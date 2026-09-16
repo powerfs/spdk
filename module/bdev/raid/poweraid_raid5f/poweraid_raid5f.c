@@ -47,6 +47,65 @@ poweraid_raid_common_stripe_request_free(struct poweraid_raid_common_req *req)
 	free(req);
 }
 
+/* ===== 5f CALC 实现（XOR P-only）=====
+ *
+ * 注册到 raid->ops.calc_parity，由 common 层 REQ CALC handler 调用。
+ * 优先用 spdk_accel_submit_xor 异步计算；accel 不可用或提交失败时
+ * fallback 到同步 XOR（poweraid_raid_common_req_xor_sync）。
+ * 完成后调用 cb(req, status)。
+ */
+static void
+poweraid_raid5f_xor_accel_cb(void *cb_arg, int status)
+{
+	struct poweraid_raid_common_req *req = cb_arg;
+	poweraid_raid_calc_cb_t user_cb = req->xor.cb;
+
+	if (status != 0) {
+		SPDK_WARNLOG("poweraid_raid5f: accel xor failed (%d), sync fallback\n",
+			     status);
+		poweraid_raid_common_req_xor_sync(req);
+	}
+	/* 重置 cb 字段，避免悬空指针 */
+	req->xor.cb = NULL;
+	if (user_cb != NULL) {
+		user_cb(req, 0);
+	}
+}
+
+static void
+poweraid_raid5f_calc_parity(struct poweraid_raid_common_req *req,
+			    poweraid_raid_calc_cb_t cb)
+{
+	struct spdk_io_channel *accel_ch;
+	int rc;
+
+	/* 保存用户回调（accel cb 通过 req->xor.cb 传递）*/
+	req->xor.cb = cb;
+
+	accel_ch = req->ch ? req->ch->accel_ch : NULL;
+	if (accel_ch == NULL) {
+		SPDK_WARNLOG("poweraid_raid5f: no accel_ch, sync xor\n");
+		poweraid_raid_common_req_xor_sync(req);
+		req->xor.cb = NULL;
+		cb(req, 0);
+		return;
+	}
+
+	rc = spdk_accel_submit_xor(accel_ch, req->parity_buf, req->src_bufs,
+				   req->n_src, req->xor_len,
+				   poweraid_raid5f_xor_accel_cb, req);
+	if (rc == 0) {
+		/* 异步完成，等 accel cb */
+		return;
+	}
+
+	/* 提交失败（含 -ENOMEM）：同步 fallback，保证前进 */
+	SPDK_WARNLOG("poweraid_raid5f: submit_xor rc=%d, sync fallback\n", rc);
+	poweraid_raid_common_req_xor_sync(req);
+	req->xor.cb = NULL;
+	cb(req, 0);
+}
+
 /* ===== per-thread IO channel（参考 raid5f_ioch_create/destroy L997-1049）===== */
 
 static int
@@ -190,6 +249,8 @@ poweraid_raid5f_start(struct raid_bdev *raid_bdev)
 	raid->block_size = raid_bdev->bdev.blocklen;
 	raid->num_base_bdevs = raid_bdev->num_base_bdevs;
 	raid->delay_us = MERGE_DELAY_US_DEFAULT;  /* Stage 3c：默认 1ms，RPC 可改 */
+	/* 注册 5f 模块差异回调（CALC = XOR P-only）*/
+	raid->ops.calc_parity = poweraid_raid5f_calc_parity;
 	spdk_uuid_copy(&raid->uuid, &raid_bdev->bdev.uuid);
 	snprintf(raid->name, sizeof(raid->name), "%s", raid_bdev->bdev.name);
 

@@ -87,8 +87,9 @@ poweraid_raid_common_sm_req_assign(struct poweraid_raid_common_req *req,
 
 /* 同步 XOR fallback：accel 资源不足或不可用时保证前进。
  * 将 n_src 个 src_bufs XOR 到 parity_buf（uint64_t 粒度 + 尾部逐字节）。
- * xor_len 须为 8 的倍数（stripe block 对齐，NVMe 块 ≥ 512）。*/
-static void
+ * xor_len 须为 8 的倍数（stripe block 对齐，NVMe 块 ≥ 512）。
+ * 供 5f/6f 的 calc_parity 实现作为 sync fallback 调用。*/
+void
 poweraid_raid_common_req_xor_sync(struct poweraid_raid_common_req *req)
 {
 	uint64_t *dst = req->parity_buf;
@@ -106,24 +107,25 @@ poweraid_raid_common_req_xor_sync(struct poweraid_raid_common_req *req)
 	}
 }
 
-/* CALC：XOR/RS 校验计算。
- * 阶段 2 D-5：若 req 携带 src_bufs/parity_buf（由 submit_rw_request 填充），
- *           通过 spdk_accel_submit_xor 异步计算 parity，完成后按 req->type 分流：
- *           - WRITE：触发 WRITE_FULL（PPL 5 步 barrier）
- *           - RECONSTRUCT：触发 IO_COMPLETE
- *           - accel 资源不足（-ENOMEM）：fallback 到同步 XOR。
- *           无 buffer（阶段 1 兼容）：直接 IO_COMPLETE。
+/* CALC：校验计算分流点。
+ *
+ * 阶段 4 步骤 4：common 层不再直接调用 spdk_accel_submit_xor，而是通过
+ * raid->ops.calc_parity(req, cb) 委托给模块（5f=XOR P-only，6f=P+Q 并行）。
+ * 完成后 cb(req, status) 回调按 req->type 分流：
+ *   - WRITE：WRITE_FULL（PPL 5 步 barrier）
+ *   - RECONSTRUCT：IO_COMPLETE
+ *
+ * 无 buffer（阶段 1 兼容路径）：直接 IO_COMPLETE。
+ * ops.calc_parity 未注册（防御）：WARN + IO_COMPLETE（不计算 parity，仅用于旧路径兼容）。
  */
 static void
-poweraid_raid_common_req_xor_cb(void *cb_arg, int status)
+poweraid_raid_common_req_calc_complete_cb(struct poweraid_raid_common_req *req, int status)
 {
-	struct poweraid_raid_common_req *req = cb_arg;
-
 	if (status != 0) {
-		SPDK_ERRLOG("req calc: accel xor failed (%d), fallback sync\n", status);
-		poweraid_raid_common_req_xor_sync(req);
+		SPDK_ERRLOG("req calc: ops.calc_parity failed (%d)\n", status);
+		/* 计算失败不阻塞状态机，继续后续流程（parity 可能不一致，但 IO 完成）*/
 	}
-	/* XOR 完成后按写/读类型分流 */
+
 	if (req->type == POWERAID_RAID_COMMON_STRIPE_REQ_WRITE) {
 		poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
 					   POWERAID_REQ_EV_WRITE_FULL);
@@ -137,9 +139,6 @@ void
 poweraid_raid_common_sm_req_calc(struct poweraid_raid_common_req *req,
 			    enum poweraid_raid_common_req_event event)
 {
-	struct spdk_io_channel *accel_ch;
-	int rc;
-
 	SPDK_DEBUGLOG(raid5f_sm_req, "calc: req=%p io=%p event=%u\n", req,
 		      req ? req->io : NULL, (uint32_t)event);
 	(void)event;
@@ -158,40 +157,15 @@ poweraid_raid_common_sm_req_calc(struct poweraid_raid_common_req *req,
 		return;
 	}
 
-	accel_ch = spdk_accel_get_io_channel();
-	if (accel_ch == NULL) {
-		SPDK_WARNLOG("req calc: no accel_ch, sync xor\n");
-		poweraid_raid_common_req_xor_sync(req);
-		if (req->type == POWERAID_RAID_COMMON_STRIPE_REQ_WRITE) {
-			poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
-						   POWERAID_REQ_EV_WRITE_FULL);
-		} else {
-			poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
-						   POWERAID_REQ_EV_IO_COMPLETE);
-		}
+	/* 委托给模块差异回调（5f=XOR, 6f=P+Q）*/
+	if (req->raid != NULL && req->raid->ops.calc_parity != NULL) {
+		req->raid->ops.calc_parity(req, poweraid_raid_common_req_calc_complete_cb);
 		return;
 	}
 
-	rc = spdk_accel_submit_xor(accel_ch, req->parity_buf, req->src_bufs,
-				   req->n_src, req->xor_len,
-				   poweraid_raid_common_req_xor_cb, req);
-	spdk_put_io_channel(accel_ch);
-
-	if (rc == 0) {
-		/* 异步完成，等 cb */
-		return;
-	}
-
-	/* 提交失败（含 -ENOMEM）：同步 fallback，保证前进 */
-	SPDK_WARNLOG("req calc: submit_xor rc=%d, sync fallback\n", rc);
-	poweraid_raid_common_req_xor_sync(req);
-	if (req->type == POWERAID_RAID_COMMON_STRIPE_REQ_WRITE) {
-		poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
-					   POWERAID_REQ_EV_WRITE_FULL);
-	} else {
-		poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
-					   POWERAID_REQ_EV_IO_COMPLETE);
-	}
+	/* ops 未注册：防御性 fallback，直接继续（parity 未计算）*/
+	SPDK_WARNLOG("req calc: ops.calc_parity not registered, skip calc\n");
+	poweraid_raid_common_req_calc_complete_cb(req, 0);
 }
 
 /* ===== D-5: WRITE_FULL + PPL 5 步 barrier =====

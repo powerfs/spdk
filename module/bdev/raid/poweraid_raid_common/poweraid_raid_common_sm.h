@@ -193,6 +193,24 @@ typedef void (*poweraid_raid_common_bdev_handler_t)(struct poweraid_raid_common_
 typedef void (*poweraid_raid_common_req_handler_t)(struct poweraid_raid_common_req *req,
 		enum poweraid_raid_common_req_event event);
 
+/* ===== 模块差异回调（5f / 6f 注册不同实现）=====
+ *
+ * 阶段 4 步骤 4：CALC 分流点。common 层的 REQ CALC handler 调用
+ * raid->ops.calc_parity(req, cb) 计算校验值，完成后通过 cb(req, status)
+ * 通知 common 层继续状态机。5f 注册 XOR（P only），6f 注册 P+Q 并行。
+ *
+ * calc_parity 约定：
+ *   - req 已填充 src_bufs / parity_buf / n_src / xor_len
+ *   - 完成后必须调用 cb(req, status)，status=0 成功，<0 失败
+ *   - 可异步（accel）或同步内联
+ */
+typedef void (*poweraid_raid_calc_cb_t)(struct poweraid_raid_common_req *req, int status);
+
+struct poweraid_raid_common_ops {
+	void (*calc_parity)(struct poweraid_raid_common_req *req,
+			    poweraid_raid_calc_cb_t cb);
+};
+
 /* ===== FSM 对象（最小骨架）===== */
 struct poweraid_raid_common_raid {
 	uint64_t state;  /* POWERAID_RAID_ST_* 位图 */
@@ -215,6 +233,8 @@ struct poweraid_raid_common_raid {
 	uint64_t delay_us;
 	/* 回指 SPDK raid_bdev 框架对象，start() 建立桥接，供 IO 路径访问 base_bdev_info。 */
 	struct raid_bdev *raid_bdev;
+	/* 模块差异回调（5f=XOR, 6f=P+Q），由模块 start() 注册 */
+	struct poweraid_raid_common_ops ops;
 	TAILQ_ENTRY(poweraid_raid_common_raid) link;
 };
 
@@ -328,6 +348,9 @@ void  poweraid_raid_common_put_parity_buf(struct poweraid_raid_common_io_channel
 int   poweraid_raid_common_buf_pool_init(struct poweraid_raid_common_io_channel *ch,
 				    struct poweraid_raid_common_raid *raid);
 void  poweraid_raid_common_buf_pool_destroy(struct poweraid_raid_common_io_channel *ch);
+
+/* 同步 XOR fallback（供 5f/6f calc_parity 实现调用）*/
+void poweraid_raid_common_req_xor_sync(struct poweraid_raid_common_req *req);
 
 /* ===== 状态位原子操作 ===== */
 static inline bool
