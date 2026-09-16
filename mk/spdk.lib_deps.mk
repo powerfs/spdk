@@ -161,6 +161,10 @@ DEPDIRS-bdev_raid := $(BDEV_DEPS_THREAD) dma trace
 ifeq ($(CONFIG_RAID5F),y)
 DEPDIRS-bdev_raid += accel
 endif
+
+ifeq ($(CONFIG_POWERAID_RAID5F),y)
+DEPDIRS-bdev_raid += accel
+endif
 DEPDIRS-bdev_rbd := $(BDEV_DEPS_THREAD)
 DEPDIRS-bdev_uring := $(BDEV_DEPS_THREAD)
 DEPDIRS-bdev_virtio := $(BDEV_DEPS_THREAD) virtio

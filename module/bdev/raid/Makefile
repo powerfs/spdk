@@ -16,6 +16,17 @@ ifeq ($(CONFIG_RAID5F),y)
 C_SRCS += raid5f.c
 endif
 
+ifeq ($(CONFIG_POWERAID_RAID5F),y)
+C_SRCS += poweraid_raid5f/poweraid_raid5f.c \
+          poweraid_raid5f/poweraid_raid5f_sm_dispatch.c \
+          poweraid_raid5f/poweraid_raid5f_sm_raid.c \
+          poweraid_raid5f/poweraid_raid5f_sm_bdev.c \
+          poweraid_raid5f/poweraid_raid5f_sm_req.c \
+          poweraid_raid5f/poweraid_raid5f_sb.c \
+          poweraid_raid5f/poweraid_raid5f_ppl.c \
+          poweraid_raid5f/poweraid_raid5f_recovery.c
+endif
+
 LIBNAME = bdev_raid
 
 SPDK_MAP_FILE = $(SPDK_ROOT_DIR)/mk/spdk_blank.map

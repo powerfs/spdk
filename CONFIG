@@ -188,6 +188,10 @@ CONFIG_OPENSSL_PATH=
 # Build with RAID5f support
 CONFIG_RAID5F=n
 
+# Build with poweraid enhanced RAID5f support (PPL/RMW/Scrub/RAID6/FSM)
+# Default enabled; depends on CONFIG_RAID5F=y for SPDK_BDEV_RAID_LEVEL_RAID5F
+CONFIG_POWERAID_RAID5F=y
+
 # Build with IDXD support
 # In this mode, SPDK fully controls the DSA device.
 CONFIG_IDXD=n
