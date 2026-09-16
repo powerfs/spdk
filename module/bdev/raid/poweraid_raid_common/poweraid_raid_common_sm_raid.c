@@ -653,3 +653,170 @@ poweraid_raid_common_raid_fsm[POWERAID_RAID_EV_COUNT_REAL] = {
 SPDK_STATIC_ASSERT(SPDK_COUNTOF(poweraid_raid_common_raid_fsm) ==
 		   POWERAID_RAID_EV_COUNT_REAL,
 		   "raid fsm table size mismatch with enum");
+
+/* ===== 缓冲池实现（data_buf / parity_buf 预分配）=====
+ *
+ * 优化点：原 full-stripe 写路径每 IO 调用 spdk_dma_malloc/free 分配
+ * data_buf（整 stripe）和 parity_buf（单 strip），频繁分配释放导致：
+ *   1. DMA allocator 锁竞争（spdk_dma_malloc 内部有 mpool 锁）
+ *   2. 缓存行/TLB 抖动
+ *   3. 延迟不稳定
+ *
+ * 方案：per-channel 预分配 MAX_STRIPES 个 data_buf 和 parity_buf，
+ *       池空时 fallback 到 spdk_dma_malloc，池满时 put 直接 free。
+ *       与 stripe_request 池深度对齐，正常负载下零 malloc。
+ *       per-channel 单线程访问，无需锁。
+ */
+
+int
+poweraid_raid_common_buf_pool_init(struct poweraid_raid_common_io_channel *ch,
+				   struct poweraid_raid_common_raid *raid)
+{
+	uint32_t data_chunks = raid->num_base_bdevs - 1;
+	uint32_t strip_bytes = raid->strip_size * raid->block_size;
+	struct poweraid_raid_common_buf *entry;
+	int i;
+
+	ch->data_buf_size = strip_bytes * data_chunks;
+	ch->parity_buf_size = strip_bytes;
+	ch->n_data_bufs = 0;
+	ch->n_parity_bufs = 0;
+
+	TAILQ_INIT(&ch->free_data_bufs);
+	TAILQ_INIT(&ch->free_parity_bufs);
+
+	for (i = 0; i < POWERAID_RAID_COMMON_MAX_STRIPES; i++) {
+		entry = calloc(1, sizeof(*entry));
+		if (entry == NULL) {
+			goto err;
+		}
+		entry->buf = spdk_dma_malloc(ch->data_buf_size, 0, NULL);
+		if (entry->buf == NULL) {
+			free(entry);
+			goto err;
+		}
+		TAILQ_INSERT_HEAD(&ch->free_data_bufs, entry, link);
+		ch->n_data_bufs++;
+	}
+
+	for (i = 0; i < POWERAID_RAID_COMMON_MAX_STRIPES; i++) {
+		entry = calloc(1, sizeof(*entry));
+		if (entry == NULL) {
+			goto err;
+		}
+		entry->buf = spdk_dma_malloc(ch->parity_buf_size, 0, NULL);
+		if (entry->buf == NULL) {
+			free(entry);
+			goto err;
+		}
+		TAILQ_INSERT_HEAD(&ch->free_parity_bufs, entry, link);
+		ch->n_parity_bufs++;
+	}
+
+	SPDK_DEBUGLOG(raid5f_sm_raid, "buf_pool_init: data_buf=%"PRIu32
+		      "B x%d parity_buf=%"PRIu32"B x%d\n",
+		      ch->data_buf_size, ch->n_data_bufs,
+		      ch->parity_buf_size, ch->n_parity_bufs);
+	return 0;
+
+err:
+	poweraid_raid_common_buf_pool_destroy(ch);
+	return -ENOMEM;
+}
+
+void
+poweraid_raid_common_buf_pool_destroy(struct poweraid_raid_common_io_channel *ch)
+{
+	struct poweraid_raid_common_buf *entry;
+
+	while ((entry = TAILQ_FIRST(&ch->free_data_bufs))) {
+		TAILQ_REMOVE(&ch->free_data_bufs, entry, link);
+		spdk_dma_free(entry->buf);
+		free(entry);
+	}
+	ch->n_data_bufs = 0;
+
+	while ((entry = TAILQ_FIRST(&ch->free_parity_bufs))) {
+		TAILQ_REMOVE(&ch->free_parity_bufs, entry, link);
+		spdk_dma_free(entry->buf);
+		free(entry);
+	}
+	ch->n_parity_bufs = 0;
+}
+
+void *
+poweraid_raid_common_get_data_buf(struct poweraid_raid_common_io_channel *ch)
+{
+	struct poweraid_raid_common_buf *entry;
+	void *buf;
+
+	entry = TAILQ_FIRST(&ch->free_data_bufs);
+	if (entry != NULL) {
+		TAILQ_REMOVE(&ch->free_data_bufs, entry, link);
+		ch->n_data_bufs--;
+		buf = entry->buf;
+		free(entry);
+		return buf;
+	}
+	/* 池空：fallback malloc（burst 场景）*/
+	buf = spdk_dma_malloc(ch->data_buf_size, 0, NULL);
+	return buf;
+}
+
+void *
+poweraid_raid_common_get_parity_buf(struct poweraid_raid_common_io_channel *ch)
+{
+	struct poweraid_raid_common_buf *entry;
+	void *buf;
+
+	entry = TAILQ_FIRST(&ch->free_parity_bufs);
+	if (entry != NULL) {
+		TAILQ_REMOVE(&ch->free_parity_bufs, entry, link);
+		ch->n_parity_bufs--;
+		buf = entry->buf;
+		free(entry);
+		return buf;
+	}
+	buf = spdk_dma_malloc(ch->parity_buf_size, 0, NULL);
+	return buf;
+}
+
+void
+poweraid_raid_common_put_data_buf(struct poweraid_raid_common_io_channel *ch, void *buf)
+{
+	struct poweraid_raid_common_buf *entry;
+
+	if (buf == NULL) {
+		return;
+	}
+	if (ch->n_data_bufs < POWERAID_RAID_COMMON_MAX_STRIPES) {
+		entry = calloc(1, sizeof(*entry));
+		if (entry != NULL) {
+			entry->buf = buf;
+			TAILQ_INSERT_HEAD(&ch->free_data_bufs, entry, link);
+			ch->n_data_bufs++;
+			return;
+		}
+	}
+	spdk_dma_free(buf);
+}
+
+void
+poweraid_raid_common_put_parity_buf(struct poweraid_raid_common_io_channel *ch, void *buf)
+{
+	struct poweraid_raid_common_buf *entry;
+
+	if (buf == NULL) {
+		return;
+	}
+	if (ch->n_parity_bufs < POWERAID_RAID_COMMON_MAX_STRIPES) {
+		entry = calloc(1, sizeof(*entry));
+		if (entry != NULL) {
+			entry->buf = buf;
+			TAILQ_INSERT_HEAD(&ch->free_parity_bufs, entry, link);
+			ch->n_parity_bufs++;
+			return;
+		}
+	}
+	spdk_dma_free(buf);
+}

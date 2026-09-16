@@ -276,6 +276,14 @@ struct poweraid_raid_common_req {
  *     耗尽时 merge 层延迟重试，不再 fail IO）。*/
 #define POWERAID_RAID_COMMON_MAX_STRIPES 64
 
+/* 缓冲池条目：data_buf / parity_buf 预分配池，避免 per-IO spdk_dma_malloc/free。
+ * 池深度 == MAX_STRIPES（与 stripe_request 池对齐），池空时 fallback malloc，
+ * 池满时 put 直接 free。per-channel 无锁访问。*/
+struct poweraid_raid_common_buf {
+	void *buf;
+	TAILQ_ENTRY(poweraid_raid_common_buf) link;
+};
+
 struct poweraid_raid_common_io_channel {
 	/* 空闲 stripe_request 池（write/reconstruct 分离，参考 raid5f）*/
 	TAILQ_HEAD(, poweraid_raid_common_req) free_write_stripe_requests;
@@ -286,6 +294,14 @@ struct poweraid_raid_common_io_channel {
 
 	/* accel_ch 资源不足时重试队列 */
 	TAILQ_HEAD(, poweraid_raid_common_req) xor_retry_queue;
+
+	/* data_buf / parity_buf 预分配池（性能优化：避免 per-IO malloc）*/
+	TAILQ_HEAD(, poweraid_raid_common_buf) free_data_bufs;
+	TAILQ_HEAD(, poweraid_raid_common_buf) free_parity_bufs;
+	uint32_t data_buf_size;    /* 完整 stripe 字节数 = strip_size * (n-1) * block_size */
+	uint32_t parity_buf_size;  /* strip 字节数 = strip_size * block_size */
+	uint32_t n_data_bufs;      /* 当前池中 data_buf 数量 */
+	uint32_t n_parity_bufs;    /* 当前池中 parity_buf 数量 */
 
 	/* 合并层上下文（阶段 3b）*/
 	struct merge_ctx merge_ctx;
@@ -303,6 +319,15 @@ void poweraid_raid_common_sm_process(enum poweraid_raid_common_fsm_layer layer,
 extern poweraid_raid_common_raid_handler_t poweraid_raid_common_raid_fsm[];
 extern poweraid_raid_common_bdev_handler_t poweraid_raid_common_bdev_fsm[];
 extern poweraid_raid_common_req_handler_t poweraid_raid_common_req_fsm[];
+
+/* ===== 缓冲池 API（data_buf / parity_buf 预分配，per-channel 无锁）===== */
+void *poweraid_raid_common_get_data_buf(struct poweraid_raid_common_io_channel *ch);
+void *poweraid_raid_common_get_parity_buf(struct poweraid_raid_common_io_channel *ch);
+void  poweraid_raid_common_put_data_buf(struct poweraid_raid_common_io_channel *ch, void *buf);
+void  poweraid_raid_common_put_parity_buf(struct poweraid_raid_common_io_channel *ch, void *buf);
+int   poweraid_raid_common_buf_pool_init(struct poweraid_raid_common_io_channel *ch,
+				    struct poweraid_raid_common_raid *raid);
+void  poweraid_raid_common_buf_pool_destroy(struct poweraid_raid_common_io_channel *ch);
 
 /* ===== 状态位原子操作 ===== */
 static inline bool

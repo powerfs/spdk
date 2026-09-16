@@ -525,14 +525,25 @@ poweraid_raid_common_sm_req_destroy(struct poweraid_raid_common_req *req,
 	__atomic_fetch_or(&req->state, POWERAID_REQ_ST_DESTROYING,
 			  __ATOMIC_ACQ_REL);
 
-	/* 释放 D-5 分配的 IO 缓冲 */
-	if (req->parity_buf_alloc != NULL) {
-		spdk_dma_free(req->parity_buf_alloc);
-		req->parity_buf_alloc = NULL;
-	}
-	if (req->data_buf != NULL) {
-		spdk_dma_free(req->data_buf);
-		req->data_buf = NULL;
+	/* 释放 D-5 分配的 IO 缓冲（回收到 per-channel 缓冲池）*/
+	if (req->ch != NULL) {
+		if (req->parity_buf_alloc != NULL) {
+			poweraid_raid_common_put_parity_buf(req->ch, req->parity_buf_alloc);
+			req->parity_buf_alloc = NULL;
+		}
+		if (req->data_buf != NULL) {
+			poweraid_raid_common_put_data_buf(req->ch, req->data_buf);
+			req->data_buf = NULL;
+		}
+	} else {
+		if (req->parity_buf_alloc != NULL) {
+			spdk_dma_free(req->parity_buf_alloc);
+			req->parity_buf_alloc = NULL;
+		}
+		if (req->data_buf != NULL) {
+			spdk_dma_free(req->data_buf);
+			req->data_buf = NULL;
+		}
 	}
 	if (req->src_bufs != NULL) {
 		free(req->src_bufs);

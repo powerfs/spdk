@@ -194,7 +194,6 @@ merge_full_stripe_write(struct merge_entry *entry)
 	struct raid_bdev_io *carrier;
 	struct merge_pending_io *first_pio;
 	uint32_t strip_bytes = entry->strip_bytes;
-	uint32_t stripe_bytes = strip_bytes * entry->data_chunks;
 	uint32_t i;
 
 	/* 从 free 池取一个 write stripe_request */
@@ -221,16 +220,16 @@ merge_full_stripe_write(struct merge_entry *entry)
 	req->raid = raid;
 	req->io = carrier;  /* IO_COMPLETE 调 raid_bdev_io_complete 用 */
 
-	/* 分配 parity 缓冲 */
-	req->parity_buf_alloc = spdk_dma_malloc(strip_bytes, 0, NULL);
+	/* 从缓冲池取 parity 缓冲 */
+	req->parity_buf_alloc = poweraid_raid_common_get_parity_buf(ch);
 	if (req->parity_buf_alloc == NULL) {
 		SPDK_ERRLOG("merge full: alloc parity_buf failed\n");
 		goto err_free_req;
 	}
 	req->parity_buf = req->parity_buf_alloc;
 
-	/* 分配全 stripe 数据缓冲 */
-	req->data_buf = spdk_dma_malloc(stripe_bytes, 0, NULL);
+	/* 从缓冲池取全 stripe 数据缓冲 */
+	req->data_buf = poweraid_raid_common_get_data_buf(ch);
 	if (req->data_buf == NULL) {
 		SPDK_ERRLOG("merge full: alloc data_buf failed\n");
 		goto err_free_parity;
@@ -263,10 +262,10 @@ merge_full_stripe_write(struct merge_entry *entry)
 	return 0;
 
 err_free_data:
-	spdk_dma_free(req->data_buf);
+	poweraid_raid_common_put_data_buf(ch, req->data_buf);
 	req->data_buf = NULL;
 err_free_parity:
-	spdk_dma_free(req->parity_buf_alloc);
+	poweraid_raid_common_put_parity_buf(ch, req->parity_buf_alloc);
 	req->parity_buf_alloc = NULL;
 	req->parity_buf = NULL;
 err_free_req:

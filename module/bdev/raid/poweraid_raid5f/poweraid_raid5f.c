@@ -85,6 +85,14 @@ poweraid_raid_common_ioch_create(void *io_device, void *ctx_buf)
 		goto err;
 	}
 
+	/* data_buf / parity_buf 预分配池（性能优化）*/
+	if (poweraid_raid_common_buf_pool_init(ch, raid) != 0) {
+		SPDK_ERRLOG("poweraid_raid5f: buf_pool_init failed\n");
+		spdk_put_io_channel(ch->accel_ch);
+		ch->accel_ch = NULL;
+		goto err;
+	}
+
 	/* 合并层初始化（阶段 3b）*/
 	if (poweraid_raid_common_merge_init(&ch->merge_ctx, raid, ch) != 0) {
 		SPDK_ERRLOG("poweraid_raid5f: merge_init failed\n");
@@ -98,6 +106,7 @@ poweraid_raid_common_ioch_create(void *io_device, void *ctx_buf)
 
 err:
 	SPDK_ERRLOG("poweraid_raid5f: ioch_create failed\n");
+	poweraid_raid_common_buf_pool_destroy(ch);
 	while ((req = TAILQ_FIRST(&ch->free_write_stripe_requests))) {
 		TAILQ_REMOVE(&ch->free_write_stripe_requests, req, link);
 		poweraid_raid_common_stripe_request_free(req);
@@ -129,6 +138,9 @@ poweraid_raid_common_ioch_destroy(void *io_device, void *ctx_buf)
 		TAILQ_REMOVE(&ch->free_reconstruct_stripe_requests, req, link);
 		poweraid_raid_common_stripe_request_free(req);
 	}
+
+	/* 缓冲池销毁（data_buf / parity_buf）*/
+	poweraid_raid_common_buf_pool_destroy(ch);
 
 	if (ch->accel_ch) {
 		spdk_put_io_channel(ch->accel_ch);
@@ -564,16 +576,16 @@ poweraid_raid5f_submit_rw_request(struct raid_bdev_io *raid_io)
 
 	strip_size_bytes = raid->strip_size * blocklen;
 
-	/* 分配 parity 缓冲（spdk_dma_malloc 保证 DMA 对齐）*/
-	req->parity_buf_alloc = spdk_dma_malloc(strip_size_bytes, 0, NULL);
+	/* 从缓冲池取 parity 缓冲（避免 per-IO malloc）*/
+	req->parity_buf_alloc = poweraid_raid_common_get_parity_buf(ch);
 	if (req->parity_buf_alloc == NULL) {
 		SPDK_ERRLOG("poweraid_raid5f: alloc parity_buf failed\n");
 		goto err_free_req;
 	}
 	req->parity_buf = req->parity_buf_alloc;
 
-	/* 分配全 stripe 数据缓冲，拷贝 raid_io->iovs */
-	req->data_buf = spdk_dma_malloc(stripe_blocks * blocklen, 0, NULL);
+	/* 从缓冲池取全 stripe 数据缓冲，拷贝 raid_io->iovs */
+	req->data_buf = poweraid_raid_common_get_data_buf(ch);
 	if (req->data_buf == NULL) {
 		SPDK_ERRLOG("poweraid_raid5f: alloc data_buf failed\n");
 		goto err_free_parity;
@@ -612,10 +624,10 @@ poweraid_raid5f_submit_rw_request(struct raid_bdev_io *raid_io)
 	return;
 
 err_free_data:
-	spdk_dma_free(req->data_buf);
+	poweraid_raid_common_put_data_buf(ch, req->data_buf);
 	req->data_buf = NULL;
 err_free_parity:
-	spdk_dma_free(req->parity_buf_alloc);
+	poweraid_raid_common_put_parity_buf(ch, req->parity_buf_alloc);
 	req->parity_buf_alloc = NULL;
 	req->parity_buf = NULL;
 err_free_req:
