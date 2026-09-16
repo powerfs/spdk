@@ -8405,6 +8405,65 @@ Example response:
 }
 ~~~
 
+### bdev_poweraid_raid5f_set_merge_delay {#rpc_bdev_poweraid_raid5f_set_merge_delay}
+
+{{ bdev_poweraid_raid5f_set_merge_delay_description }}
+
+#### Parameters
+
+{{ bdev_poweraid_raid5f_set_merge_delay_params }}
+
+#### Response
+
+{{ bdev_poweraid_raid5f_set_merge_delay_response }}
+
+#### Example
+
+Example request:
+
+{{ example_request("bdev_poweraid_raid5f_set_merge_delay", "-n", "RAID5F0", "-d", "1000") }}
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+### bdev_poweraid_raid5f_get_merge_delay {#rpc_bdev_poweraid_raid5f_get_merge_delay}
+
+{{ bdev_poweraid_raid5f_get_merge_delay_description }}
+
+#### Parameters
+
+{{ bdev_poweraid_raid5f_get_merge_delay_params }}
+
+#### Response
+
+{{ bdev_poweraid_raid5f_get_merge_delay_response }}
+
+#### Example
+
+Example request:
+
+{{ example_request("bdev_poweraid_raid5f_get_merge_delay", "-n", "RAID5F0") }}
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "name": "RAID5F0",
+    "delay_us": 1000
+  }
+}
+~~~
+
 ## SPLIT {#jsonrpc_components_split}
 
 ### bdev_split_create {#rpc_bdev_split_create}

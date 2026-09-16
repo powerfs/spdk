@@ -144,6 +144,10 @@ enums:
         value: SPDK_BDEV_RAID_LEVEL_RAID5F
       - name: 5f
         value: SPDK_BDEV_RAID_LEVEL_RAID5F
+      - name: raid6f
+        value: SPDK_BDEV_RAID_LEVEL_RAID6F
+      - name: 6f
+        value: SPDK_BDEV_RAID_LEVEL_RAID6F
       - name: concat
         value: SPDK_BDEV_RAID_LEVEL_CONCAT
   - name: bdev_raid_state
@@ -4814,6 +4818,35 @@ methods:
         type: string
         required: true
         description: Base bdev name in RAID
+  - name: bdev_poweraid_raid5f_set_merge_delay
+    description: |
+      Set the merge layer delay (in microseconds) for a poweraid RAID5F bdev.
+      delay_us=0 disables merge coalescing (submit immediately flushes, equivalent to pure RMW baseline).
+      delay_us>0 enables coalescing window; entries are flushed when full chunk coverage is reached or the delay timer expires.
+      Updates the raid-level configuration and iterates existing io channels to apply the new value.
+    result:
+      type: boolean
+      description: true on success
+    params:
+      - name: name
+        type: string
+        required: true
+        description: RAID bdev name
+      - name: delay_us
+        type: uint64
+        required: true
+        description: Merge delay in microseconds (0 = merge OFF)
+  - name: bdev_poweraid_raid5f_get_merge_delay
+    description: |
+      Query the current merge layer delay (in microseconds) for a poweraid RAID5F bdev.
+    result:
+      type: object
+      description: Object containing the raid name and current delay_us value
+    params:
+      - name: name
+        type: string
+        required: true
+        description: RAID bdev name
   - name: bdev_split_create
     description: This is used to split an underlying block device and create several smaller equal-sized vbdevs.
     params:

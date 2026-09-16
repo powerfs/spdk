@@ -1327,6 +1327,8 @@ static struct {
 	{ "1", SPDK_BDEV_RAID_LEVEL_RAID1 },
 	{ "raid5f", SPDK_BDEV_RAID_LEVEL_RAID5F },
 	{ "5f", SPDK_BDEV_RAID_LEVEL_RAID5F },
+	{ "raid6f", SPDK_BDEV_RAID_LEVEL_RAID6F },
+	{ "6f", SPDK_BDEV_RAID_LEVEL_RAID6F },
 	{ "concat", SPDK_BDEV_RAID_LEVEL_CONCAT },
 	{ }
 };

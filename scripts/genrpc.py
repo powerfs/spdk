@@ -103,6 +103,9 @@ def lint_c_code(schema: Dict[str, Any]) -> None:
         "bdev_rbd_create",
         "bdev_rbd_register_cluster",
         "nvmf_set_config",
+        # poweraid RAID5F RPCs use custom struct names (Stage 3c)
+        "bdev_poweraid_raid5f_set_merge_delay",
+        "bdev_poweraid_raid5f_get_merge_delay",
     }
     manual_decoder_names = {f"rpc_{name}_decoders_manual" for name in manual_decoders}
     c_code_methods = dict()

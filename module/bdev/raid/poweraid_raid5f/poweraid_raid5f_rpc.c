@@ -33,9 +33,9 @@ struct rpc_set_merge_delay {
 	struct spdk_jsonrpc_request *request;
 };
 
-static const struct spdk_json_object_decoder rpc_set_merge_delay_decoders[] = {
+static const struct spdk_json_object_decoder rpc_bdev_poweraid_raid5f_set_merge_delay_decoders_manual[] = {
 	{"name", offsetof(struct rpc_set_merge_delay, name), spdk_json_decode_string},
-	{"delay_us", offsetof(struct rpc_set_merge_delay, delay_us), spdk_json_decode_uint64, true},
+	{"delay_us", offsetof(struct rpc_set_merge_delay, delay_us), spdk_json_decode_uint64},
 };
 
 static void
@@ -73,8 +73,8 @@ set_merge_delay_done(struct spdk_io_channel_iter *i, int status)
 }
 
 static void
-rpc_poweraid_raid5f_set_merge_delay(struct spdk_jsonrpc_request *request,
-				    const struct spdk_json_val *params)
+rpc_bdev_poweraid_raid5f_set_merge_delay(struct spdk_jsonrpc_request *request,
+					 const struct spdk_json_val *params)
 {
 	struct rpc_set_merge_delay *req;
 	struct raid_bdev *raid_bdev;
@@ -86,8 +86,8 @@ rpc_poweraid_raid5f_set_merge_delay(struct spdk_jsonrpc_request *request,
 		return;
 	}
 
-	if (spdk_json_decode_object(params, rpc_set_merge_delay_decoders,
-				    SPDK_COUNTOF(rpc_set_merge_delay_decoders), req)) {
+	if (spdk_json_decode_object(params, rpc_bdev_poweraid_raid5f_set_merge_delay_decoders_manual,
+				    SPDK_COUNTOF(rpc_bdev_poweraid_raid5f_set_merge_delay_decoders_manual), req)) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
 						 "spdk_json_decode_object failed");
 		rpc_free_set_merge_delay(req);
@@ -116,7 +116,7 @@ rpc_poweraid_raid5f_set_merge_delay(struct spdk_jsonrpc_request *request,
 	spdk_for_each_channel(raid, set_merge_delay_channel, req, set_merge_delay_done);
 }
 SPDK_RPC_REGISTER("bdev_poweraid_raid5f_set_merge_delay",
-		  rpc_poweraid_raid5f_set_merge_delay, SPDK_RPC_RUNTIME)
+		  rpc_bdev_poweraid_raid5f_set_merge_delay, SPDK_RPC_RUNTIME)
 
 /* ===== get_merge_delay ===== */
 
@@ -124,21 +124,21 @@ struct rpc_get_merge_delay {
 	char	*name;
 };
 
-static const struct spdk_json_object_decoder rpc_get_merge_delay_decoders[] = {
+static const struct spdk_json_object_decoder rpc_bdev_poweraid_raid5f_get_merge_delay_decoders_manual[] = {
 	{"name", offsetof(struct rpc_get_merge_delay, name), spdk_json_decode_string},
 };
 
 static void
-rpc_poweraid_raid5f_get_merge_delay(struct spdk_jsonrpc_request *request,
-				    const struct spdk_json_val *params)
+rpc_bdev_poweraid_raid5f_get_merge_delay(struct spdk_jsonrpc_request *request,
+					 const struct spdk_json_val *params)
 {
 	struct rpc_get_merge_delay req = {};
 	struct raid_bdev *raid_bdev;
 	struct poweraid_raid5f_raid *raid;
 	struct spdk_json_write_ctx *w;
 
-	if (spdk_json_decode_object(params, rpc_get_merge_delay_decoders,
-				    SPDK_COUNTOF(rpc_get_merge_delay_decoders), &req)) {
+	if (spdk_json_decode_object(params, rpc_bdev_poweraid_raid5f_get_merge_delay_decoders_manual,
+				    SPDK_COUNTOF(rpc_bdev_poweraid_raid5f_get_merge_delay_decoders_manual), &req)) {
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
 						 "spdk_json_decode_object failed");
 		return;
@@ -167,4 +167,4 @@ rpc_poweraid_raid5f_get_merge_delay(struct spdk_jsonrpc_request *request,
 	spdk_jsonrpc_end_result(request, w);
 }
 SPDK_RPC_REGISTER("bdev_poweraid_raid5f_get_merge_delay",
-		  rpc_poweraid_raid5f_get_merge_delay, SPDK_RPC_RUNTIME)
+		  rpc_bdev_poweraid_raid5f_get_merge_delay, SPDK_RPC_RUNTIME)

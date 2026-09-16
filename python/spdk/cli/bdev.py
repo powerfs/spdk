@@ -771,7 +771,7 @@ def add_parser(subparsers):
     p = subparsers.add_parser('bdev_raid_create', help='Create new raid bdev')
     p.add_argument('-n', '--name', help='raid bdev name', required=True)
     p.add_argument('-z', '--strip-size-kb', help='strip size in KB', type=int)
-    p.add_argument('-r', '--raid-level', choices=['raid0', '0', 'raid1', '1', 'raid5f', '5f', 'concat'], help='Raid level', required=True)
+    p.add_argument('-r', '--raid-level', choices=['raid0', '0', 'raid1', '1', 'raid5f', '5f', 'raid6f', '6f', 'concat'], help='Raid level', required=True)
     p.add_argument('-b', '--base-bdevs', help='base bdevs name, whitespace separated list in quotes', required=True, type=str.split)
     p.add_argument('--uuid', help='UUID for this raid bdev')
     p.add_argument('-s', '--superblock', help='information about raid bdev will be stored in superblock on each base bdev, '
@@ -801,6 +801,24 @@ def add_parser(subparsers):
     p = subparsers.add_parser('bdev_raid_remove_base_bdev', help='Remove base bdev from existing raid bdev')
     p.add_argument('name', help='base bdev name')
     p.set_defaults(func=bdev_raid_remove_base_bdev)
+
+    def bdev_poweraid_raid5f_set_merge_delay(args):
+        args.client.bdev_poweraid_raid5f_set_merge_delay(
+            name=args.name,
+            delay_us=args.delay_us)
+    p = subparsers.add_parser('bdev_poweraid_raid5f_set_merge_delay',
+                              help='Set merge layer delay (us) for poweraid RAID5F. 0 disables merge coalescing.')
+    p.add_argument('-n', '--name', help='RAID bdev name', required=True)
+    p.add_argument('-d', '--delay-us', help='Merge delay in microseconds (0 = merge OFF)', type=int, required=True)
+    p.set_defaults(func=bdev_poweraid_raid5f_set_merge_delay)
+
+    def bdev_poweraid_raid5f_get_merge_delay(args):
+        print_json(args.client.bdev_poweraid_raid5f_get_merge_delay(
+            name=args.name))
+    p = subparsers.add_parser('bdev_poweraid_raid5f_get_merge_delay',
+                              help='Query current merge layer delay (us) for poweraid RAID5F.')
+    p.add_argument('-n', '--name', help='RAID bdev name', required=True)
+    p.set_defaults(func=bdev_poweraid_raid5f_get_merge_delay)
 
     # split
     def bdev_split_create(args):
