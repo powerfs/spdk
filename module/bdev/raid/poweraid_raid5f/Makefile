@@ -20,7 +20,18 @@ C_SRCS = poweraid_raid5f.c \
 	 poweraid_raid5f_sm_req.c \
 	 poweraid_raid5f_sb.c \
 	 poweraid_raid5f_ppl.c \
-	 poweraid_raid5f_rmw.c
+	 poweraid_raid5f_recovery.c \
+	 poweraid_raid5f_rmw.c \
+	 poweraid_raid5f_merge.c \
+	 poweraid_raid5f_rpc.c \
+	 poweraid_raid5f_gf8.c
+
+# GF8 SIMD 路径: 按架构选择（避免符号冲突）
+ifeq ($(shell uname -m),x86_64)
+C_SRCS += poweraid_raid5f_gf8_x86.c
+else ifeq ($(shell uname -m),aarch64)
+C_SRCS += poweraid_raid5f_gf8_neon.c
+endif
 
 LIBNAME = poweraid_raid5f
 
