@@ -25,7 +25,8 @@ C_SRCS += poweraid_raid5f/poweraid_raid5f.c \
 	          poweraid_raid5f/poweraid_raid5f_sb.c \
 	          poweraid_raid5f/poweraid_raid5f_ppl.c \
 	          poweraid_raid5f/poweraid_raid5f_recovery.c \
-	          poweraid_raid5f/poweraid_raid5f_rmw.c
+	          poweraid_raid5f/poweraid_raid5f_rmw.c \
+	          poweraid_raid5f/poweraid_raid5f_merge.c
 endif
 
 LIBNAME = bdev_raid

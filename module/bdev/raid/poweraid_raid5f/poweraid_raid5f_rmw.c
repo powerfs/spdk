@@ -8,15 +8,18 @@
  *     submit → READ_OLD(data+parity 并行) → CALC → PPL_APPEND
  *            → WRITE(data+parity 并行) → FLUSH(并行) → PPL_COMMIT → COMPLETE
  *
+ *   阶段 3b：支持非连续 chunk_bitmap（合并层多 strip 写同一 stripe 时可能不连续）。
+ *   按 chunk_bitmap set bit 升序迭代（与 recovery 读盘顺序一致）。
+ *
  *   ENOMEM：简化为失败（与 write_full 一致），由 bdev 层重试整个 raid_io。
  *     PPL record 已 append 但未 commit，recovery 三分支判定处理（data==old → NONE）。
  *
- *   几何（框架 split 已保证）：
- *     - stripe_offset = offset_blocks % stripe_blocks，strip 对齐
- *     - num_blocks = num_modified * strip_size，num_modified < data_chunks
- *     - 被改 data chunk 连续：[start_chunk, start_chunk + num_modified)
- *     - data_idx → 物理盘映射：phys = (data_idx < p_idx) ? data_idx : data_idx + 1
- *       （left-symmetric，与 recovery_read_strip 一致）
+ *   两种入口：
+ *     A) poweraid_raid5f_rmw_submit(raid_io) — 直接单 strip 写（raid_io 完成回调）
+ *     B) poweraid_raid5f_rmw_submit_merged(...) — 合并层调用（自定义完成回调）
+ *
+ *   data_idx → 物理盘映射：phys = (data_idx < p_idx) ? data_idx : data_idx + 1
+ *     （left-symmetric，与 recovery_read_strip 一致）
  */
 
 #include "spdk/stdinc.h"
@@ -44,20 +47,21 @@ enum rmw_state {
 };
 
 struct rmw_op {
-	struct raid_bdev_io			*raid_io;
+	struct raid_bdev_io			*raid_io;	/* NULL 当合并层调用 */
+	struct raid_bdev_io_channel		*raid_ch;	/* 框架 IO channel（合并层路径 raid_io=NULL 时使用）*/
 	struct poweraid_raid5f_raid		*raid;
+	struct raid_bdev			*raid_bdev;	/* 缓存，避免重复解引用 */
 
 	uint64_t				stripe_index;
 	uint8_t					p_idx;		/* parity 物理盘号 */
-	uint32_t				start_chunk;	/* 第一个被改 data chunk 序号 */
-	uint32_t				num_modified;	/* 被改 data chunk 数 */
-	uint64_t				chunk_bitmap;	/* PPL record 用 */
+	uint64_t				chunk_bitmap;	/* set bit i = data chunk i 被改 */
+	uint32_t				num_modified;	/* popcount(chunk_bitmap)，预计算 */
 
 	uint32_t				strip_bytes;
 
-	/* 缓冲：old_data/new_data 按 modified 序号（0..num_modified-1）排列 */
+	/* 缓冲：old_data/new_data 按 chunk_bitmap set bit 升序排列（buf_idx 0..num_modified-1） */
 	void					*old_data_buf;	/* num_modified * strip_bytes */
-	void					*new_data_buf;	/* num_modified * strip_bytes（从 raid_io iovs 拷贝）*/
+	void					*new_data_buf;	/* num_modified * strip_bytes */
 	void					*parity_buf;	/* strip_bytes：读旧 parity → 原地 XOR 成新 parity */
 
 	/* PPL */
@@ -69,6 +73,10 @@ struct rmw_op {
 	enum rmw_state				state;
 	uint32_t				io_remaining;
 	int					io_status;
+
+	/* 完成回调（合并层路径用；直接路径为 NULL → raid_bdev_io_complete）*/
+	void					(*complete_cb)(int status, void *cb_arg);
+	void					*complete_cb_arg;
 };
 
 /* 前向声明 */
@@ -102,13 +110,25 @@ rmw_op_free(struct rmw_op *op)
 static void
 rmw_op_finish(struct rmw_op *op, enum spdk_bdev_io_status status)
 {
-	struct raid_bdev_io *raid_io = op->raid_io;
-
 	SPDK_DEBUGLOG(raid5f_rmw, "rmw finish: op=%p status=%u stripe=%"PRIu64
-		      " start_chunk=%u num_modified=%u\n",
-		      op, status, op->stripe_index, op->start_chunk, op->num_modified);
-	rmw_op_free(op);
-	raid_bdev_io_complete(raid_io, status);
+		      " bitmap=0x%"PRIx64" num_modified=%u\n",
+		      op, status, op->stripe_index, op->chunk_bitmap, op->num_modified);
+
+	if (op->complete_cb != NULL) {
+		int s = (status == SPDK_BDEV_IO_STATUS_SUCCESS) ? 0 : -EIO;
+		void (*cb)(int, void *) = op->complete_cb;
+		void *cb_arg = op->complete_cb_arg;
+		rmw_op_free(op);
+		cb(s, cb_arg);
+	} else if (op->raid_io != NULL) {
+		struct raid_bdev_io *raid_io = op->raid_io;
+		rmw_op_free(op);
+		raid_bdev_io_complete(raid_io, status);
+	} else {
+		/* 无回调且无 raid_io：不应发生，释放并警告 */
+		SPDK_ERRLOG("rmw finish: no completion path, op=%p\n", op);
+		rmw_op_free(op);
+	}
 }
 
 /* ===== 几何辅助 ===== */
@@ -131,7 +151,6 @@ rmw_can_proceed(struct rmw_op *op)
 static void
 rmw_find_ppl(struct rmw_op *op)
 {
-	struct raid_bdev_io *raid_io = op->raid_io;
 	struct poweraid_raid5f_raid *raid = op->raid;
 	uint8_t i;
 
@@ -140,7 +159,7 @@ rmw_find_ppl(struct rmw_op *op)
 		    raid->base_bdevs[i]->ppl_ctx != NULL) {
 			op->ppl_ctx = raid->base_bdevs[i]->ppl_ctx;
 			op->ppl_ch = raid_bdev_channel_get_base_channel(
-				raid_io->raid_ch, i);
+				op->raid_ch, i);
 			break;
 		}
 	}
@@ -151,12 +170,12 @@ rmw_find_ppl(struct rmw_op *op)
 static void
 rmw_start_reads(struct rmw_op *op)
 {
-	struct raid_bdev_io *raid_io = op->raid_io;
-	struct raid_bdev *raid_bdev = raid_io->raid_bdev;
+	struct raid_bdev *raid_bdev = op->raid_bdev;
 	struct poweraid_raid5f_raid *raid = op->raid;
 	uint64_t base_offset = raid->data_offset_blocks +
 			       op->stripe_index * raid->strip_size;
-	uint32_t i;
+	uint64_t bits = op->chunk_bitmap;
+	uint32_t buf_idx = 0;
 	int rc;
 
 	op->state = RMW_S_READ_OLD;
@@ -164,23 +183,25 @@ rmw_start_reads(struct rmw_op *op)
 	op->io_status = 0;
 
 	SPDK_DEBUGLOG(raid5f_rmw, "rmw reads: op=%p stripe=%"PRIu64" base_offset=%"PRIu64
-		      " p_idx=%u num_modified=%u\n",
-		      op, op->stripe_index, base_offset, op->p_idx, op->num_modified);
+		      " p_idx=%u bitmap=0x%"PRIx64" num_modified=%u\n",
+		      op, op->stripe_index, base_offset, op->p_idx,
+		      op->chunk_bitmap, op->num_modified);
 
-	/* 读旧 data chunks */
-	for (i = 0; i < op->num_modified; i++) {
-		uint8_t data_idx = op->start_chunk + i;
+	/* 读旧 data chunks（按 chunk_bitmap set bit 升序）*/
+	while (bits) {
+		uint8_t data_idx = __builtin_ctzll(bits);
+		bits &= bits - 1;
 		uint8_t phys = rmw_data_to_phys(data_idx, op->p_idx);
 		struct raid_base_bdev_info *base_info = &raid_bdev->base_bdev_info[phys];
 		struct spdk_io_channel *base_ch;
 		struct spdk_bdev_ext_io_opts io_opts = {0};
 		struct iovec iov = {
-			.iov_base = (char *)op->old_data_buf + i * op->strip_bytes,
+			.iov_base = (char *)op->old_data_buf + buf_idx * op->strip_bytes,
 			.iov_len = op->strip_bytes,
 		};
 
 		io_opts.size = sizeof(io_opts);
-		base_ch = raid_bdev_channel_get_base_channel(raid_io->raid_ch, phys);
+		base_ch = raid_bdev_channel_get_base_channel(op->raid_ch, phys);
 		if (base_ch == NULL || base_info->desc == NULL) {
 			SPDK_ERRLOG("rmw read: no channel for data chunk %u (phys %u)\n",
 				    data_idx, phys);
@@ -188,6 +209,7 @@ rmw_start_reads(struct rmw_op *op)
 			if (--op->io_remaining == 0) {
 				rmw_calc_and_next(op);
 			}
+			buf_idx++;
 			continue;
 		}
 
@@ -201,6 +223,7 @@ rmw_start_reads(struct rmw_op *op)
 				rmw_calc_and_next(op);
 			}
 		}
+		buf_idx++;
 	}
 
 	/* 读旧 parity（p_idx 盘）*/
@@ -214,7 +237,7 @@ rmw_start_reads(struct rmw_op *op)
 		};
 
 		io_opts.size = sizeof(io_opts);
-		p_ch = raid_bdev_channel_get_base_channel(raid_io->raid_ch, op->p_idx);
+		p_ch = raid_bdev_channel_get_base_channel(op->raid_ch, op->p_idx);
 		if (p_ch == NULL || p_info->desc == NULL) {
 			SPDK_ERRLOG("rmw read: no channel for parity (p_idx %u)\n",
 				    op->p_idx);
@@ -264,7 +287,8 @@ rmw_calc_and_next(struct rmw_op *op)
 	uint64_t *parity = op->parity_buf;
 	struct poweraid_raid5f_ppl_hash_ctx old_h, new_h;
 	uint64_t old_hash, new_hash;
-	uint32_t i, j;
+	uint64_t bits;
+	uint32_t buf_idx, j;
 
 	if (!rmw_can_proceed(op)) {
 		SPDK_WARNLOG("rmw: raid offline during reads, abort op=%p\n", op);
@@ -281,27 +305,36 @@ rmw_calc_and_next(struct rmw_op *op)
 	op->state = RMW_S_CALC;
 
 	/* 新 parity = 旧 parity ^ (旧 data[i] ^ 新 data[i]) for each modified i
-	 * 原地更新 parity_buf：先已是旧 parity，XOR 进 (old ^ new) 即得新 parity。*/
-	for (i = 0; i < op->num_modified; i++) {
+	 * 原地更新 parity_buf：先已是旧 parity，XOR 进 (old ^ new) 即得新 parity。
+	 * 按 chunk_bitmap set bit 升序迭代（与 recovery 读盘顺序一致）。*/
+	bits = op->chunk_bitmap;
+	buf_idx = 0;
+	while (bits) {
 		const uint64_t *oldp = (const uint64_t *)
-			((char *)op->old_data_buf + i * op->strip_bytes);
+			((char *)op->old_data_buf + buf_idx * op->strip_bytes);
 		const uint64_t *newp = (const uint64_t *)
-			((char *)op->new_data_buf + i * op->strip_bytes);
+			((char *)op->new_data_buf + buf_idx * op->strip_bytes);
 		for (j = 0; j < strip_u64; j++) {
 			parity[j] ^= oldp[j] ^ newp[j];
 		}
+		bits &= bits - 1;
+		buf_idx++;
 	}
 
-	/* old/new hash：按 modified chunk 升序（与 recovery 读盘顺序一致）*/
+	/* old/new hash：按 chunk_bitmap set bit 升序 */
 	poweraid_raid5f_ppl_hash_init(&old_h);
 	poweraid_raid5f_ppl_hash_init(&new_h);
-	for (i = 0; i < op->num_modified; i++) {
+	bits = op->chunk_bitmap;
+	buf_idx = 0;
+	while (bits) {
 		poweraid_raid5f_ppl_hash_update(&old_h,
-			(char *)op->old_data_buf + i * op->strip_bytes,
+			(char *)op->old_data_buf + buf_idx * op->strip_bytes,
 			op->strip_bytes);
 		poweraid_raid5f_ppl_hash_update(&new_h,
-			(char *)op->new_data_buf + i * op->strip_bytes,
+			(char *)op->new_data_buf + buf_idx * op->strip_bytes,
 			op->strip_bytes);
+		bits &= bits - 1;
+		buf_idx++;
 	}
 	old_hash = poweraid_raid5f_ppl_hash_final(&old_h);
 	new_hash = poweraid_raid5f_ppl_hash_final(&new_h);
@@ -350,31 +383,32 @@ rmw_ppl_append_done(int status, uint64_t seq, void *cb_arg)
 static void
 rmw_start_writes(struct rmw_op *op)
 {
-	struct raid_bdev_io *raid_io = op->raid_io;
-	struct raid_bdev *raid_bdev = raid_io->raid_bdev;
+	struct raid_bdev *raid_bdev = op->raid_bdev;
 	struct poweraid_raid5f_raid *raid = op->raid;
 	uint64_t base_offset = raid->data_offset_blocks +
 			       op->stripe_index * raid->strip_size;
-	uint32_t i;
+	uint64_t bits = op->chunk_bitmap;
+	uint32_t buf_idx = 0;
 	int rc;
 
 	op->state = RMW_S_WRITE;
 	op->io_remaining = op->num_modified + 1; /* data chunks + parity */
 	op->io_status = 0;
 
-	for (i = 0; i < op->num_modified; i++) {
-		uint8_t data_idx = op->start_chunk + i;
+	while (bits) {
+		uint8_t data_idx = __builtin_ctzll(bits);
+		bits &= bits - 1;
 		uint8_t phys = rmw_data_to_phys(data_idx, op->p_idx);
 		struct raid_base_bdev_info *base_info = &raid_bdev->base_bdev_info[phys];
 		struct spdk_io_channel *base_ch;
 		struct spdk_bdev_ext_io_opts io_opts = {0};
 		struct iovec iov = {
-			.iov_base = (char *)op->new_data_buf + i * op->strip_bytes,
+			.iov_base = (char *)op->new_data_buf + buf_idx * op->strip_bytes,
 			.iov_len = op->strip_bytes,
 		};
 
 		io_opts.size = sizeof(io_opts);
-		base_ch = raid_bdev_channel_get_base_channel(raid_io->raid_ch, phys);
+		base_ch = raid_bdev_channel_get_base_channel(op->raid_ch, phys);
 		if (base_ch == NULL || base_info->desc == NULL) {
 			SPDK_ERRLOG("rmw write: no channel for data chunk %u (phys %u)\n",
 				    data_idx, phys);
@@ -382,6 +416,7 @@ rmw_start_writes(struct rmw_op *op)
 			if (--op->io_remaining == 0) {
 				rmw_start_flushes(op);
 			}
+			buf_idx++;
 			continue;
 		}
 
@@ -395,6 +430,7 @@ rmw_start_writes(struct rmw_op *op)
 				rmw_start_flushes(op);
 			}
 		}
+		buf_idx++;
 	}
 
 	/* 写新 parity（p_idx 盘）*/
@@ -408,7 +444,7 @@ rmw_start_writes(struct rmw_op *op)
 		};
 
 		io_opts.size = sizeof(io_opts);
-		p_ch = raid_bdev_channel_get_base_channel(raid_io->raid_ch, op->p_idx);
+		p_ch = raid_bdev_channel_get_base_channel(op->raid_ch, op->p_idx);
 		if (p_ch == NULL || p_info->desc == NULL) {
 			SPDK_ERRLOG("rmw write: no channel for parity (p_idx %u)\n",
 				    op->p_idx);
@@ -454,12 +490,11 @@ rmw_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 static void
 rmw_start_flushes(struct rmw_op *op)
 {
-	struct raid_bdev_io *raid_io = op->raid_io;
-	struct raid_bdev *raid_bdev = raid_io->raid_bdev;
+	struct raid_bdev *raid_bdev = op->raid_bdev;
 	struct poweraid_raid5f_raid *raid = op->raid;
 	uint64_t base_offset = raid->data_offset_blocks +
 			       op->stripe_index * raid->strip_size;
-	uint32_t i;
+	uint64_t bits = op->chunk_bitmap;
 	int rc;
 
 	if (!rmw_can_proceed(op)) {
@@ -480,13 +515,14 @@ rmw_start_flushes(struct rmw_op *op)
 	op->io_remaining = op->num_modified + 1;
 	op->io_status = 0;
 
-	for (i = 0; i < op->num_modified; i++) {
-		uint8_t data_idx = op->start_chunk + i;
+	while (bits) {
+		uint8_t data_idx = __builtin_ctzll(bits);
+		bits &= bits - 1;
 		uint8_t phys = rmw_data_to_phys(data_idx, op->p_idx);
 		struct raid_base_bdev_info *base_info = &raid_bdev->base_bdev_info[phys];
 		struct spdk_io_channel *base_ch;
 
-		base_ch = raid_bdev_channel_get_base_channel(raid_io->raid_ch, phys);
+		base_ch = raid_bdev_channel_get_base_channel(op->raid_ch, phys);
 		if (base_ch == NULL || base_info->desc == NULL) {
 			op->io_status = -ENODEV;
 			if (--op->io_remaining == 0) {
@@ -513,7 +549,7 @@ rmw_start_flushes(struct rmw_op *op)
 		struct raid_base_bdev_info *p_info = &raid_bdev->base_bdev_info[op->p_idx];
 		struct spdk_io_channel *p_ch;
 
-		p_ch = raid_bdev_channel_get_base_channel(raid_io->raid_ch, op->p_idx);
+		p_ch = raid_bdev_channel_get_base_channel(op->raid_ch, op->p_idx);
 		if (p_ch == NULL || p_info->desc == NULL) {
 			op->io_status = -ENODEV;
 			if (--op->io_remaining == 0) {
@@ -600,7 +636,40 @@ rmw_ppl_commit_done(int status, void *cb_arg)
 	rmw_op_finish(op, io_status);
 }
 
-/* ===== 入口：提交 RMW IO ===== */
+/* ===== 内部初始化：分配 op + 缓冲 + PPL ctx（不启动状态机）===== */
+
+static int
+rmw_op_alloc(struct rmw_op *op)
+{
+	uint32_t num_modified = op->num_modified;
+	uint32_t strip_bytes = op->strip_bytes;
+
+	op->old_data_buf = spdk_dma_malloc((size_t)num_modified * strip_bytes,
+					   0x1000, NULL);
+	if (op->old_data_buf == NULL) {
+		return -ENOMEM;
+	}
+	op->new_data_buf = spdk_dma_malloc((size_t)num_modified * strip_bytes,
+					   0x1000, NULL);
+	if (op->new_data_buf == NULL) {
+		spdk_dma_free(op->old_data_buf);
+		op->old_data_buf = NULL;
+		return -ENOMEM;
+	}
+	op->parity_buf = spdk_dma_malloc(strip_bytes, 0x1000, NULL);
+	if (op->parity_buf == NULL) {
+		spdk_dma_free(op->new_data_buf);
+		op->new_data_buf = NULL;
+		spdk_dma_free(op->old_data_buf);
+		op->old_data_buf = NULL;
+		return -ENOMEM;
+	}
+
+	rmw_find_ppl(op);
+	return 0;
+}
+
+/* ===== 入口 A：直接单 strip 写（raid_io 完成回调）===== */
 
 int
 poweraid_raid5f_rmw_submit(struct raid_bdev_io *raid_io)
@@ -633,50 +702,39 @@ poweraid_raid5f_rmw_submit(struct raid_bdev_io *raid_io)
 		return -EINVAL;
 	}
 
+	/* 构建 chunk_bitmap（连续 range）*/
+	for (i = 0; i < num_modified; i++) {
+		chunk_bitmap |= (1ULL << (start_chunk + i));
+	}
+
 	op = calloc(1, sizeof(*op));
 	if (op == NULL) {
 		SPDK_ERRLOG("rmw: alloc op failed\n");
 		return -ENOMEM;
 	}
 	op->raid_io = raid_io;
+	op->raid_ch = raid_io->raid_ch;
 	op->raid = raid;
+	op->raid_bdev = raid_bdev;
 	op->stripe_index = stripe_index;
 	op->p_idx = p_idx;
-	op->start_chunk = start_chunk;
+	op->chunk_bitmap = chunk_bitmap;
 	op->num_modified = num_modified;
 	op->strip_bytes = strip_size_bytes;
+	op->complete_cb = NULL;
+	op->complete_cb_arg = NULL;
 
-	/* chunk_bitmap：被改 data chunk 位图 */
-	for (i = 0; i < num_modified; i++) {
-		chunk_bitmap |= (1ULL << (start_chunk + i));
-	}
-	op->chunk_bitmap = chunk_bitmap;
+	SPDK_DEBUGLOG(raid5f_rmw, "rmw submit: op=%p stripe=%"PRIu64" p_idx=%u"
+		       " bitmap=0x%"PRIx64" num_modified=%u\n",
+		       op, stripe_index, p_idx, chunk_bitmap, num_modified);
 
-	SPDK_NOTICELOG("rmw submit: op=%p stripe=%"PRIu64" p_idx=%u"
-		       " start_chunk=%u num_modified=%u bitmap=0x%"PRIx64"\n",
-		       op, stripe_index, p_idx, start_chunk, num_modified,
-	       chunk_bitmap);
-
-	/* 分配缓冲 */
-	op->old_data_buf = spdk_dma_malloc((size_t)num_modified * strip_size_bytes,
-					   0x1000, NULL);
-	if (op->old_data_buf == NULL) {
-		rc = -ENOMEM;
-		goto err_free_op;
-	}
-	op->new_data_buf = spdk_dma_malloc((size_t)num_modified * strip_size_bytes,
-					   0x1000, NULL);
-	if (op->new_data_buf == NULL) {
-		rc = -ENOMEM;
-		goto err_free_old;
-	}
-	op->parity_buf = spdk_dma_malloc(strip_size_bytes, 0x1000, NULL);
-	if (op->parity_buf == NULL) {
-		rc = -ENOMEM;
-		goto err_free_new;
+	rc = rmw_op_alloc(op);
+	if (rc != 0) {
+		free(op);
+		return rc;
 	}
 
-	/* 从 raid_io iovs 拷贝新数据（modified chunks 连续，按序拷贝）*/
+	/* 从 raid_io iovs 拷贝新数据到 new_data_buf */
 	rc = (int)spdk_iovcpy(raid_io->iovs, raid_io->iovcnt,
 		&(struct iovec){ .iov_base = op->new_data_buf,
 				 .iov_len = (size_t)num_modified * strip_size_bytes },
@@ -684,27 +742,80 @@ poweraid_raid5f_rmw_submit(struct raid_bdev_io *raid_io)
 	if (rc != (int)((size_t)num_modified * strip_size_bytes)) {
 		SPDK_ERRLOG("rmw: iovcpy short copied=%d expect=%zu\n",
 			    rc, (size_t)num_modified * strip_size_bytes);
-		rc = -EIO;
-		goto err_free_parity;
+		rmw_op_free(op);
+		return -EIO;
 	}
-
-	/* 查找 PPL ctx（与 write_full 一致：首个带 ppl_ctx 的成员盘）*/
-	rmw_find_ppl(op);
 
 	/* 启动状态机：Step 1 读旧 data + 旧 parity */
 	rmw_start_reads(op);
 	return 0;
+}
 
-err_free_parity:
-	spdk_dma_free(op->parity_buf);
-	op->parity_buf = NULL;
-err_free_new:
-	spdk_dma_free(op->new_data_buf);
-	op->new_data_buf = NULL;
-err_free_old:
-	spdk_dma_free(op->old_data_buf);
-	op->old_data_buf = NULL;
-err_free_op:
-	free(op);
-	return rc;
+/* ===== 入口 B：合并层调用（自定义完成回调，非连续 chunk_bitmap）===== */
+
+int
+poweraid_raid5f_rmw_submit_merged(
+	struct raid_bdev_io_channel *raid_ch,
+	struct poweraid_raid5f_raid *raid,
+	uint64_t stripe_index,
+	uint64_t chunk_bitmap,
+	void **new_chunk_bufs,
+	void (*cb)(int status, void *cb_arg),
+	void *cb_arg)
+{
+	uint32_t data_chunks = raid->num_base_bdevs - 1;
+	uint8_t p_idx = data_chunks - (stripe_index % raid->num_base_bdevs);
+	uint32_t strip_size_bytes = raid->strip_size * raid->block_size;
+	uint32_t num_modified = (uint32_t)__builtin_popcountll(chunk_bitmap);
+	struct rmw_op *op;
+	uint64_t bits;
+	uint32_t buf_idx;
+	int rc;
+
+	if (chunk_bitmap == 0 || num_modified >= data_chunks) {
+		SPDK_ERRLOG("rmw_merged: invalid bitmap=0x%"PRIx64" num=%u dc=%u\n",
+			    chunk_bitmap, num_modified, data_chunks);
+		return -EINVAL;
+	}
+
+	op = calloc(1, sizeof(*op));
+	if (op == NULL) {
+		return -ENOMEM;
+	}
+	op->raid_io = NULL;
+	op->raid_ch = raid_ch;
+	op->raid = raid;
+	op->raid_bdev = raid->raid_bdev;
+	op->stripe_index = stripe_index;
+	op->p_idx = p_idx;
+	op->chunk_bitmap = chunk_bitmap;
+	op->num_modified = num_modified;
+	op->strip_bytes = strip_size_bytes;
+	op->complete_cb = cb;
+	op->complete_cb_arg = cb_arg;
+
+	SPDK_DEBUGLOG(raid5f_rmw, "rmw_merged: op=%p stripe=%"PRIu64" p_idx=%u"
+		       " bitmap=0x%"PRIx64" num_modified=%u\n",
+		       op, stripe_index, p_idx, chunk_bitmap, num_modified);
+
+	rc = rmw_op_alloc(op);
+	if (rc != 0) {
+		free(op);
+		return rc;
+	}
+
+	/* 从 new_chunk_bufs 拷贝新数据到 new_data_buf（按 bit 升序）*/
+	bits = chunk_bitmap;
+	buf_idx = 0;
+	while (bits) {
+		uint32_t chunk = __builtin_ctzll(bits);
+		bits &= bits - 1;
+		memcpy((char *)op->new_data_buf + buf_idx * strip_size_bytes,
+		       new_chunk_bufs[chunk], strip_size_bytes);
+		buf_idx++;
+	}
+
+	/* 启动状态机 */
+	rmw_start_reads(op);
+	return 0;
 }

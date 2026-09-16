@@ -16,6 +16,7 @@
 #include "../bdev_raid.h"
 #include "poweraid_raid5f.h"
 #include "poweraid_raid5f_rmw.h"
+#include "poweraid_raid5f_merge.h"
 
 SPDK_LOG_REGISTER_COMPONENT(poweraid_raid5f)
 
@@ -84,6 +85,14 @@ poweraid_raid5f_ioch_create(void *io_device, void *ctx_buf)
 		goto err;
 	}
 
+	/* 合并层初始化（阶段 3b）*/
+	if (poweraid_raid5f_merge_init(&ch->merge_ctx, raid, ch) != 0) {
+		SPDK_ERRLOG("poweraid_raid5f: merge_init failed\n");
+		spdk_put_io_channel(ch->accel_ch);
+		ch->accel_ch = NULL;
+		goto err;
+	}
+
 	SPDK_DEBUGLOG(poweraid_raid5f, "ioch_create: raid=%p ch=%p\n", raid, ch);
 	return 0;
 
@@ -107,6 +116,9 @@ poweraid_raid5f_ioch_destroy(void *io_device, void *ctx_buf)
 	struct poweraid_raid5f_req *req;
 
 	assert(TAILQ_EMPTY(&ch->xor_retry_queue));
+
+	/* 合并层销毁（先于 stripe_request 池，确保 pending IO 完成）*/
+	poweraid_raid5f_merge_destroy(&ch->merge_ctx);
 
 	while ((req = TAILQ_FIRST(&ch->free_write_stripe_requests))) {
 		TAILQ_REMOVE(&ch->free_write_stripe_requests, req, link);
@@ -512,13 +524,13 @@ poweraid_raid5f_submit_rw_request(struct raid_bdev_io *raid_io)
 
 	/* 写分流：完整 stripe → 全 stripe 写路径（5 步 barrier）；
 	 * 部分 stripe（框架 split_on_write_unit/optimal_io_boundary 保证 strip 对齐且不跨 stripe）
-	 * → RMW 路径（读旧 data+parity → 算新 parity → PPL → 写 → flush → commit）。*/
+	 * → 合并层（merge_submit，收集同 stripe 多 strip，1ms 超时或全覆盖后 flush）。*/
 	stripe_index = raid_io->offset_blocks / stripe_blocks;
 	stripe_offset = raid_io->offset_blocks % stripe_blocks;
 	if (stripe_offset != 0 || raid_io->num_blocks != stripe_blocks) {
-		int rmw_rc = poweraid_raid5f_rmw_submit(raid_io);
-		if (rmw_rc != 0) {
-			raid_bdev_io_complete(raid_io, rmw_rc == -ENOMEM ?
+		int merge_rc = poweraid_raid5f_merge_submit(raid_io);
+		if (merge_rc != 0) {
+			raid_bdev_io_complete(raid_io, merge_rc == -ENOMEM ?
 					      SPDK_BDEV_IO_STATUS_NOMEM :
 					      SPDK_BDEV_IO_STATUS_FAILED);
 		}
@@ -627,6 +639,33 @@ poweraid_raid5f_submit_process_request(struct raid_bdev_process_request *process
 	return 0;
 }
 
+/* ===== FLUSH / UNMAP 处理（阶段 3b）=====
+ * FLUSH：先 drain 合并层 pending entries（写路径自带 FUA/flush barrier，
+ *         drain 后数据已在持久存储上），然后完成 flush IO。
+ * UNMAP：阶段 4 实现，暂不支持。
+ */
+static void
+poweraid_raid5f_submit_null_payload_request(struct raid_bdev_io *raid_io)
+{
+	switch (raid_io->type) {
+	case SPDK_BDEV_IO_TYPE_FLUSH:
+		poweraid_raid5f_merge_flush_all(raid_io);
+		break;
+
+	case SPDK_BDEV_IO_TYPE_UNMAP:
+		/* TODO 阶段 4：TRIM 支持 */
+		SPDK_WARNLOG("poweraid_raid5f: UNMAP not yet supported\n");
+		raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
+		break;
+
+	default:
+		SPDK_ERRLOG("poweraid_raid5f: invalid null payload io type %u\n",
+			    raid_io->type);
+		raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
+		break;
+	}
+}
+
 /* ===== 模块注册（参考 raid5f.c g_raid5f_module）===== */
 struct raid_bdev_module g_poweraid_raid5f_module = {
 	.level = SPDK_BDEV_RAID_LEVEL_RAID5F,  /* 阶段 1 复用 5F，后续可注册 RAID6 */
@@ -637,5 +676,6 @@ struct raid_bdev_module g_poweraid_raid5f_module = {
 	.submit_rw_request = poweraid_raid5f_submit_rw_request,
 	.get_io_channel = poweraid_raid5f_get_io_channel,
 	.submit_process_request = poweraid_raid5f_submit_process_request,
+	.submit_null_payload_request = poweraid_raid5f_submit_null_payload_request,
 };
 RAID_MODULE_REGISTER(&g_poweraid_raid5f_module)

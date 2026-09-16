@@ -14,6 +14,8 @@
 #include "spdk/thread.h"
 #include "spdk/uuid.h"
 
+#include "poweraid_raid5f_merge.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -278,6 +280,9 @@ struct poweraid_raid5f_io_channel {
 
 	/* accel_ch 资源不足时重试队列 */
 	TAILQ_HEAD(, poweraid_raid5f_req) xor_retry_queue;
+
+	/* 合并层上下文（阶段 3b）*/
+	struct merge_ctx merge_ctx;
 };
 
 /* ===== 通用分派入口 ===== */
