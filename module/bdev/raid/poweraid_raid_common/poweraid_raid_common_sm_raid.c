@@ -1,8 +1,8 @@
 /*   SPDX-License-Identifier: BSD-3-Clause
  *   Copyright (c) 2026 poweraid. All rights reserved.
  *
- *   RAID 层 FSM handler（38 个事件，对应 poweraid_raid5f_sm.h 中
- *   enum poweraid_raid5f_raid_event 全部真实事件）
+ *   RAID 层 FSM handler（38 个事件，对应 poweraid_raid_common_sm.h 中
+ *   enum poweraid_raid_common_raid_event 全部真实事件）
  *
  *   阶段 1：全部为 stub，仅 SPDK_DEBUGLOG 打印 + 立即返回。
  *   后续阶段逐个填充实际逻辑（参考 XISRC rdx_stt[STATE][EVENT] 二维分派）。
@@ -13,7 +13,7 @@
 #include "spdk/stdinc.h"
 #include "spdk/log.h"
 
-#include "poweraid_raid5f.h"
+#include "poweraid_raid_common.h"
 
 SPDK_LOG_REGISTER_COMPONENT(raid5f_sm_raid);
 
@@ -23,8 +23,8 @@ SPDK_LOG_REGISTER_COMPONENT(raid5f_sm_raid);
  */
 #define DEFINE_RAID_HANDLER(name)                                        \
 void                                                                     \
-poweraid_raid5f_sm_raid_##name(struct poweraid_raid5f_raid *raid,        \
-			       enum poweraid_raid5f_raid_event event)        \
+poweraid_raid_common_sm_raid_##name(struct poweraid_raid_common_raid *raid,        \
+			       enum poweraid_raid_common_raid_event event)        \
 {                                                                        \
 	SPDK_DEBUGLOG(raid5f_sm_raid, "%s: raid=%p state=0x%" PRIx64     \
 		       " event=%u\n", #name, raid,                         \
@@ -91,8 +91,8 @@ DEFINE_RAID_HANDLER(unregister_bdev)
  * 参考：XISRC xnr_create_dsc + raid5f_start 的 r5f_info 分配（L1061-1095）。
  */
 void
-poweraid_raid5f_sm_raid_create_dsc(struct poweraid_raid5f_raid *raid,
-				   enum poweraid_raid5f_raid_event event)
+poweraid_raid_common_sm_raid_create_dsc(struct poweraid_raid_common_raid *raid,
+				   enum poweraid_raid_common_raid_event event)
 {
 	int rc;
 
@@ -106,7 +106,7 @@ poweraid_raid5f_sm_raid_create_dsc(struct poweraid_raid5f_raid *raid,
 	}
 
 	/* 分配 superblock v2 上下文（v1 + base_bdevs + ext 区）*/
-	rc = poweraid_raid5f_sb_alloc(raid, raid->block_size, raid->num_base_bdevs);
+	rc = poweraid_raid_common_sb_alloc(raid, raid->block_size, raid->num_base_bdevs);
 	if (rc != 0) {
 		SPDK_ERRLOG("create_dsc: sb_alloc failed rc=%d (raid=%p)\n", rc, raid);
 		return;
@@ -114,14 +114,14 @@ poweraid_raid5f_sm_raid_create_dsc(struct poweraid_raid5f_raid *raid,
 
 	/* 初始化 superblock 字段（v2 版本号、ext_signature、CRC 双区）。
 	 * 阶段 2 默认开启 PPL（write hole 根治）；后续阶段按 raid 配置增减。*/
-	poweraid_raid5f_sb_init(raid, raid->level, raid->strip_size,
-				POWERAID_RAID5F_SB_F_PPL);
+	poweraid_raid_common_sb_init(raid, raid->level, raid->strip_size,
+				POWERAID_RAID_COMMON_SB_F_PPL);
 
 	/* 标记配置待持久化（阶段 2 由 EV_SAVE_CONFIG 落盘）*/
 	poweraid_raid_state_set(&raid->state, POWERAID_RAID_ST_CONFIG_DIRTY);
 
 	/* 触发下一事件：打开所有 base bdev */
-	poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_RAID, raid,
+	poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_RAID, raid,
 				   POWERAID_RAID_EV_OPEN_BDEVS);
 }
 
@@ -131,8 +131,8 @@ poweraid_raid5f_sm_raid_create_dsc(struct poweraid_raid5f_raid *raid,
  * 参考：XISRC xnr_open_bdevs 遍历 + raid5f RAID_FOR_EACH_BASE_BDEV（L1068）。
  */
 void
-poweraid_raid5f_sm_raid_open_bdevs(struct poweraid_raid5f_raid *raid,
-				   enum poweraid_raid5f_raid_event event)
+poweraid_raid_common_sm_raid_open_bdevs(struct poweraid_raid_common_raid *raid,
+				   enum poweraid_raid_common_raid_event event)
 {
 	uint8_t i;
 
@@ -151,7 +151,7 @@ poweraid_raid5f_sm_raid_open_bdevs(struct poweraid_raid5f_raid *raid,
 			SPDK_ERRLOG("open_bdevs: base_bdev[%u] NULL\n", i);
 			continue;
 		}
-		poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_BDEV,
+		poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_BDEV,
 					   raid->base_bdevs[i],
 					   POWERAID_BDEV_EV_OPEN);
 	}
@@ -160,8 +160,8 @@ poweraid_raid5f_sm_raid_open_bdevs(struct poweraid_raid5f_raid *raid,
 /* ===== parity fixup：对 data==old/data==new 的未提交 stripe，用当前数据重算
  * 并重写 parity（写+flush）。INCONSISTENT 仅告警（阶段 2 不做数据重构）。===== */
 struct parity_fixup {
-	struct poweraid_raid5f_raid		*raid;
-	struct poweraid_raid5f_recovery_result	*results;
+	struct poweraid_raid_common_raid		*raid;
+	struct poweraid_raid_common_recovery_result	*results;
 	uint32_t				num;
 	uint32_t				idx;
 	uint32_t				chunk;
@@ -178,11 +178,11 @@ static void parity_fixup_flush_cb(struct spdk_bdev_io *bdev_io, bool success, vo
 static void
 parity_fixup_finish(struct parity_fixup *op)
 {
-	struct poweraid_raid5f_raid *raid = op->raid;
+	struct poweraid_raid_common_raid *raid = op->raid;
 
 	SPDK_NOTICELOG("online: parity fixup done, %u uncommitted stripes processed\n",
 		       op->num);
-	poweraid_raid5f_recovery_free_result(op->results);
+	poweraid_raid_common_recovery_free_result(op->results);
 	free(op);
 	/* recovery + fixup 全部落盘后数据面才允许 IO */
 	poweraid_raid_state_clear(&raid->state, POWERAID_RAID_ST_RESTORING);
@@ -192,14 +192,14 @@ parity_fixup_finish(struct parity_fixup *op)
 static void
 parity_fixup_abort(struct parity_fixup *op, const char *why)
 {
-	struct poweraid_raid5f_raid *raid = op->raid;
+	struct poweraid_raid_common_raid *raid = op->raid;
 
 	SPDK_WARNLOG("online: parity fixup aborted (%s) at %u/%u\n",
 		     why, op->idx, op->num);
 	if (op->pbuf != NULL) {
 		spdk_dma_free(op->pbuf);
 	}
-	poweraid_raid5f_recovery_free_result(op->results);
+	poweraid_raid_common_recovery_free_result(op->results);
 	free(op);
 	poweraid_raid_state_clear(&raid->state, POWERAID_RAID_ST_RESTORING);
 }
@@ -207,7 +207,7 @@ parity_fixup_abort(struct parity_fixup *op, const char *why)
 static void
 parity_fixup_write_or_next(struct parity_fixup *op)
 {
-	struct poweraid_raid5f_bdev *bdev;
+	struct poweraid_raid_common_bdev *bdev;
 	struct spdk_bdev_desc *desc;
 	struct spdk_io_channel *ch;
 	uint64_t stripe = op->results[op->idx].stripe_id;
@@ -272,7 +272,7 @@ parity_fixup_read_cb(int status, const void *buf, size_t len, void *cb_arg)
 	}
 	op->chunk++;
 	if (op->chunk < op->data_chunks) {
-		poweraid_raid5f_recovery_read_strip(op->raid,
+		poweraid_raid_common_recovery_read_strip(op->raid,
 			op->results[op->idx].stripe_id, op->chunk,
 			op->raid->strip_size, parity_fixup_read_cb, op);
 		return;
@@ -284,7 +284,7 @@ static void
 parity_fixup_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct parity_fixup *op = cb_arg;
-	struct poweraid_raid5f_bdev *bdev;
+	struct poweraid_raid_common_bdev *bdev;
 	uint64_t stripe = op->results[op->idx].stripe_id;
 	uint8_t p_idx;
 	uint64_t offset;
@@ -350,7 +350,7 @@ parity_fixup_next(struct parity_fixup *op)
 		return;
 	}
 	while (op->idx < op->num) {
-		enum poweraid_raid5f_recovery_action act = op->results[op->idx].action;
+		enum poweraid_raid_common_recovery_action act = op->results[op->idx].action;
 		if (act != POWERAID_RECOVERY_ACT_NONE &&
 		    act != POWERAID_RECOVERY_ACT_REWRITE_PARITY) {
 			op->idx++;  /* INCONSISTENT：不处理 */
@@ -364,7 +364,7 @@ parity_fixup_next(struct parity_fixup *op)
 			continue;
 		}
 		memset(op->pbuf, 0, op->strip_bytes);
-		poweraid_raid5f_recovery_read_strip(op->raid,
+		poweraid_raid_common_recovery_read_strip(op->raid,
 			op->results[op->idx].stripe_id, 0,
 			op->raid->strip_size, parity_fixup_read_cb, op);
 		return;
@@ -377,11 +377,11 @@ parity_fixup_next(struct parity_fixup *op)
  *   - 对 NONE / REWRITE_PARITY 的 stripe 异步重算重写 parity（flush 落盘）；
  *   - INCONSISTENT 仅告警（部分写，阶段 2 无法重构数据，留 scrub/阶段 3+）。*/
 static void
-poweraid_raid5f_online_recovery_done(int status,
-		const struct poweraid_raid5f_recovery_result *results,
+poweraid_raid_common_online_recovery_done(int status,
+		const struct poweraid_raid_common_recovery_result *results,
 		uint32_t num_results, void *cb_arg)
 {
-	struct poweraid_raid5f_raid *raid = cb_arg;
+	struct poweraid_raid_common_raid *raid = cb_arg;
 	struct parity_fixup *op;
 	uint32_t i;
 
@@ -391,11 +391,11 @@ poweraid_raid5f_online_recovery_done(int status,
 		return;
 	}
 	if (num_results == 0) {
-		SPDK_NOTICELOG("poweraid_raid5f_ppl: replay clean (no uncommitted) raid=%p\n", raid);
+		SPDK_NOTICELOG("poweraid_raid_common_ppl: replay clean (no uncommitted) raid=%p\n", raid);
 		poweraid_raid_state_clear(&raid->state, POWERAID_RAID_ST_RESTORING);
 		return;
 	}
-	SPDK_NOTICELOG("poweraid_raid5f_ppl: replay found %u uncommitted records raid=%p\n",
+	SPDK_NOTICELOG("poweraid_raid_common_ppl: replay found %u uncommitted records raid=%p\n",
 		       num_results, raid);
 	for (i = 0; i < num_results; i++) {
 		const char *act = "NONE";
@@ -410,11 +410,11 @@ poweraid_raid5f_online_recovery_done(int status,
 
 	op = calloc(1, sizeof(*op));
 	if (op == NULL) {
-		poweraid_raid5f_recovery_free_result((struct poweraid_raid5f_recovery_result *)results);
+		poweraid_raid_common_recovery_free_result((struct poweraid_raid_common_recovery_result *)results);
 		return;
 	}
 	op->raid = raid;
-	op->results = (struct poweraid_raid5f_recovery_result *)results;
+	op->results = (struct poweraid_raid_common_recovery_result *)results;
 	op->num = num_results;
 	op->data_chunks = raid->num_base_bdevs - 1;
 	op->strip_bytes = (size_t)raid->strip_size * raid->block_size;
@@ -423,7 +423,7 @@ poweraid_raid5f_online_recovery_done(int status,
 
 /* 实际置 ONLINE 并触发 recovery（新卷初始化完成 / 既有卷直接进入）。*/
 static void
-raid_enter_online(struct poweraid_raid5f_raid *raid)
+raid_enter_online(struct poweraid_raid_common_raid *raid)
 {
 	uint8_t i;
 
@@ -445,9 +445,9 @@ raid_enter_online(struct poweraid_raid5f_raid *raid)
 		if (raid->base_bdevs[i] != NULL && raid->base_bdevs[i]->ppl_ctx != NULL) {
 			SPDK_NOTICELOG("online: kick recovery on bdev[%u] ppl_ctx=%p\n",
 				       i, raid->base_bdevs[i]->ppl_ctx);
-			poweraid_raid5f_recovery_run(raid->base_bdevs[i]->ppl_ctx, raid,
-						     poweraid_raid5f_recovery_read_strip,
-						     poweraid_raid5f_online_recovery_done, raid);
+			poweraid_raid_common_recovery_run(raid->base_bdevs[i]->ppl_ctx, raid,
+						     poweraid_raid_common_recovery_read_strip,
+						     poweraid_raid_common_online_recovery_done, raid);
 			break;
 		}
 	}
@@ -455,7 +455,7 @@ raid_enter_online(struct poweraid_raid5f_raid *raid)
 
 /* 新卷 PPL 初始化：逐盘 alloc ppl_ctx + ppl_init（写 PPL super + flush）。*/
 struct fresh_ppl_op {
-	struct poweraid_raid5f_raid	*raid;
+	struct poweraid_raid_common_raid	*raid;
 	uint8_t				idx;
 	int				status;
 	uint64_t			region_offset;
@@ -467,8 +467,8 @@ static void fresh_ppl_init_cb(int status, void *cb_arg);
 static void
 fresh_ppl_step(struct fresh_ppl_op *op)
 {
-	struct poweraid_raid5f_bdev *bdev;
-	struct poweraid_raid5f_ppl_ctx *ppl_ctx;
+	struct poweraid_raid_common_bdev *bdev;
+	struct poweraid_raid_common_ppl_ctx *ppl_ctx;
 
 	while (op->idx < op->raid->num_base_bdevs) {
 		bdev = op->raid->base_bdevs[op->idx];
@@ -478,7 +478,7 @@ fresh_ppl_step(struct fresh_ppl_op *op)
 			op->idx++;
 			continue;
 		}
-		ppl_ctx = poweraid_raid5f_ppl_alloc(bdev->desc,
+		ppl_ctx = poweraid_raid_common_ppl_alloc(bdev->desc,
 					(struct spdk_io_channel *)bdev->ch,
 					op->raid->block_size,
 					op->region_offset, op->region_size);
@@ -489,7 +489,7 @@ fresh_ppl_step(struct fresh_ppl_op *op)
 			continue;
 		}
 		bdev->ppl_ctx = ppl_ctx;
-		poweraid_raid5f_ppl_init(ppl_ctx, fresh_ppl_init_cb, op);
+		poweraid_raid_common_ppl_init(ppl_ctx, fresh_ppl_init_cb, op);
 		return;  /* 等回调 */
 	}
 
@@ -520,7 +520,7 @@ fresh_ppl_init_cb(int status, void *cb_arg)
 static void
 fresh_sb_write_cb(int status, void *cb_arg)
 {
-	struct poweraid_raid5f_raid *raid = cb_arg;
+	struct poweraid_raid_common_raid *raid = cb_arg;
 	struct fresh_ppl_op *op;
 
 	if (status != 0) {
@@ -534,7 +534,7 @@ fresh_sb_write_cb(int status, void *cb_arg)
 		return;
 	}
 	op->raid = raid;
-	if (poweraid_raid5f_sb_get_ppl_region(raid, &op->region_offset,
+	if (poweraid_raid_common_sb_get_ppl_region(raid, &op->region_offset,
 					      &op->region_size) != 0) {
 		SPDK_ERRLOG("fresh_init: no PPL region in sb ext\n");
 		free(op);
@@ -549,8 +549,8 @@ fresh_sb_write_cb(int status, void *cb_arg)
  * - 既有卷（VALIDATE_MD 已按 ext 分配 ppl_ctx）：直接置 ONLINE → recovery。
  */
 void
-poweraid_raid5f_sm_raid_online(struct poweraid_raid5f_raid *raid,
-			       enum poweraid_raid5f_raid_event event)
+poweraid_raid_common_sm_raid_online(struct poweraid_raid_common_raid *raid,
+			       enum poweraid_raid_common_raid_event event)
 {
 	uint8_t i;
 	bool all_fresh;
@@ -576,7 +576,7 @@ poweraid_raid5f_sm_raid_online(struct poweraid_raid5f_raid *raid,
 	if (all_fresh) {
 		SPDK_NOTICELOG("online: fresh volume, writing sb + init PPL raid=%s\n",
 			       raid->name);
-		poweraid_raid5f_sb_write(raid, fresh_sb_write_cb, raid);
+		poweraid_raid_common_sb_write(raid, fresh_sb_write_cb, raid);
 		return;  /* raid_enter_online 由异步回调触发 */
 	}
 
@@ -588,8 +588,8 @@ poweraid_raid5f_sm_raid_online(struct poweraid_raid5f_raid *raid,
  * 参考：XISRC xnr_offline 清位 + raid5f_stop 返回 false 异步（L1119）。
  */
 void
-poweraid_raid5f_sm_raid_offline(struct poweraid_raid5f_raid *raid,
-				enum poweraid_raid5f_raid_event event)
+poweraid_raid_common_sm_raid_offline(struct poweraid_raid_common_raid *raid,
+				enum poweraid_raid_common_raid_event event)
 {
 	SPDK_DEBUGLOG(raid5f_sm_raid, "offline: raid=%p old_state=0x%" PRIx64
 		      " event=%u\n", raid, raid ? raid->state : 0ULL,
@@ -605,51 +605,51 @@ poweraid_raid5f_sm_raid_offline(struct poweraid_raid5f_raid *raid,
 }
 
 /* ===== 全局 RAID FSM 分派表（dispatch.c 引用）=====
- * 索引 = enum poweraid_raid5f_raid_event，值 = handler 函数指针。
+ * 索引 = enum poweraid_raid_common_raid_event，值 = handler 函数指针。
  * 槽位与 enum 顺序严格对齐（designated initializer 已保证）。
  */
-poweraid_raid5f_raid_handler_t
-poweraid_raid5f_raid_fsm[POWERAID_RAID_EV_COUNT_REAL] = {
-	[POWERAID_RAID_EV_CREATE_DEV]         = poweraid_raid5f_sm_raid_create_dev,
-	[POWERAID_RAID_EV_DESTROY_DEV]        = poweraid_raid5f_sm_raid_destroy_dev,
-	[POWERAID_RAID_EV_CREATE_OLD_DEV]     = poweraid_raid5f_sm_raid_create_old_dev,
-	[POWERAID_RAID_EV_OPEN_BDEVS]         = poweraid_raid5f_sm_raid_open_bdevs,
-	[POWERAID_RAID_EV_CREATE_DSC]         = poweraid_raid5f_sm_raid_create_dsc,
-	[POWERAID_RAID_EV_CREATE_OLD_DSC]     = poweraid_raid5f_sm_raid_create_old_dsc,
-	[POWERAID_RAID_EV_ONLINE]             = poweraid_raid5f_sm_raid_online,
-	[POWERAID_RAID_EV_OFFLINE]             = poweraid_raid5f_sm_raid_offline,
-	[POWERAID_RAID_EV_DESTROY_COMPLETE]    = poweraid_raid5f_sm_raid_destroy_complete,
-	[POWERAID_RAID_EV_FINISH]             = poweraid_raid5f_sm_raid_finish,
-	[POWERAID_RAID_EV_CHECK_MD]           = poweraid_raid5f_sm_raid_check_md,
-	[POWERAID_RAID_EV_APPLY_PARAMS]       = poweraid_raid5f_sm_raid_apply_params,
-	[POWERAID_RAID_EV_SAVE_CONFIG]        = poweraid_raid5f_sm_raid_save_config,
-	[POWERAID_RAID_EV_UPDATE_CONFIG]      = poweraid_raid5f_sm_raid_update_config,
-	[POWERAID_RAID_EV_UPDATE_CONFIG2]     = poweraid_raid5f_sm_raid_update_config2,
-	[POWERAID_RAID_EV_DISK_OPEN]          = poweraid_raid5f_sm_raid_disk_open,
-	[POWERAID_RAID_EV_DISK_VERIFY]        = poweraid_raid5f_sm_raid_disk_verify,
-	[POWERAID_RAID_EV_DISK_ADD]           = poweraid_raid5f_sm_raid_disk_add,
-	[POWERAID_RAID_EV_DISK_ADD_NEW]       = poweraid_raid5f_sm_raid_disk_add_new,
-	[POWERAID_RAID_EV_DISK_ADD_CANCEL]    = poweraid_raid5f_sm_raid_disk_add_cancel,
-	[POWERAID_RAID_EV_DISK_REMOVE]        = poweraid_raid5f_sm_raid_disk_remove,
-	[POWERAID_RAID_EV_DISK_ONLINE]        = poweraid_raid5f_sm_raid_disk_online,
-	[POWERAID_RAID_EV_START_INIT]         = poweraid_raid5f_sm_raid_start_init,
-	[POWERAID_RAID_EV_START_RECON]        = poweraid_raid5f_sm_raid_start_recon,
-	[POWERAID_RAID_EV_START_SCRUB]        = poweraid_raid5f_sm_raid_start_scrub,
-	[POWERAID_RAID_EV_START_RESTRIPE]     = poweraid_raid5f_sm_raid_start_restripe,
-	[POWERAID_RAID_EV_WAIT_SERVICES_STOP] = poweraid_raid5f_sm_raid_wait_services_stop,
-	[POWERAID_RAID_EV_WAIT_IO_END]        = poweraid_raid5f_sm_raid_wait_io_end,
-	[POWERAID_RAID_EV_WAIT_FLUSH_MD]      = poweraid_raid5f_sm_raid_wait_flush_md,
-	[POWERAID_RAID_EV_WRITE_LOCK]         = poweraid_raid5f_sm_raid_write_lock,
-	[POWERAID_RAID_EV_ADD_RAID]           = poweraid_raid5f_sm_raid_add_raid,
-	[POWERAID_RAID_EV_REMOVE_RAID]        = poweraid_raid5f_sm_raid_remove_raid,
-	[POWERAID_RAID_EV_REMOVE_RAID_CONFIG] = poweraid_raid5f_sm_raid_remove_raid_config,
-	[POWERAID_RAID_EV_MGMT_CALLBACK]      = poweraid_raid5f_sm_raid_mgmt_callback,
-	[POWERAID_RAID_EV_MGMT_GET_CALLBACK]  = poweraid_raid5f_sm_raid_mgmt_get_callback,
-	[POWERAID_RAID_EV_REGISTER_BDEV]      = poweraid_raid5f_sm_raid_register_bdev,
-	[POWERAID_RAID_EV_IODEV_UNREGISTER]   = poweraid_raid5f_sm_raid_iodev_unregister,
-	[POWERAID_RAID_EV_UNREGISTER_BDEV]    = poweraid_raid5f_sm_raid_unregister_bdev,
+poweraid_raid_common_raid_handler_t
+poweraid_raid_common_raid_fsm[POWERAID_RAID_EV_COUNT_REAL] = {
+	[POWERAID_RAID_EV_CREATE_DEV]         = poweraid_raid_common_sm_raid_create_dev,
+	[POWERAID_RAID_EV_DESTROY_DEV]        = poweraid_raid_common_sm_raid_destroy_dev,
+	[POWERAID_RAID_EV_CREATE_OLD_DEV]     = poweraid_raid_common_sm_raid_create_old_dev,
+	[POWERAID_RAID_EV_OPEN_BDEVS]         = poweraid_raid_common_sm_raid_open_bdevs,
+	[POWERAID_RAID_EV_CREATE_DSC]         = poweraid_raid_common_sm_raid_create_dsc,
+	[POWERAID_RAID_EV_CREATE_OLD_DSC]     = poweraid_raid_common_sm_raid_create_old_dsc,
+	[POWERAID_RAID_EV_ONLINE]             = poweraid_raid_common_sm_raid_online,
+	[POWERAID_RAID_EV_OFFLINE]             = poweraid_raid_common_sm_raid_offline,
+	[POWERAID_RAID_EV_DESTROY_COMPLETE]    = poweraid_raid_common_sm_raid_destroy_complete,
+	[POWERAID_RAID_EV_FINISH]             = poweraid_raid_common_sm_raid_finish,
+	[POWERAID_RAID_EV_CHECK_MD]           = poweraid_raid_common_sm_raid_check_md,
+	[POWERAID_RAID_EV_APPLY_PARAMS]       = poweraid_raid_common_sm_raid_apply_params,
+	[POWERAID_RAID_EV_SAVE_CONFIG]        = poweraid_raid_common_sm_raid_save_config,
+	[POWERAID_RAID_EV_UPDATE_CONFIG]      = poweraid_raid_common_sm_raid_update_config,
+	[POWERAID_RAID_EV_UPDATE_CONFIG2]     = poweraid_raid_common_sm_raid_update_config2,
+	[POWERAID_RAID_EV_DISK_OPEN]          = poweraid_raid_common_sm_raid_disk_open,
+	[POWERAID_RAID_EV_DISK_VERIFY]        = poweraid_raid_common_sm_raid_disk_verify,
+	[POWERAID_RAID_EV_DISK_ADD]           = poweraid_raid_common_sm_raid_disk_add,
+	[POWERAID_RAID_EV_DISK_ADD_NEW]       = poweraid_raid_common_sm_raid_disk_add_new,
+	[POWERAID_RAID_EV_DISK_ADD_CANCEL]    = poweraid_raid_common_sm_raid_disk_add_cancel,
+	[POWERAID_RAID_EV_DISK_REMOVE]        = poweraid_raid_common_sm_raid_disk_remove,
+	[POWERAID_RAID_EV_DISK_ONLINE]        = poweraid_raid_common_sm_raid_disk_online,
+	[POWERAID_RAID_EV_START_INIT]         = poweraid_raid_common_sm_raid_start_init,
+	[POWERAID_RAID_EV_START_RECON]        = poweraid_raid_common_sm_raid_start_recon,
+	[POWERAID_RAID_EV_START_SCRUB]        = poweraid_raid_common_sm_raid_start_scrub,
+	[POWERAID_RAID_EV_START_RESTRIPE]     = poweraid_raid_common_sm_raid_start_restripe,
+	[POWERAID_RAID_EV_WAIT_SERVICES_STOP] = poweraid_raid_common_sm_raid_wait_services_stop,
+	[POWERAID_RAID_EV_WAIT_IO_END]        = poweraid_raid_common_sm_raid_wait_io_end,
+	[POWERAID_RAID_EV_WAIT_FLUSH_MD]      = poweraid_raid_common_sm_raid_wait_flush_md,
+	[POWERAID_RAID_EV_WRITE_LOCK]         = poweraid_raid_common_sm_raid_write_lock,
+	[POWERAID_RAID_EV_ADD_RAID]           = poweraid_raid_common_sm_raid_add_raid,
+	[POWERAID_RAID_EV_REMOVE_RAID]        = poweraid_raid_common_sm_raid_remove_raid,
+	[POWERAID_RAID_EV_REMOVE_RAID_CONFIG] = poweraid_raid_common_sm_raid_remove_raid_config,
+	[POWERAID_RAID_EV_MGMT_CALLBACK]      = poweraid_raid_common_sm_raid_mgmt_callback,
+	[POWERAID_RAID_EV_MGMT_GET_CALLBACK]  = poweraid_raid_common_sm_raid_mgmt_get_callback,
+	[POWERAID_RAID_EV_REGISTER_BDEV]      = poweraid_raid_common_sm_raid_register_bdev,
+	[POWERAID_RAID_EV_IODEV_UNREGISTER]   = poweraid_raid_common_sm_raid_iodev_unregister,
+	[POWERAID_RAID_EV_UNREGISTER_BDEV]    = poweraid_raid_common_sm_raid_unregister_bdev,
 };
 
-SPDK_STATIC_ASSERT(SPDK_COUNTOF(poweraid_raid5f_raid_fsm) ==
+SPDK_STATIC_ASSERT(SPDK_COUNTOF(poweraid_raid_common_raid_fsm) ==
 		   POWERAID_RAID_EV_COUNT_REAL,
 		   "raid fsm table size mismatch with enum");

@@ -17,17 +17,26 @@ C_SRCS += raid5f.c
 endif
 
 ifeq ($(CONFIG_POWERAID_RAID5F),y)
-C_SRCS += poweraid_raid5f/poweraid_raid5f.c \
-	          poweraid_raid5f/poweraid_raid5f_sm_dispatch.c \
-	          poweraid_raid5f/poweraid_raid5f_sm_raid.c \
-	          poweraid_raid5f/poweraid_raid5f_sm_bdev.c \
-	          poweraid_raid5f/poweraid_raid5f_sm_req.c \
-	          poweraid_raid5f/poweraid_raid5f_sb.c \
-	          poweraid_raid5f/poweraid_raid5f_ppl.c \
-	          poweraid_raid5f/poweraid_raid5f_recovery.c \
-	          poweraid_raid5f/poweraid_raid5f_rmw.c \
-	          poweraid_raid5f/poweraid_raid5f_merge.c \
-	          poweraid_raid5f/poweraid_raid5f_rpc.c
+# 公共层（5f/6f 共用）
+C_SRCS += poweraid_raid_common/poweraid_raid_common_sm_dispatch.c \
+	          poweraid_raid_common/poweraid_raid_common_sm_raid.c \
+	          poweraid_raid_common/poweraid_raid_common_sm_bdev.c \
+	          poweraid_raid_common/poweraid_raid_common_sm_req.c \
+	          poweraid_raid_common/poweraid_raid_common_sb.c \
+	          poweraid_raid_common/poweraid_raid_common_ppl.c \
+	          poweraid_raid_common/poweraid_raid_common_recovery.c \
+	          poweraid_raid_common/poweraid_raid_common_rmw.c \
+	          poweraid_raid_common/poweraid_raid_common_merge.c \
+	          poweraid_raid_common/poweraid_raid_common_rpc.c \
+	          poweraid_raid_common/poweraid_raid_common_gf8.c
+# GF8 SIMD 路径: 按架构选择
+ifeq ($(shell uname -m),x86_64)
+C_SRCS += poweraid_raid_common/poweraid_raid_common_gf8_x86.c
+else ifeq ($(shell uname -m),aarch64)
+C_SRCS += poweraid_raid_common/poweraid_raid_common_gf8_neon.c
+endif
+# 5f 薄壳
+C_SRCS += poweraid_raid5f/poweraid_raid5f.c
 endif
 
 LIBNAME = bdev_raid

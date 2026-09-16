@@ -8,7 +8,7 @@
  *     - strip 对齐（offset 与 num_blocks 均 strip_size 整数倍）
  *   故模块收到的写 IO 只有两种：
  *     A) 完整 stripe（offset_blocks % stripe_blocks == 0 且 num_blocks == stripe_blocks）
- *        → 走全 stripe 写路径（poweraid_raid5f_sm_req WRITE_FULL，5 步 barrier）
+ *        → 走全 stripe 写路径（poweraid_raid_common_sm_req WRITE_FULL，5 步 barrier）
  *     B) 部分 stripe（非 A）→ 走 RMW（本文件）
  *
  *   RMW 7 步（op + 回调状态机，与 REQ FSM 独立）：
@@ -25,14 +25,14 @@
  *   详见 raid5f-enhanced-design.md 第 3.2 节（阶段 3a）。
  */
 
-#ifndef POWERAID_RAID5F_RMW_H
-#define POWERAID_RAID5F_RMW_H
+#ifndef POWERAID_RAID_COMMON_RMW_H
+#define POWERAID_RAID_COMMON_RMW_H
 
 #include "spdk/stdinc.h"
 
 struct raid_bdev_io;
 struct raid_bdev_io_channel;
-struct poweraid_raid5f_raid;
+struct poweraid_raid_common_raid;
 
 #ifdef __cplusplus
 extern "C" {
@@ -53,7 +53,7 @@ extern "C" {
  * 异步完成：通过 raid_bdev_io_complete 通知 raid_bdev 框架。
  * 返回 0 表示已接受（异步完成），非 0 表示立即失败（调用方负责 complete）。
  */
-int poweraid_raid5f_rmw_submit(struct raid_bdev_io *raid_io);
+int poweraid_raid_common_rmw_submit(struct raid_bdev_io *raid_io);
 
 /**
  * 提交合并后的 RMW IO（合并层入口，阶段 3b）。
@@ -70,8 +70,8 @@ int poweraid_raid5f_rmw_submit(struct raid_bdev_io *raid_io);
  * \param cb_arg 回调参数
  * \return 0 成功（异步完成 via cb），非 0 立即失败
  */
-int poweraid_raid5f_rmw_submit_merged(struct raid_bdev_io_channel *raid_ch,
-				       struct poweraid_raid5f_raid *raid,
+int poweraid_raid_common_rmw_submit_merged(struct raid_bdev_io_channel *raid_ch,
+				       struct poweraid_raid_common_raid *raid,
 				       uint64_t stripe_index,
 				       uint64_t chunk_bitmap,
 				       void **new_chunk_bufs,
@@ -82,4 +82,4 @@ int poweraid_raid5f_rmw_submit_merged(struct raid_bdev_io_channel *raid_ch,
 }
 #endif
 
-#endif /* POWERAID_RAID5F_RMW_H */
+#endif /* POWERAID_RAID_COMMON_RMW_H */

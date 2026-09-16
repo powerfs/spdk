@@ -5,8 +5,8 @@
  *   详见 raid5f-enhanced-design.md 第 3.5 节
  */
 
-#ifndef POWERAID_RAID5F_SB_H
-#define POWERAID_RAID5F_SB_H
+#ifndef POWERAID_RAID_COMMON_SB_H
+#define POWERAID_RAID_COMMON_SB_H
 
 #include "spdk/stdinc.h"
 #include "spdk/uuid.h"
@@ -16,36 +16,36 @@ extern "C" {
 #endif
 
 /* v1 superblock 固定长度，参考 bdev_raid.h 的 raid_bdev_superblock */
-#define POWERAID_RAID5F_SB_V1_LENGTH    256
+#define POWERAID_RAID_COMMON_SB_V1_LENGTH    256
 /* v2 扩展区长度，追加在 v1 末尾（base_bdevs[] 数组之外）*/
-#define POWERAID_RAID5F_SB_V2_EXT_LENGTH  256
+#define POWERAID_RAID_COMMON_SB_V2_EXT_LENGTH  256
 /* v2 总长度 = v1 + ext */
-#define POWERAID_RAID5F_SB_V2_LENGTH    (POWERAID_RAID5F_SB_V1_LENGTH + \
-					 POWERAID_RAID5F_SB_V2_EXT_LENGTH)
+#define POWERAID_RAID_COMMON_SB_V2_LENGTH    (POWERAID_RAID_COMMON_SB_V1_LENGTH + \
+					 POWERAID_RAID_COMMON_SB_V2_EXT_LENGTH)
 
 /* 版本号编码：v1.major=1, v1.minor=0；v2.major=2, v2.minor=0 */
-#define POWERAID_RAID5F_SB_VERSION_V1_MAJOR  1
-#define POWERAID_RAID5F_SB_VERSION_V2_MAJOR  2
+#define POWERAID_RAID_COMMON_SB_VERSION_V1_MAJOR  1
+#define POWERAID_RAID_COMMON_SB_VERSION_V2_MAJOR  2
 
 /* PPL 区固定布局（每盘；字节单位）：
  *   LBA0 起 1 块为 sb；[1MiB, 5MiB) 为 PPL 区（4MiB，1024 个 4K slot）；
  *   数据区从 5MiB 起（4K 块下 = 1280 块，strip 64K/16 块对齐）。*/
-#define POWERAID_RAID5F_PPL_REGION_OFFSET  (1024ULL * 1024)
-#define POWERAID_RAID5F_PPL_REGION_SIZE    (4ULL * 1024 * 1024)
+#define POWERAID_RAID_COMMON_PPL_REGION_OFFSET  (1024ULL * 1024)
+#define POWERAID_RAID_COMMON_PPL_REGION_SIZE    (4ULL * 1024 * 1024)
 
 /* feature_flags：标识 v2 启用的特性 */
-#define POWERAID_RAID5F_SB_F_PPL         (1u << 0)
-#define POWERAID_RAID5F_SB_F_DIF         (1u << 1)
-#define POWERAID_RAID5F_SB_F_SCRUB       (1u << 2)
-#define POWERAID_RAID5F_SB_F_RAID6       (1u << 3)
-#define POWERAID_RAID5F_SB_F_SPARE_POOL  (1u << 4)
-#define POWERAID_RAID5F_SB_F_RESTRIPE    (1u << 5)
+#define POWERAID_RAID_COMMON_SB_F_PPL         (1u << 0)
+#define POWERAID_RAID_COMMON_SB_F_DIF         (1u << 1)
+#define POWERAID_RAID_COMMON_SB_F_SCRUB       (1u << 2)
+#define POWERAID_RAID_COMMON_SB_F_RAID6       (1u << 3)
+#define POWERAID_RAID_COMMON_SB_F_SPARE_POOL  (1u << 4)
+#define POWERAID_RAID_COMMON_SB_F_RESTRIPE    (1u << 5)
 
 /* dif_mode：DIF/DIX 工作模式 */
-enum poweraid_raid5f_dif_mode {
-	POWERAID_RAID5F_DIF_NONE = 0,
-	POWERAID_RAID5F_DIF_GENERATED,
-	POWERAID_RAID5F_DIF_PASSTHROUGH,
+enum poweraid_raid_common_dif_mode {
+	POWERAID_RAID_COMMON_DIF_NONE = 0,
+	POWERAID_RAID_COMMON_DIF_GENERATED,
+	POWERAID_RAID_COMMON_DIF_PASSTHROUGH,
 };
 
 /**
@@ -61,16 +61,16 @@ enum poweraid_raid5f_dif_mode {
  *   2. v1：用 v1 路径，base_bdevs[] 紧跟 256B
  *   3. v2：再读 256B ext，base_bdevs[] 紧跟 512B 之后
  */
-struct poweraid_raid5f_sb_v2_ext {
+struct poweraid_raid_common_sb_v2_ext {
 	/* v2 魔数，校验 ext 区完整性（避免误读 v1 数据）*/
-#define POWERAID_RAID5F_SB_V2_EXT_SIG "PWRAIDEX"
+#define POWERAID_RAID_COMMON_SB_V2_EXT_SIG "PWRAIDEX"
 	uint8_t ext_signature[8];
 	/* v2 扩展版本号（独立于 v1，用于 ext 内字段演进）*/
 	uint16_t ext_major;
 	uint16_t ext_minor;
 	/* 扩展区 CRC32C（仅 ext 区，不含 v1）*/
 	uint32_t ext_crc;
-	/* 启用的特性 bitmap（POWERAID_RAID5F_SB_F_*）*/
+	/* 启用的特性 bitmap（POWERAID_RAID_COMMON_SB_F_*）*/
 	uint32_t feature_flags;
 	/* DIF/DIX 模式 */
 	uint8_t dif_mode;
@@ -110,28 +110,28 @@ struct poweraid_raid5f_sb_v2_ext {
 	/* 预留（填满至 256B：8+2+2+4+4+1+1+1+5+4pad+8*11=120，剩 136）*/
 	uint8_t reserved[136];
 };
-SPDK_STATIC_ASSERT(sizeof(struct poweraid_raid5f_sb_v2_ext) ==
-		   POWERAID_RAID5F_SB_V2_EXT_LENGTH,
+SPDK_STATIC_ASSERT(sizeof(struct poweraid_raid_common_sb_v2_ext) ==
+		   POWERAID_RAID_COMMON_SB_V2_EXT_LENGTH,
 		   "incorrect v2 ext size");
 
 /* API */
-struct poweraid_raid5f_raid;
+struct poweraid_raid_common_raid;
 
 /* sb_load 内部分配的加载上下文（opaque），调用方需用 sb_free_loaded 释放。
  * 与 raid->sb_ctx（由 sb_alloc 分配）独立——sb_load 是单盘探测，不污染 raid 状态。 */
-struct poweraid_raid5f_sb_ctx;
+struct poweraid_raid_common_sb_ctx;
 
 /**
  * 分配 v2 superblock（v1 区 + ext 区 + base_bdevs 数组）。
  * 返回 0 成功，负数失败。
  */
-int poweraid_raid5f_sb_alloc(struct poweraid_raid5f_raid *raid,
+int poweraid_raid_common_sb_alloc(struct poweraid_raid_common_raid *raid,
 			     uint32_t block_size, uint8_t num_base_bdevs);
 
 /**
  * 初始化 superblock 字段（创建新卷时）。
  */
-void poweraid_raid5f_sb_init(struct poweraid_raid5f_raid *raid,
+void poweraid_raid_common_sb_init(struct poweraid_raid_common_raid *raid,
 			     uint32_t level, uint32_t strip_size,
 			     uint32_t feature_flags);
 
@@ -140,9 +140,9 @@ void poweraid_raid5f_sb_init(struct poweraid_raid5f_raid *raid,
  * 每盘用 base_bdevs[i]->desc + base_bdevs[i]->ch 调用 spdk_bdev_write_blocks。
  * 资源不足时用 spdk_bdev_queue_io_wait 排队。
  */
-typedef void (*poweraid_raid5f_sb_write_cb)(int status, void *cb_arg);
-void poweraid_raid5f_sb_write(struct poweraid_raid5f_raid *raid,
-			     poweraid_raid5f_sb_write_cb cb, void *cb_arg);
+typedef void (*poweraid_raid_common_sb_write_cb)(int status, void *cb_arg);
+void poweraid_raid_common_sb_write(struct poweraid_raid_common_raid *raid,
+			     poweraid_raid_common_sb_write_cb cb, void *cb_arg);
 
 /**
  * 加载单盘 superblock（异步，单盘探测，不写 raid->sb_ctx）。
@@ -151,27 +151,27 @@ void poweraid_raid5f_sb_write(struct poweraid_raid5f_raid *raid,
  *   - status==0 且 loaded_ctx!=NULL：成功加载（v1 时 ext 为 NULL）
  *   - status!=0：读失败或 crc 错（loaded_ctx 为 NULL）
  */
-typedef void (*poweraid_raid5f_sb_load_cb)(int status,
-		struct poweraid_raid5f_sb_ctx *loaded_ctx,
+typedef void (*poweraid_raid_common_sb_load_cb)(int status,
+		struct poweraid_raid_common_sb_ctx *loaded_ctx,
 		void *cb_arg);
-void poweraid_raid5f_sb_load(void *bdev_desc, struct spdk_io_channel *ch,
-			    poweraid_raid5f_sb_load_cb cb, void *cb_arg);
+void poweraid_raid_common_sb_load(void *bdev_desc, struct spdk_io_channel *ch,
+			    poweraid_raid_common_sb_load_cb cb, void *cb_arg);
 
 /**
  * 释放 raid 的 sb_ctx（由 sb_alloc 分配，挂在 raid->sb_ctx）。
  */
-void poweraid_raid5f_sb_free(struct poweraid_raid5f_raid *raid);
+void poweraid_raid_common_sb_free(struct poweraid_raid_common_raid *raid);
 
 /**
  * 释放 sb_load 返回的独立 sb_ctx（不依赖 raid）。
  */
-void poweraid_raid5f_sb_free_loaded(struct poweraid_raid5f_sb_ctx *ctx);
+void poweraid_raid_common_sb_free_loaded(struct poweraid_raid_common_sb_ctx *ctx);
 
 /**
  * 取 raid->sb_ctx v2 ext 中的 PPL 区布局（字节单位）。
  * 仅当 sb_alloc+sb_init（建卷）后可用；无 ext 时返回 -ENOENT。
  */
-int poweraid_raid5f_sb_get_ppl_region(struct poweraid_raid5f_raid *raid,
+int poweraid_raid_common_sb_get_ppl_region(struct poweraid_raid_common_raid *raid,
 				      uint64_t *region_offset_bytes,
 				      uint64_t *region_size_bytes);
 
@@ -180,32 +180,32 @@ int poweraid_raid5f_sb_get_ppl_region(struct poweraid_raid5f_raid *raid,
  * 调用 spdk_bdev_write_blocks 使用。out_size 输出 buffer 长度。
  * 返回 NULL 表示 raid 未分配 sb。
  */
-const void *poweraid_raid5f_sb_get_write_buffer(struct poweraid_raid5f_raid *raid,
+const void *poweraid_raid_common_sb_get_write_buffer(struct poweraid_raid_common_raid *raid,
 		uint32_t *out_size);
 
 /**
  * 获取 v2 ext 指针，用于上层在加载完成后查询 PPL/scrub/feature_flags 等。
  * 返回 NULL 表示 raid 未分配 sb 或仅 v1 兼容加载（无 ext）。
  */
-const struct poweraid_raid5f_sb_v2_ext *poweraid_raid5f_sb_get_ext(
-	struct poweraid_raid5f_raid *raid);
+const struct poweraid_raid_common_sb_v2_ext *poweraid_raid_common_sb_get_ext(
+	struct poweraid_raid_common_raid *raid);
 
 /**
  * 查询 sb_load 返回的 loaded_ctx 的 v1 superblock 指针（含 signature/uuid/level/strip_size）。
  * 用于上层判断盘是否属于某 raid。
  */
-const struct raid_bdev_superblock *poweraid_raid5f_sb_loaded_get_v1(
-	struct poweraid_raid5f_sb_ctx *ctx);
+const struct raid_bdev_superblock *poweraid_raid_common_sb_loaded_get_v1(
+	struct poweraid_raid_common_sb_ctx *ctx);
 
 /**
  * 查询 sb_load 返回的 loaded_ctx 的 v2 ext 指针。
  * 返回 NULL 表示该盘仅 v1 兼容加载（无 ext 区）。
  */
-const struct poweraid_raid5f_sb_v2_ext *poweraid_raid5f_sb_loaded_get_ext(
-	struct poweraid_raid5f_sb_ctx *ctx);
+const struct poweraid_raid_common_sb_v2_ext *poweraid_raid_common_sb_loaded_get_ext(
+	struct poweraid_raid_common_sb_ctx *ctx);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* POWERAID_RAID5F_SB_H */
+#endif /* POWERAID_RAID_COMMON_SB_H */

@@ -20,8 +20,8 @@
 #include "spdk/thread.h"
 
 #include "../bdev_raid.h"
-#include "poweraid_raid5f.h"
-#include "poweraid_raid5f_merge.h"
+#include "poweraid_raid_common.h"
+#include "poweraid_raid_common_merge.h"
 
 SPDK_LOG_REGISTER_COMPONENT(raid5f_rpc);
 
@@ -49,7 +49,7 @@ static void
 set_merge_delay_channel(struct spdk_io_channel_iter *i)
 {
 	struct rpc_set_merge_delay *req = spdk_io_channel_iter_get_ctx(i);
-	struct poweraid_raid5f_io_channel *ch =
+	struct poweraid_raid_common_io_channel *ch =
 		spdk_io_channel_get_ctx(spdk_io_channel_iter_get_channel(i));
 
 	ch->merge_ctx.delay_us = req->delay_us;
@@ -78,7 +78,7 @@ rpc_bdev_poweraid_raid5f_set_merge_delay(struct spdk_jsonrpc_request *request,
 {
 	struct rpc_set_merge_delay *req;
 	struct raid_bdev *raid_bdev;
-	struct poweraid_raid5f_raid *raid;
+	struct poweraid_raid_common_raid *raid;
 
 	req = calloc(1, sizeof(*req));
 	if (req == NULL) {
@@ -134,7 +134,7 @@ rpc_bdev_poweraid_raid5f_get_merge_delay(struct spdk_jsonrpc_request *request,
 {
 	struct rpc_get_merge_delay req = {};
 	struct raid_bdev *raid_bdev;
-	struct poweraid_raid5f_raid *raid;
+	struct poweraid_raid_common_raid *raid;
 	struct spdk_json_write_ctx *w;
 
 	if (spdk_json_decode_object(params, rpc_bdev_poweraid_raid5f_get_merge_delay_decoders_manual,

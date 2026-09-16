@@ -24,16 +24,16 @@
 #include "spdk/uuid.h"
 
 #include "../bdev_raid.h"
-#include "poweraid_raid5f.h"
+#include "poweraid_raid_common.h"
 
 SPDK_LOG_REGISTER_COMPONENT(raid5f_sb);
 
 /* ===== 内部 sb 上下文（opaque 对外；同时供 raid->sb_ctx 与 sb_load loaded_ctx 复用）===== */
-struct poweraid_raid5f_sb_ctx {
+struct poweraid_raid_common_sb_ctx {
 	/* raw buffer 起始 = v1 superblock 起始；包含 256B 头 + N*64 base_bdevs + 256B ext */
 	struct raid_bdev_superblock	*v1;
 	/* ext 区指针，紧跟 base_bdevs 之后；v1 兼容加载时为 NULL */
-	struct poweraid_raid5f_sb_v2_ext *ext;
+	struct poweraid_raid_common_sb_v2_ext *ext;
 	/* spdk_dma_malloc 原始指针（== v1） */
 	void				*raw;
 	/* raw buffer 总长度：256 + N*64 + 256（v2）或 256 + N*64（v1） */
@@ -47,19 +47,19 @@ struct poweraid_raid5f_sb_ctx {
 	/* ===== sb_load 异步 IO 上下文（仅 sb_load 路径使用）===== */
 	struct spdk_bdev_desc		*load_desc;
 	struct spdk_io_channel		*load_ch;
-	poweraid_raid5f_sb_load_cb	load_cb;
+	poweraid_raid_common_sb_load_cb	load_cb;
 	void				*load_cb_arg;
 	/* 当前 buf 容量（多段读时动态扩展） */
 	uint32_t			load_buf_size;
 };
 
 /* ===== sb_write 异步 IO 上下文 ===== */
-struct poweraid_raid5f_sb_write_ctx {
-	struct poweraid_raid5f_raid	*raid;
+struct poweraid_raid_common_sb_write_ctx {
+	struct poweraid_raid_common_raid	*raid;
 	int				status;
 	uint8_t				submitted;
 	uint8_t				remaining;
-	poweraid_raid5f_sb_write_cb	cb;
+	poweraid_raid_common_sb_write_cb	cb;
 	void				*cb_arg;
 	struct spdk_bdev_io_wait_entry	wait_entry;
 };
@@ -69,26 +69,26 @@ struct poweraid_raid5f_sb_write_ctx {
 static inline uint32_t
 sb_v1_length(uint8_t num_base_bdevs)
 {
-	return POWERAID_RAID5F_SB_V1_LENGTH +
+	return POWERAID_RAID_COMMON_SB_V1_LENGTH +
 	       num_base_bdevs * sizeof(struct raid_bdev_sb_base_bdev);
 }
 
 static inline uint32_t
 sb_total_size(uint8_t num_base_bdevs)
 {
-	return sb_v1_length(num_base_bdevs) + POWERAID_RAID5F_SB_V2_EXT_LENGTH;
+	return sb_v1_length(num_base_bdevs) + POWERAID_RAID_COMMON_SB_V2_EXT_LENGTH;
 }
 
-static inline struct poweraid_raid5f_sb_v2_ext *
+static inline struct poweraid_raid_common_sb_v2_ext *
 sb_ext_at(void *raw, uint8_t num_base_bdevs)
 {
-	return (struct poweraid_raid5f_sb_v2_ext *)
+	return (struct poweraid_raid_common_sb_v2_ext *)
 		((uint8_t *)raw + sb_v1_length(num_base_bdevs));
 }
 
 /* 更新 v1 superblock 的 crc 字段（覆盖 raw 起始 sb_v1_length 字节，不含 ext） */
 static void
-sb_update_v1_crc(struct poweraid_raid5f_sb_ctx *ctx)
+sb_update_v1_crc(struct poweraid_raid_common_sb_ctx *ctx)
 {
 	ctx->v1->crc = 0;
 	ctx->v1->crc = spdk_crc32c_update(ctx->raw, sb_v1_length(ctx->num_base_bdevs), 0);
@@ -96,22 +96,22 @@ sb_update_v1_crc(struct poweraid_raid5f_sb_ctx *ctx)
 
 /* 更新 ext 区 crc 字段（覆盖 ext 256B，先清零 ext_crc 再计算） */
 static void
-sb_update_ext_crc(struct poweraid_raid5f_sb_ctx *ctx)
+sb_update_ext_crc(struct poweraid_raid_common_sb_ctx *ctx)
 {
 	uint32_t crc;
 	ctx->ext->ext_crc = 0;
-	crc = spdk_crc32c_update(ctx->ext, POWERAID_RAID5F_SB_V2_EXT_LENGTH, 0);
+	crc = spdk_crc32c_update(ctx->ext, POWERAID_RAID_COMMON_SB_V2_EXT_LENGTH, 0);
 	ctx->ext->ext_crc = crc;
 }
 
 /* 校验 ext crc */
 static bool
-sb_check_ext_crc(struct poweraid_raid5f_sb_ctx *ctx)
+sb_check_ext_crc(struct poweraid_raid_common_sb_ctx *ctx)
 {
 	uint32_t prev = ctx->ext->ext_crc;
 	uint32_t crc;
 	ctx->ext->ext_crc = 0;
-	crc = spdk_crc32c_update(ctx->ext, POWERAID_RAID5F_SB_V2_EXT_LENGTH, 0);
+	crc = spdk_crc32c_update(ctx->ext, POWERAID_RAID_COMMON_SB_V2_EXT_LENGTH, 0);
 	ctx->ext->ext_crc = prev;
 	return crc == prev;
 }
@@ -119,10 +119,10 @@ sb_check_ext_crc(struct poweraid_raid5f_sb_ctx *ctx)
 /* ===== 公共 API：alloc / init / free（raid 级别）===== */
 
 int
-poweraid_raid5f_sb_alloc(struct poweraid_raid5f_raid *raid,
+poweraid_raid_common_sb_alloc(struct poweraid_raid_common_raid *raid,
 			 uint32_t block_size, uint8_t num_base_bdevs)
 {
-	struct poweraid_raid5f_sb_ctx *ctx;
+	struct poweraid_raid_common_sb_ctx *ctx;
 	uint32_t total;
 
 	if (raid == NULL || block_size == 0 || num_base_bdevs == 0) {
@@ -159,11 +159,11 @@ poweraid_raid5f_sb_alloc(struct poweraid_raid5f_raid *raid,
 }
 
 void
-poweraid_raid5f_sb_init(struct poweraid_raid5f_raid *raid,
+poweraid_raid_common_sb_init(struct poweraid_raid_common_raid *raid,
 			uint32_t level, uint32_t strip_size,
 			uint32_t feature_flags)
 {
-	struct poweraid_raid5f_sb_ctx *ctx;
+	struct poweraid_raid_common_sb_ctx *ctx;
 	uint8_t i;
 
 	if (raid == NULL || raid->sb_ctx == NULL) {
@@ -173,7 +173,7 @@ poweraid_raid5f_sb_init(struct poweraid_raid5f_raid *raid,
 
 	/* === v1 header === */
 	memcpy(ctx->v1->signature, RAID_BDEV_SB_SIG, sizeof(ctx->v1->signature));
-	ctx->v1->version.major = POWERAID_RAID5F_SB_VERSION_V2_MAJOR;  /* v2 */
+	ctx->v1->version.major = POWERAID_RAID_COMMON_SB_VERSION_V2_MAJOR;  /* v2 */
 	ctx->v1->version.minor = 0;
 	spdk_uuid_copy(&ctx->v1->uuid, &raid->uuid);
 	snprintf((char *)ctx->v1->name, RAID_BDEV_SB_NAME_SIZE, "%s", raid->name);
@@ -194,17 +194,17 @@ poweraid_raid5f_sb_init(struct poweraid_raid5f_raid *raid,
 	}
 
 	/* === ext 区 === */
-	memset(ctx->ext, 0, POWERAID_RAID5F_SB_V2_EXT_LENGTH);
-	memcpy(ctx->ext->ext_signature, POWERAID_RAID5F_SB_V2_EXT_SIG,
+	memset(ctx->ext, 0, POWERAID_RAID_COMMON_SB_V2_EXT_LENGTH);
+	memcpy(ctx->ext->ext_signature, POWERAID_RAID_COMMON_SB_V2_EXT_SIG,
 	       sizeof(ctx->ext->ext_signature));
 	ctx->ext->ext_major = 1;
 	ctx->ext->ext_minor = 0;
 	ctx->ext->feature_flags = feature_flags;
-	ctx->ext->dif_mode = POWERAID_RAID5F_DIF_NONE;
+	ctx->ext->dif_mode = POWERAID_RAID_COMMON_DIF_NONE;
 	ctx->ext->raid_level_ext = (uint8_t)level;
 	ctx->ext->synd_cnt = (level == 6) ? 2 : 1;
-	ctx->ext->ppl_region_offset = POWERAID_RAID5F_PPL_REGION_OFFSET;
-	ctx->ext->ppl_region_size = POWERAID_RAID5F_PPL_REGION_SIZE;
+	ctx->ext->ppl_region_offset = POWERAID_RAID_COMMON_PPL_REGION_OFFSET;
+	ctx->ext->ppl_region_size = POWERAID_RAID_COMMON_PPL_REGION_SIZE;
 	ctx->ext->ppl_seq = 0;
 	ctx->ext->scrub_progress = 0;
 	ctx->ext->scrub_last_complete_ts = 0;
@@ -222,12 +222,12 @@ poweraid_raid5f_sb_init(struct poweraid_raid5f_raid *raid,
 
 /* ===== sb_write 异步 IO 实现（参考 bdev_raid_sb.c _raid_bdev_write_superblock）===== */
 
-static void sb_write_one_done(int status, struct poweraid_raid5f_sb_write_ctx *wctx);
+static void sb_write_one_done(int status, struct poweraid_raid_common_sb_write_ctx *wctx);
 static void sb_write_io_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
 static void sb_write_loop(void *_wctx);
 
 static void
-sb_write_one_done(int status, struct poweraid_raid5f_sb_write_ctx *wctx)
+sb_write_one_done(int status, struct poweraid_raid_common_sb_write_ctx *wctx)
 {
 	if (status != 0) {
 		wctx->status = status;
@@ -242,7 +242,7 @@ sb_write_one_done(int status, struct poweraid_raid5f_sb_write_ctx *wctx)
 static void
 sb_write_io_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
-	struct poweraid_raid5f_sb_write_ctx *wctx = cb_arg;
+	struct poweraid_raid_common_sb_write_ctx *wctx = cb_arg;
 	int status = 0;
 
 	if (!success) {
@@ -259,9 +259,9 @@ sb_write_io_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 static void
 sb_write_loop(void *_wctx)
 {
-	struct poweraid_raid5f_sb_write_ctx *wctx = _wctx;
-	struct poweraid_raid5f_raid *raid = wctx->raid;
-	struct poweraid_raid5f_sb_ctx *ctx;
+	struct poweraid_raid_common_sb_write_ctx *wctx = _wctx;
+	struct poweraid_raid_common_raid *raid = wctx->raid;
+	struct poweraid_raid_common_sb_ctx *ctx;
 	const void *buf;
 	uint32_t buf_size;
 	uint8_t i;
@@ -276,7 +276,7 @@ sb_write_loop(void *_wctx)
 	buf_size = ctx->raw_size;
 
 	for (i = wctx->submitted; i < raid->num_base_bdevs; i++) {
-		struct poweraid_raid5f_bdev *bdev = raid->base_bdevs[i];
+		struct poweraid_raid_common_bdev *bdev = raid->base_bdevs[i];
 		struct spdk_bdev_desc *desc;
 		struct spdk_io_channel *ch;
 		struct spdk_bdev *bd;
@@ -321,11 +321,11 @@ sb_write_loop(void *_wctx)
 }
 
 void
-poweraid_raid5f_sb_write(struct poweraid_raid5f_raid *raid,
-			 poweraid_raid5f_sb_write_cb cb, void *cb_arg)
+poweraid_raid_common_sb_write(struct poweraid_raid_common_raid *raid,
+			 poweraid_raid_common_sb_write_cb cb, void *cb_arg)
 {
-	struct poweraid_raid5f_sb_ctx *ctx;
-	struct poweraid_raid5f_sb_write_ctx *wctx;
+	struct poweraid_raid_common_sb_ctx *ctx;
+	struct poweraid_raid_common_sb_write_ctx *wctx;
 
 	if (raid == NULL || raid->sb_ctx == NULL) {
 		if (cb) cb(-EINVAL, cb_arg);
@@ -356,12 +356,12 @@ poweraid_raid5f_sb_write(struct poweraid_raid5f_raid *raid,
 /* ===== sb_load 异步 IO 实现（参考 bdev_raid_sb.c raid_bdev_load_base_bdev_superblock）===== */
 
 static void sb_load_read_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
-static int sb_load_parse_and_continue(struct poweraid_raid5f_sb_ctx *ctx);
+static int sb_load_parse_and_continue(struct poweraid_raid_common_sb_ctx *ctx);
 
 static void
-sb_load_ctx_fail(struct poweraid_raid5f_sb_ctx *ctx, int status)
+sb_load_ctx_fail(struct poweraid_raid_common_sb_ctx *ctx, int status)
 {
-	poweraid_raid5f_sb_load_cb cb = ctx->load_cb;
+	poweraid_raid_common_sb_load_cb cb = ctx->load_cb;
 	void *arg = ctx->load_cb_arg;
 
 	/* 失败：内部释放，回调传 NULL */
@@ -375,7 +375,7 @@ sb_load_ctx_fail(struct poweraid_raid5f_sb_ctx *ctx, int status)
 static void
 sb_load_read_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
-	struct poweraid_raid5f_sb_ctx *ctx = cb_arg;
+	struct poweraid_raid_common_sb_ctx *ctx = cb_arg;
 	int rc;
 
 	spdk_bdev_free_io(bdev_io);
@@ -404,7 +404,7 @@ sb_load_read_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 
 /* 解析当前 buf 内容；返回 0=需继续读后续段（已提交），1=完成（成功），<0=失败 */
 static int
-sb_load_parse_and_continue(struct poweraid_raid5f_sb_ctx *ctx)
+sb_load_parse_and_continue(struct poweraid_raid_common_sb_ctx *ctx)
 {
 	struct raid_bdev_superblock *sb = ctx->v1;
 	uint32_t need_size, first_v1_size, read_offset, read_len;
@@ -425,10 +425,10 @@ sb_load_parse_and_continue(struct poweraid_raid5f_sb_ctx *ctx)
 	}
 
 	/* 3. 计算总需要大小（v2 时 + ext 256B）*/
-	if (sb->version.major == POWERAID_RAID5F_SB_VERSION_V2_MAJOR) {
-		need_size = sb->length + POWERAID_RAID5F_SB_V2_EXT_LENGTH;
+	if (sb->version.major == POWERAID_RAID_COMMON_SB_VERSION_V2_MAJOR) {
+		need_size = sb->length + POWERAID_RAID_COMMON_SB_V2_EXT_LENGTH;
 		ctx->is_v2 = 1;
-	} else if (sb->version.major == POWERAID_RAID5F_SB_VERSION_V1_MAJOR) {
+	} else if (sb->version.major == POWERAID_RAID_COMMON_SB_VERSION_V1_MAJOR) {
 		need_size = sb->length;
 		ctx->is_v2 = 0;
 	} else {
@@ -482,10 +482,10 @@ sb_load_parse_and_continue(struct poweraid_raid5f_sb_ctx *ctx)
 	ctx->raw_size = need_size;
 
 	if (ctx->is_v2) {
-		ctx->ext = (struct poweraid_raid5f_sb_v2_ext *)
+		ctx->ext = (struct poweraid_raid_common_sb_v2_ext *)
 			   ((uint8_t *)ctx->raw + sb->length);
 		/* 7. 校验 ext_signature */
-		if (memcmp(ctx->ext->ext_signature, POWERAID_RAID5F_SB_V2_EXT_SIG,
+		if (memcmp(ctx->ext->ext_signature, POWERAID_RAID_COMMON_SB_V2_EXT_SIG,
 			   sizeof(ctx->ext->ext_signature)) != 0) {
 			SPDK_ERRLOG("sb_load: ext_signature mismatch\n");
 			return -EINVAL;
@@ -503,12 +503,12 @@ sb_load_parse_and_continue(struct poweraid_raid5f_sb_ctx *ctx)
 }
 
 void
-poweraid_raid5f_sb_load(void *bdev_desc, struct spdk_io_channel *ch,
-			poweraid_raid5f_sb_load_cb cb, void *cb_arg)
+poweraid_raid_common_sb_load(void *bdev_desc, struct spdk_io_channel *ch,
+			poweraid_raid_common_sb_load_cb cb, void *cb_arg)
 {
 	struct spdk_bdev_desc *desc = bdev_desc;
 	struct spdk_bdev *bdev;
-	struct poweraid_raid5f_sb_ctx *ctx;
+	struct poweraid_raid_common_sb_ctx *ctx;
 	uint32_t first_size;
 	int rc;
 
@@ -529,7 +529,7 @@ poweraid_raid5f_sb_load(void *bdev_desc, struct spdk_io_channel *ch,
 	 * 按 blocklen 对齐。不能分段续读非块对齐的字节范围（spdk_bdev_read 要求
 	 * offset/nbytes 均块对齐，否则 -EINVAL，会导致既有卷被误判为新卷）。*/
 	first_size = spdk_divide_round_up(RAID_BDEV_SB_MAX_LENGTH +
-					 POWERAID_RAID5F_SB_V2_EXT_LENGTH,
+					 POWERAID_RAID_COMMON_SB_V2_EXT_LENGTH,
 					 spdk_bdev_get_data_block_size(bdev)) * bdev->blocklen;
 	ctx->raw = spdk_dma_malloc(first_size, spdk_bdev_get_buf_align(bdev), NULL);
 	if (!ctx->raw) {
@@ -557,9 +557,9 @@ poweraid_raid5f_sb_load(void *bdev_desc, struct spdk_io_channel *ch,
 /* ===== 释放与查询 ===== */
 
 void
-poweraid_raid5f_sb_free(struct poweraid_raid5f_raid *raid)
+poweraid_raid_common_sb_free(struct poweraid_raid_common_raid *raid)
 {
-	struct poweraid_raid5f_sb_ctx *ctx;
+	struct poweraid_raid_common_sb_ctx *ctx;
 
 	if (raid == NULL || raid->sb_ctx == NULL) {
 		return;
@@ -571,11 +571,11 @@ poweraid_raid5f_sb_free(struct poweraid_raid5f_raid *raid)
 }
 
 int
-poweraid_raid5f_sb_get_ppl_region(struct poweraid_raid5f_raid *raid,
+poweraid_raid_common_sb_get_ppl_region(struct poweraid_raid_common_raid *raid,
 				   uint64_t *region_offset_bytes,
 				   uint64_t *region_size_bytes)
 {
-	struct poweraid_raid5f_sb_ctx *ctx;
+	struct poweraid_raid_common_sb_ctx *ctx;
 
 	if (raid == NULL || raid->sb_ctx == NULL) {
 		return -ENOENT;
@@ -594,7 +594,7 @@ poweraid_raid5f_sb_get_ppl_region(struct poweraid_raid5f_raid *raid,
 }
 
 void
-poweraid_raid5f_sb_free_loaded(struct poweraid_raid5f_sb_ctx *ctx)
+poweraid_raid_common_sb_free_loaded(struct poweraid_raid_common_sb_ctx *ctx)
 {
 	if (ctx == NULL) {
 		return;
@@ -604,10 +604,10 @@ poweraid_raid5f_sb_free_loaded(struct poweraid_raid5f_sb_ctx *ctx)
 }
 
 const void *
-poweraid_raid5f_sb_get_write_buffer(struct poweraid_raid5f_raid *raid,
+poweraid_raid_common_sb_get_write_buffer(struct poweraid_raid_common_raid *raid,
 				     uint32_t *out_size)
 {
-	struct poweraid_raid5f_sb_ctx *ctx;
+	struct poweraid_raid_common_sb_ctx *ctx;
 	if (raid == NULL || raid->sb_ctx == NULL) {
 		return NULL;
 	}
@@ -618,10 +618,10 @@ poweraid_raid5f_sb_get_write_buffer(struct poweraid_raid5f_raid *raid,
 	return ctx->raw;
 }
 
-const struct poweraid_raid5f_sb_v2_ext *
-poweraid_raid5f_sb_get_ext(struct poweraid_raid5f_raid *raid)
+const struct poweraid_raid_common_sb_v2_ext *
+poweraid_raid_common_sb_get_ext(struct poweraid_raid_common_raid *raid)
 {
-	struct poweraid_raid5f_sb_ctx *ctx;
+	struct poweraid_raid_common_sb_ctx *ctx;
 	if (raid == NULL || raid->sb_ctx == NULL) {
 		return NULL;
 	}
@@ -630,13 +630,13 @@ poweraid_raid5f_sb_get_ext(struct poweraid_raid5f_raid *raid)
 }
 
 const struct raid_bdev_superblock *
-poweraid_raid5f_sb_loaded_get_v1(struct poweraid_raid5f_sb_ctx *ctx)
+poweraid_raid_common_sb_loaded_get_v1(struct poweraid_raid_common_sb_ctx *ctx)
 {
 	return ctx ? ctx->v1 : NULL;
 }
 
-const struct poweraid_raid5f_sb_v2_ext *
-poweraid_raid5f_sb_loaded_get_ext(struct poweraid_raid5f_sb_ctx *ctx)
+const struct poweraid_raid_common_sb_v2_ext *
+poweraid_raid_common_sb_loaded_get_ext(struct poweraid_raid_common_sb_ctx *ctx)
 {
 	return (ctx && ctx->is_v2) ? ctx->ext : NULL;
 }

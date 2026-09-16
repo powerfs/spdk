@@ -6,15 +6,15 @@
  *   详见 raid5f-enhanced-design.md 第 3.10 节
  */
 
-#ifndef POWERAID_RAID5F_SM_H
-#define POWERAID_RAID5F_SM_H
+#ifndef POWERAID_RAID_COMMON_SM_H
+#define POWERAID_RAID_COMMON_SM_H
 
 #include "spdk/stdinc.h"
 #include "spdk/queue.h"
 #include "spdk/thread.h"
 #include "spdk/uuid.h"
 
-#include "poweraid_raid5f_merge.h"
+#include "poweraid_raid_common_merge.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -61,7 +61,7 @@ extern "C" {
 #define POWERAID_REQ_ST_DESTROYING       (1u << 9)
 
 /* ===== FSM 层 ===== */
-enum poweraid_raid5f_fsm_layer {
+enum poweraid_raid_common_fsm_layer {
 	POWERAID_FSM_LAYER_RAID = 0,
 	POWERAID_FSM_LAYER_BDEV,
 	POWERAID_FSM_LAYER_REQ,
@@ -69,7 +69,7 @@ enum poweraid_raid5f_fsm_layer {
 };
 
 /* ===== RAID FSM 事件（44 个，对应 44 个 handler）===== */
-enum poweraid_raid5f_raid_event {
+enum poweraid_raid_common_raid_event {
 	/* 生命周期 */
 	POWERAID_RAID_EV_CREATE_DEV = 0,
 	POWERAID_RAID_EV_DESTROY_DEV,
@@ -122,7 +122,7 @@ enum poweraid_raid5f_raid_event {
 SPDK_STATIC_ASSERT(POWERAID_RAID_EV_COUNT <= 44, "RAID events exceed 44");
 
 /* ===== BDEV FSM 事件（24 个）===== */
-enum poweraid_raid5f_bdev_event {
+enum poweraid_raid_common_bdev_event {
 	POWERAID_BDEV_EV_START = 0,
 	POWERAID_BDEV_EV_DEV_START,
 	POWERAID_BDEV_EV_OPEN,
@@ -154,7 +154,7 @@ enum poweraid_raid5f_bdev_event {
 SPDK_STATIC_ASSERT(POWERAID_BDEV_EV_COUNT <= 28, "BDEV events exceed 28");
 
 /* ===== REQ FSM 事件（18 个）===== */
-enum poweraid_raid5f_req_event {
+enum poweraid_raid_common_req_event {
 	POWERAID_REQ_EV_ASSIGN = 0,
 	POWERAID_REQ_EV_REASSIGN,
 	POWERAID_REQ_EV_COMPLETE_SERVICE_REQ,
@@ -181,20 +181,20 @@ enum poweraid_raid5f_req_event {
 SPDK_STATIC_ASSERT(POWERAID_REQ_EV_COUNT <= 24, "REQ events exceed 24");
 
 /* ===== FSM 对象前向声明 ===== */
-struct poweraid_raid5f_raid;
-struct poweraid_raid5f_bdev;
-struct poweraid_raid5f_req;
+struct poweraid_raid_common_raid;
+struct poweraid_raid_common_bdev;
+struct poweraid_raid_common_req;
 
 /* ===== FSM handler 函数原型 ===== */
-typedef void (*poweraid_raid5f_raid_handler_t)(struct poweraid_raid5f_raid *raid,
-		enum poweraid_raid5f_raid_event event);
-typedef void (*poweraid_raid5f_bdev_handler_t)(struct poweraid_raid5f_bdev *bdev,
-		enum poweraid_raid5f_bdev_event event);
-typedef void (*poweraid_raid5f_req_handler_t)(struct poweraid_raid5f_req *req,
-		enum poweraid_raid5f_req_event event);
+typedef void (*poweraid_raid_common_raid_handler_t)(struct poweraid_raid_common_raid *raid,
+		enum poweraid_raid_common_raid_event event);
+typedef void (*poweraid_raid_common_bdev_handler_t)(struct poweraid_raid_common_bdev *bdev,
+		enum poweraid_raid_common_bdev_event event);
+typedef void (*poweraid_raid_common_req_handler_t)(struct poweraid_raid_common_req *req,
+		enum poweraid_raid_common_req_event event);
 
 /* ===== FSM 对象（最小骨架）===== */
-struct poweraid_raid5f_raid {
+struct poweraid_raid_common_raid {
 	uint64_t state;  /* POWERAID_RAID_ST_* 位图 */
 	struct spdk_uuid uuid;
 	char name[64];
@@ -205,46 +205,46 @@ struct poweraid_raid5f_raid {
 	/* 数据区起始块（跳过 LBA0 sb 与 PPL 区，按 strip 对齐）*/
 	uint64_t data_offset_blocks;
 	uint8_t num_base_bdevs;
-	struct poweraid_raid5f_bdev **base_bdevs;  /* num_base_bdevs 个 */
-	/* superblock v2 上下文，由 poweraid_raid5f_sb.c 内部管理，
+	struct poweraid_raid_common_bdev **base_bdevs;  /* num_base_bdevs 个 */
+	/* superblock v2 上下文，由 poweraid_raid_common_sb.c 内部管理，
 	 * 对外 opaque；NULL 表示尚未分配。 */
 	void *sb_ctx;
 	/* 合并层延迟（Stage 3c 可配置；0 = merge OFF，submit 即 flush）。
-	 * start() 置默认值 MERGE_DELAY_US_DEFAULT，RPC bdev_poweraid_raid5f_set_merge_delay
+	 * start() 置默认值 MERGE_DELAY_US_DEFAULT，RPC bdev_poweraid_raid_common_set_merge_delay
 	 * 运行时修改，ioch_create 时复制到各 channel 的 merge_ctx。 */
 	uint64_t delay_us;
 	/* 回指 SPDK raid_bdev 框架对象，start() 建立桥接，供 IO 路径访问 base_bdev_info。 */
 	struct raid_bdev *raid_bdev;
-	TAILQ_ENTRY(poweraid_raid5f_raid) link;
+	TAILQ_ENTRY(poweraid_raid_common_raid) link;
 };
 
-struct poweraid_raid5f_bdev {
+struct poweraid_raid_common_bdev {
 	uint64_t state;  /* POWERAID_BDEV_ST_* 位图 */
 	struct spdk_uuid uuid;
 	uint8_t slot;
 	void *desc;  /* spdk_bdev_desc */
-	struct poweraid_raid5f_raid *raid;
+	struct poweraid_raid_common_raid *raid;
 	void *ch;               /* struct spdk_io_channel*；OPEN 阶段填充，sb_write/sb_load 用 */
-	void *loaded_sb_ctx;    /* struct poweraid_raid5f_sb_ctx*；sb_load 回调持有至 VALIDATE_MD 完成，SET_ONLINE 释放 */
-	void *ppl_ctx;          /* struct poweraid_raid5f_ppl_ctx*；VALIDATE_MD/建卷初始化分配，OFFLINE 释放 */
+	void *loaded_sb_ctx;    /* struct poweraid_raid_common_sb_ctx*；sb_load 回调持有至 VALIDATE_MD 完成，SET_ONLINE 释放 */
+	void *ppl_ctx;          /* struct poweraid_raid_common_ppl_ctx*；VALIDATE_MD/建卷初始化分配，OFFLINE 释放 */
 	bool md_present;        /* sb_load 是否在盘上读到有效 sb（区分新卷/既有卷）*/
 };
 
 /* stripe_request 类型（req 同时充当 stripe_request，复用池化管理）*/
-enum poweraid_raid5f_stripe_type {
-	POWERAID_RAID5F_STRIPE_REQ_WRITE = 0,
-	POWERAID_RAID5F_STRIPE_REQ_RECONSTRUCT,
+enum poweraid_raid_common_stripe_type {
+	POWERAID_RAID_COMMON_STRIPE_REQ_WRITE = 0,
+	POWERAID_RAID_COMMON_STRIPE_REQ_RECONSTRUCT,
 };
 
-struct poweraid_raid5f_io_channel;
+struct poweraid_raid_common_io_channel;
 
-struct poweraid_raid5f_req {
+struct poweraid_raid_common_req {
 	uint32_t state;  /* POWERAID_REQ_ST_* 位图 */
 	void *io;  /* spdk_bdev_io */
-	struct poweraid_raid5f_raid *raid;
+	struct poweraid_raid_common_raid *raid;
 	/* stripe_request 字段（D-4 引入池化管理；D-5 填充实际 IO 数据）*/
-	enum poweraid_raid5f_stripe_type type;
-	struct poweraid_raid5f_io_channel *ch;  /* 所属 io channel 回指 */
+	enum poweraid_raid_common_stripe_type type;
+	struct poweraid_raid_common_io_channel *ch;  /* 所属 io channel 回指 */
 	struct raid_bdev_io *raid_io;           /* 关联的 raid_bdev_io */
 	uint64_t stripe_index;                  /* stripe 序号 */
 	/* XOR 计算参数（CALC 用），由写路径填充；src_bufs 不由 req 拥有。
@@ -258,7 +258,7 @@ struct poweraid_raid5f_req {
 	struct {
 		size_t remaining;
 		int    status;
-		void  (*cb)(struct poweraid_raid5f_req *req, int status);
+		void  (*cb)(struct poweraid_raid_common_req *req, int status);
 	} xor;
 	/* 写路径状态（D-5 PPL 5 步 barrier）*/
 	uint64_t ppl_seq;                /* PPL append 回传的 seq */
@@ -266,7 +266,7 @@ struct poweraid_raid5f_req {
 	int      base_bdev_io_status;    /* 聚合状态（0 成功，<0 失败）*/
 	void    *data_buf;               /* owned 全 stripe 数据缓冲（spdk_dma_malloc）*/
 	void    *parity_buf_alloc;       /* owned parity 缓冲（区别于 xor 期借用 parity_buf）*/
-	TAILQ_ENTRY(poweraid_raid5f_req) link;  /* free 池 / xor_retry_queue 链接 */
+	TAILQ_ENTRY(poweraid_raid_common_req) link;  /* free 池 / xor_retry_queue 链接 */
 };
 
 /* per-thread IO channel：参考 raid5f_io_channel（L120-136）。
@@ -274,25 +274,25 @@ struct poweraid_raid5f_req {
  * D-5 在此基础上扩展 PPL 5 步 barrier 状态。
  * 3c：MAX_STRIPES 32→64（1M 写 qd=8 拆分为 32 并发 stripe，2× 余量；
  *     耗尽时 merge 层延迟重试，不再 fail IO）。*/
-#define POWERAID_RAID5F_MAX_STRIPES 64
+#define POWERAID_RAID_COMMON_MAX_STRIPES 64
 
-struct poweraid_raid5f_io_channel {
+struct poweraid_raid_common_io_channel {
 	/* 空闲 stripe_request 池（write/reconstruct 分离，参考 raid5f）*/
-	TAILQ_HEAD(, poweraid_raid5f_req) free_write_stripe_requests;
-	TAILQ_HEAD(, poweraid_raid5f_req) free_reconstruct_stripe_requests;
+	TAILQ_HEAD(, poweraid_raid_common_req) free_write_stripe_requests;
+	TAILQ_HEAD(, poweraid_raid_common_req) free_reconstruct_stripe_requests;
 
 	/* accel framework channel（spdk_accel_submit_xor 用）*/
 	struct spdk_io_channel *accel_ch;
 
 	/* accel_ch 资源不足时重试队列 */
-	TAILQ_HEAD(, poweraid_raid5f_req) xor_retry_queue;
+	TAILQ_HEAD(, poweraid_raid_common_req) xor_retry_queue;
 
 	/* 合并层上下文（阶段 3b）*/
 	struct merge_ctx merge_ctx;
 };
 
 /* ===== 通用分派入口 ===== */
-void poweraid_raid5f_sm_process(enum poweraid_raid5f_fsm_layer layer,
+void poweraid_raid_common_sm_process(enum poweraid_raid_common_fsm_layer layer,
 			       void *obj, uint32_t event);
 
 /* ===== 全局分派表（由 sm_raid.c / sm_bdev.c / sm_req.c 提供）=====
@@ -300,9 +300,9 @@ void poweraid_raid5f_sm_process(enum poweraid_raid5f_fsm_layer layer,
  * 索引 == enum event 值，值 == handler 函数指针。
  * sm_dispatch.c 仅引用，不再重复持有 static 表，避免与各层 .c 文件产生重复声明。
  */
-extern poweraid_raid5f_raid_handler_t poweraid_raid5f_raid_fsm[];
-extern poweraid_raid5f_bdev_handler_t poweraid_raid5f_bdev_fsm[];
-extern poweraid_raid5f_req_handler_t poweraid_raid5f_req_fsm[];
+extern poweraid_raid_common_raid_handler_t poweraid_raid_common_raid_fsm[];
+extern poweraid_raid_common_bdev_handler_t poweraid_raid_common_bdev_fsm[];
+extern poweraid_raid_common_req_handler_t poweraid_raid_common_req_fsm[];
 
 /* ===== 状态位原子操作 ===== */
 static inline bool
@@ -331,21 +331,21 @@ poweraid_raid_state_clear(uint64_t *state, uint64_t bits)
 
 /* ===== 复合判断 ===== */
 static inline bool
-poweraid_raid_can_accept_io(const struct poweraid_raid5f_raid *raid)
+poweraid_raid_can_accept_io(const struct poweraid_raid_common_raid *raid)
 {
 	uint64_t s = __atomic_load_n((uint64_t *)&raid->state, __ATOMIC_ACQUIRE);
 	return (s & POWERAID_RAID_ST_ONLINE) && !(s & POWERAID_RAID_ST_OFFLINE);
 }
 
 static inline bool
-poweraid_raid_is_degraded(const struct poweraid_raid5f_raid *raid)
+poweraid_raid_is_degraded(const struct poweraid_raid_common_raid *raid)
 {
 	uint64_t s = __atomic_load_n((uint64_t *)&raid->state, __ATOMIC_ACQUIRE);
 	return (s & POWERAID_RAID_ST_DEGRADED) || (s & POWERAID_RAID_ST_DEGRADED2);
 }
 
 static inline bool
-poweraid_raid_is_recon_in_progress(const struct poweraid_raid5f_raid *raid)
+poweraid_raid_is_recon_in_progress(const struct poweraid_raid_common_raid *raid)
 {
 	return poweraid_raid_state_test_any((uint64_t *)&raid->state,
 					   POWERAID_RAID_ST_RECON);
@@ -355,4 +355,4 @@ poweraid_raid_is_recon_in_progress(const struct poweraid_raid5f_raid *raid)
 }
 #endif
 
-#endif /* POWERAID_RAID5F_SM_H */
+#endif /* POWERAID_RAID_COMMON_SM_H */

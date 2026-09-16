@@ -25,7 +25,7 @@
 
 #include "spdk/log.h"
 
-#include "poweraid_raid5f_gf8.h"
+#include "poweraid_raid_common_gf8.h"
 
 SPDK_LOG_REGISTER_COMPONENT(raid5f_gf8_x86);
 
@@ -65,8 +65,8 @@ cpu_supports_avx2(void)
 static void
 build_mul_lut(uint8_t c, uint8_t hi_lut[16], uint8_t lo_lut[16])
 {
-	const uint8_t *exp = poweraid_raid5f_gf8_exp;
-	const uint8_t *log = poweraid_raid5f_gf8_log;
+	const uint8_t *exp = poweraid_raid_common_gf8_exp;
+	const uint8_t *log = poweraid_raid_common_gf8_log;
 	uint8_t lc;
 	int i;
 
@@ -333,9 +333,9 @@ gf8_mul_const_xor_avx2(const uint8_t *src, uint8_t c, uint8_t *dst, uint64_t len
 /* ===== SIMD 路径选择入口 ===== */
 
 void
-poweraid_raid5f_gf8_try_select_simd(
-	poweraid_raid5f_gf8_mul_const_fn     *p_mul_const,
-	poweraid_raid5f_gf8_mul_const_xor_fn *p_mul_const_xor,
+poweraid_raid_common_gf8_try_select_simd(
+	poweraid_raid_common_gf8_mul_const_fn     *p_mul_const,
+	poweraid_raid_common_gf8_mul_const_xor_fn *p_mul_const_xor,
 	const char                          **p_impl_name)
 {
 	if (cpu_supports_avx2()) {
@@ -357,9 +357,9 @@ poweraid_raid5f_gf8_try_select_simd(
 
 /* 非 x86 平台: 不覆盖函数指针，保持标量 fallback */
 void
-poweraid_raid5f_gf8_try_select_simd(
-	poweraid_raid5f_gf8_mul_const_fn     *p_mul_const,
-	poweraid_raid5f_gf8_mul_const_xor_fn *p_mul_const_xor,
+poweraid_raid_common_gf8_try_select_simd(
+	poweraid_raid_common_gf8_mul_const_fn     *p_mul_const,
+	poweraid_raid_common_gf8_mul_const_xor_fn *p_mul_const_xor,
 	const char                          **p_impl_name)
 {
 	SPDK_NOTICELOG("GF8: x86 SIMD not available on this platform, using scalar\n");

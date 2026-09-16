@@ -3,7 +3,7 @@
  *
  *   PPL（Partial Parity Log）实现。
  *
- *   详见 poweraid_raid5f_ppl.h 与 raid5f-enhanced-design.md 第 3.1 / 3.7 节。
+ *   详见 poweraid_raid_common_ppl.h 与 raid5f-enhanced-design.md 第 3.1 / 3.7 节。
  *
  *   阶段 2 策略（正确性优先）：
  *     - 线性日志，无回卷/回收（满则 -ENOSPC；测试场景容量足够）。
@@ -23,13 +23,13 @@
 #include "spdk/log.h"
 #include "spdk/util.h"
 
-#include "poweraid_raid5f_ppl.h"
+#include "poweraid_raid_common_ppl.h"
 
 SPDK_LOG_REGISTER_COMPONENT(raid5f_ppl);
 
 /* ===== 内部上下文 ===== */
 
-struct poweraid_raid5f_ppl_ctx {
+struct poweraid_raid_common_ppl_ctx {
 	void				*bdev_desc;     /* struct spdk_bdev_desc* */
 	struct spdk_io_channel		*ch;
 	uint32_t			block_size;
@@ -39,13 +39,13 @@ struct poweraid_raid5f_ppl_ctx {
 	uint32_t			max_slots;       /* region 内 block 槽位数（含 super slot 0）*/
 
 	/* 内存 super 镜像（append/commit 时更新并写盘；load_replay 时从盘加载）*/
-	struct poweraid_raid5f_ppl_super	super;
+	struct poweraid_raid_common_ppl_super	super;
 
 	/* 线性日志写指针：下一条 record 写入的 slot 下标（1..max_slots-1；0=super）*/
 	uint32_t			tail_slot;
 
 	/* in-flight（已 append 待 commit）记录链表，保证 commit 顺序 */
-	TAILQ_HEAD(, poweraid_raid5f_ppl_inflight)	inflight;
+	TAILQ_HEAD(, poweraid_raid_common_ppl_inflight)	inflight;
 };
 
 /* ===== append 异步操作 ===== */
@@ -56,16 +56,16 @@ enum ppl_append_state {
 };
 
 struct ppl_append_op {
-	struct poweraid_raid5f_ppl_ctx	*ctx;
+	struct poweraid_raid_common_ppl_ctx	*ctx;
 	struct spdk_io_channel		*ch;   /* 调用方线程的 bdev channel（数据面）*/
-	struct poweraid_raid5f_ppl_record rec;
+	struct poweraid_raid_common_ppl_record rec;
 	uint8_t				state;
 	int				status;
 	uint64_t			seq;
 	uint32_t			slot;            /* 写入的 slot 下标 */
 	uint64_t			slot_byte_off;    /* slot 在盘上的字节偏移 */
 	void				*buf;             /* block_size DMA scratch */
-	poweraid_raid5f_ppl_append_cb	cb;
+	poweraid_raid_common_ppl_append_cb	cb;
 	void				*cb_arg;
 	struct spdk_bdev_io_wait_entry	wait_entry;
 };
@@ -78,13 +78,13 @@ enum ppl_commit_state {
 };
 
 struct ppl_commit_op {
-	struct poweraid_raid5f_ppl_ctx	*ctx;
+	struct poweraid_raid_common_ppl_ctx	*ctx;
 	struct spdk_io_channel		*ch;   /* 调用方线程的 bdev channel（数据面）*/
 	uint8_t				state;
 	int				status;
 	uint64_t			commit_seq;
 	void				*buf;             /* block_size DMA scratch（写 super）*/
-	poweraid_raid5f_ppl_commit_cb	cb;
+	poweraid_raid_common_ppl_commit_cb	cb;
 	void				*cb_arg;
 	struct spdk_bdev_io_wait_entry	wait_entry;
 };
@@ -97,25 +97,25 @@ enum ppl_init_state {
 };
 
 struct ppl_init_op {
-	struct poweraid_raid5f_ppl_ctx	*ctx;
+	struct poweraid_raid_common_ppl_ctx	*ctx;
 	uint8_t				state;
 	int				status;
 	void				*buf;             /* block_size DMA scratch（写 super）*/
-	poweraid_raid5f_ppl_init_cb	cb;
+	poweraid_raid_common_ppl_init_cb	cb;
 	void				*cb_arg;
 	struct spdk_bdev_io_wait_entry	wait_entry;
 };
 
 /* ===== load_replay 异步操作 ===== */
 struct ppl_replay_op {
-	struct poweraid_raid5f_ppl_ctx	*ctx;
-	poweraid_raid5f_ppl_replay_cb	cb;
+	struct poweraid_raid_common_ppl_ctx	*ctx;
+	poweraid_raid_common_ppl_replay_cb	cb;
 	void				*cb_arg;
 	void				*buf;             /* 当前 chunk 读缓冲 */
 	uint32_t			buf_blocks;       /* buf 容纳的 block 数 */
 	uint32_t			cur_slot;         /* 下一个待读 slot */
 	uint32_t			end_slot;         /* 扫描终止 slot */
-	struct poweraid_raid5f_ppl_record *result;
+	struct poweraid_raid_common_ppl_record *result;
 	uint32_t			result_cap;
 	uint32_t			result_cnt;
 	int				status;
@@ -124,8 +124,8 @@ struct ppl_replay_op {
 
 /* super 读专用 op（load_replay 第一阶段）*/
 struct ppl_super_load_op {
-	struct poweraid_raid5f_ppl_ctx	*ctx;
-	poweraid_raid5f_ppl_replay_cb	cb;
+	struct poweraid_raid_common_ppl_ctx	*ctx;
+	poweraid_raid_common_ppl_replay_cb	cb;
 	void				*cb_arg;
 	void				*buf;             /* block_size，读 super */
 	struct spdk_bdev_io_wait_entry	wait_entry;
@@ -134,77 +134,77 @@ struct ppl_super_load_op {
 /* ===== 内部辅助 ===== */
 
 static inline uint64_t
-slot_to_byte_offset(struct poweraid_raid5f_ppl_ctx *ctx, uint32_t slot)
+slot_to_byte_offset(struct poweraid_raid_common_ppl_ctx *ctx, uint32_t slot)
 {
 	return ctx->region_offset + (uint64_t)slot * ctx->block_size;
 }
 
 static inline uint64_t
-byte_to_block_offset(struct poweraid_raid5f_ppl_ctx *ctx, uint64_t byte_off)
+byte_to_block_offset(struct poweraid_raid_common_ppl_ctx *ctx, uint64_t byte_off)
 {
 	return byte_off >> ctx->block_shift;
 }
 
 /* crc 覆盖 record 除 crc32c 字段外全部字节（两段：crc32c 前一段 + crc32c 后一段）*/
 static uint32_t
-ppl_rec_calc_crc(const struct poweraid_raid5f_ppl_record *rec)
+ppl_rec_calc_crc(const struct poweraid_raid_common_ppl_record *rec)
 {
 	uint32_t crc;
 	crc = spdk_crc32c_update(rec,
-				 offsetof(struct poweraid_raid5f_ppl_record, crc32c), 0);
+				 offsetof(struct poweraid_raid_common_ppl_record, crc32c), 0);
 	crc = spdk_crc32c_update((const uint8_t *)rec +
-				 offsetof(struct poweraid_raid5f_ppl_record, crc32c) +
+				 offsetof(struct poweraid_raid_common_ppl_record, crc32c) +
 				 sizeof(uint32_t),
 				 sizeof(*rec) -
-				 offsetof(struct poweraid_raid5f_ppl_record, crc32c) -
+				 offsetof(struct poweraid_raid_common_ppl_record, crc32c) -
 				 sizeof(uint32_t),
 				 crc);
 	return crc;
 }
 
 static inline void
-ppl_rec_set_crc(struct poweraid_raid5f_ppl_record *rec)
+ppl_rec_set_crc(struct poweraid_raid_common_ppl_record *rec)
 {
 	rec->crc32c = 0;
 	rec->crc32c = ppl_rec_calc_crc(rec);
 }
 
 static inline bool
-ppl_rec_check(const struct poweraid_raid5f_ppl_record *rec)
+ppl_rec_check(const struct poweraid_raid_common_ppl_record *rec)
 {
-	if (rec->magic != POWERAID_RAID5F_PPL_REC_MAGIC) {
+	if (rec->magic != POWERAID_RAID_COMMON_PPL_REC_MAGIC) {
 		return false;
 	}
 	return ppl_rec_calc_crc(rec) == rec->crc32c;
 }
 
 static uint32_t
-ppl_super_calc_crc(const struct poweraid_raid5f_ppl_super *s)
+ppl_super_calc_crc(const struct poweraid_raid_common_ppl_super *s)
 {
 	uint32_t crc;
 	crc = spdk_crc32c_update(s,
-				 offsetof(struct poweraid_raid5f_ppl_super, crc32c), 0);
+				 offsetof(struct poweraid_raid_common_ppl_super, crc32c), 0);
 	crc = spdk_crc32c_update((const uint8_t *)s +
-				offsetof(struct poweraid_raid5f_ppl_super, crc32c) +
+				offsetof(struct poweraid_raid_common_ppl_super, crc32c) +
 				sizeof(uint32_t),
 				sizeof(*s) -
-				offsetof(struct poweraid_raid5f_ppl_super, crc32c) -
+				offsetof(struct poweraid_raid_common_ppl_super, crc32c) -
 				sizeof(uint32_t),
 				crc);
 	return crc;
 }
 
 static inline void
-ppl_super_set_crc(struct poweraid_raid5f_ppl_super *s)
+ppl_super_set_crc(struct poweraid_raid_common_ppl_super *s)
 {
 	s->crc32c = 0;
 	s->crc32c = ppl_super_calc_crc(s);
 }
 
 static inline bool
-ppl_super_check(const struct poweraid_raid5f_ppl_super *s)
+ppl_super_check(const struct poweraid_raid_common_ppl_super *s)
 {
-	if (s->magic != POWERAID_RAID5F_PPL_SUPER_MAGIC) {
+	if (s->magic != POWERAID_RAID_COMMON_PPL_SUPER_MAGIC) {
 		return false;
 	}
 	return ppl_super_calc_crc(s) == s->crc32c;
@@ -225,12 +225,12 @@ block_shift_of(uint32_t block_size)
 
 /* ===== 公共 API：alloc / free ===== */
 
-struct poweraid_raid5f_ppl_ctx *
-poweraid_raid5f_ppl_alloc(void *bdev_desc, struct spdk_io_channel *ch,
+struct poweraid_raid_common_ppl_ctx *
+poweraid_raid_common_ppl_alloc(void *bdev_desc, struct spdk_io_channel *ch,
 			  uint32_t block_size,
 			  uint64_t region_offset, uint64_t region_size)
 {
-	struct poweraid_raid5f_ppl_ctx *ctx;
+	struct poweraid_raid_common_ppl_ctx *ctx;
 	int shift;
 
 	if (bdev_desc == NULL || ch == NULL || block_size == 0 ||
@@ -262,7 +262,7 @@ poweraid_raid5f_ppl_alloc(void *bdev_desc, struct spdk_io_channel *ch,
 
 	/* 内存 super 初始（写盘由 ppl_init 触发；加载由 ppl_load_replay 触发）*/
 	memset(&ctx->super, 0, sizeof(ctx->super));
-	ctx->super.magic = POWERAID_RAID5F_PPL_SUPER_MAGIC;
+	ctx->super.magic = POWERAID_RAID_COMMON_PPL_SUPER_MAGIC;
 	ctx->super.version = 1;
 	ctx->super.head_seq = 1;
 	ctx->super.tail_seq = 1;
@@ -274,9 +274,9 @@ poweraid_raid5f_ppl_alloc(void *bdev_desc, struct spdk_io_channel *ch,
 }
 
 void
-poweraid_raid5f_ppl_free(struct poweraid_raid5f_ppl_ctx *ctx)
+poweraid_raid_common_ppl_free(struct poweraid_raid_common_ppl_ctx *ctx)
 {
-	struct poweraid_raid5f_ppl_inflight *inf;
+	struct poweraid_raid_common_ppl_inflight *inf;
 
 	if (ctx == NULL) {
 		return;
@@ -323,7 +323,7 @@ ppl_init_io_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 static void
 ppl_init_loop(struct ppl_init_op *op)
 {
-	struct poweraid_raid5f_ppl_ctx *ctx = op->ctx;
+	struct poweraid_raid_common_ppl_ctx *ctx = op->ctx;
 	int rc;
 
 	while (op->state < PPL_INIT_DONE) {
@@ -368,7 +368,7 @@ ppl_init_loop(struct ppl_init_op *op)
 
 	/* DONE */
 	if (op->status == 0) {
-		SPDK_NOTICELOG("poweraid_raid5f_ppl: init ok (super @ slot 0)\n");
+		SPDK_NOTICELOG("poweraid_raid_common_ppl: init ok (super @ slot 0)\n");
 	}
 	op->cb(op->status, op->cb_arg);
 	spdk_free(op->buf);
@@ -376,8 +376,8 @@ ppl_init_loop(struct ppl_init_op *op)
 }
 
 void
-poweraid_raid5f_ppl_init(struct poweraid_raid5f_ppl_ctx *ctx,
-			 poweraid_raid5f_ppl_init_cb cb, void *cb_arg)
+poweraid_raid_common_ppl_init(struct poweraid_raid_common_ppl_ctx *ctx,
+			 poweraid_raid_common_ppl_init_cb cb, void *cb_arg)
 {
 	struct ppl_init_op *op;
 
@@ -433,7 +433,7 @@ ppl_append_io_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 static void
 ppl_append_loop(struct ppl_append_op *op)
 {
-	struct poweraid_raid5f_ppl_ctx *ctx = op->ctx;
+	struct poweraid_raid_common_ppl_ctx *ctx = op->ctx;
 	int rc;
 
 	while (op->state < PPL_APPEND_DONE) {
@@ -477,7 +477,7 @@ ppl_append_loop(struct ppl_append_op *op)
 
 	/* DONE */
 	if (op->status == 0) {
-		struct poweraid_raid5f_ppl_inflight *inf;
+		struct poweraid_raid_common_ppl_inflight *inf;
 		ctx->super.tail_seq = op->seq + 1;
 		ctx->super.next_seq = op->seq + 1;
 		ctx->super.num_records++;
@@ -497,11 +497,11 @@ ppl_append_loop(struct ppl_append_op *op)
 }
 
 void
-poweraid_raid5f_ppl_append_record(struct poweraid_raid5f_ppl_ctx *ctx,
+poweraid_raid_common_ppl_append_record(struct poweraid_raid_common_ppl_ctx *ctx,
 				  struct spdk_io_channel *ch,
 				  uint64_t stripe_id, uint64_t chunk_bitmap,
 				  uint64_t old_data_hash, uint64_t new_data_hash,
-				  poweraid_raid5f_ppl_append_cb cb, void *cb_arg)
+				  poweraid_raid_common_ppl_append_cb cb, void *cb_arg)
 {
 	struct ppl_append_op *op;
 	uint64_t seq;
@@ -521,7 +521,7 @@ poweraid_raid5f_ppl_append_record(struct poweraid_raid5f_ppl_ctx *ctx,
 			cb(-ENOSPC, 0, cb_arg);
 			return;
 		}
-		SPDK_NOTICELOG("poweraid_raid5f_ppl: ring recycle (next_seq=%"PRIu64")\n",
+		SPDK_NOTICELOG("poweraid_raid_common_ppl: ring recycle (next_seq=%"PRIu64")\n",
 			       ctx->super.next_seq);
 		ctx->tail_slot = 1;
 	}
@@ -545,8 +545,8 @@ poweraid_raid5f_ppl_append_record(struct poweraid_raid5f_ppl_ctx *ctx,
 	op->status = 0;
 
 	memset(&op->rec, 0, sizeof(op->rec));
-	op->rec.magic = POWERAID_RAID5F_PPL_REC_MAGIC;
-	op->rec.flags = POWERAID_RAID5F_PPL_REC_F_VALID;
+	op->rec.magic = POWERAID_RAID_COMMON_PPL_REC_MAGIC;
+	op->rec.flags = POWERAID_RAID_COMMON_PPL_REC_F_VALID;
 	op->rec.seq = seq;
 	op->rec.stripe_id = stripe_id;
 	op->rec.chunk_bitmap = chunk_bitmap;
@@ -589,7 +589,7 @@ ppl_commit_io_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 static void
 ppl_commit_loop(struct ppl_commit_op *op)
 {
-	struct poweraid_raid5f_ppl_ctx *ctx = op->ctx;
+	struct poweraid_raid_common_ppl_ctx *ctx = op->ctx;
 	int rc;
 
 	while (op->state < PPL_COMMIT_DONE) {
@@ -634,7 +634,7 @@ ppl_commit_loop(struct ppl_commit_op *op)
 
 	/* DONE */
 	if (op->status == 0) {
-		struct poweraid_raid5f_ppl_inflight *inf, *tmp;
+		struct poweraid_raid_common_ppl_inflight *inf, *tmp;
 		TAILQ_FOREACH_SAFE(inf, &ctx->inflight, link, tmp) {
 			if (inf->seq <= op->commit_seq) {
 				TAILQ_REMOVE(&ctx->inflight, inf, link);
@@ -648,9 +648,9 @@ ppl_commit_loop(struct ppl_commit_op *op)
 }
 
 void
-poweraid_raid5f_ppl_commit(struct poweraid_raid5f_ppl_ctx *ctx,
+poweraid_raid_common_ppl_commit(struct poweraid_raid_common_ppl_ctx *ctx,
 			  struct spdk_io_channel *ch, uint64_t seq,
-			  poweraid_raid5f_ppl_commit_cb cb, void *cb_arg)
+			  poweraid_raid_common_ppl_commit_cb cb, void *cb_arg)
 {
 	struct ppl_commit_op *op;
 
@@ -698,9 +698,9 @@ static void ppl_replay_read_cb(struct spdk_bdev_io *bdev_io, bool success, void 
 static void ppl_replay_loop(struct ppl_replay_op *op);
 
 static int
-ppl_replay_insert(struct ppl_replay_op *op, const struct poweraid_raid5f_ppl_record *rec)
+ppl_replay_insert(struct ppl_replay_op *op, const struct poweraid_raid_common_ppl_record *rec)
 {
-	struct poweraid_raid5f_ppl_record *arr;
+	struct poweraid_raid_common_ppl_record *arr;
 	uint32_t i, j;
 
 	if (op->result_cnt >= op->result_cap) {
@@ -733,9 +733,9 @@ ppl_replay_scan_chunk(struct ppl_replay_op *op, uint32_t slots_in_buf)
 	uint32_t i;
 
 	for (i = 0; i < slots_in_buf; i++) {
-		const struct poweraid_raid5f_ppl_record *rec =
-			(const struct poweraid_raid5f_ppl_record *)p;
-		if (rec->magic == POWERAID_RAID5F_PPL_REC_MAGIC && ppl_rec_check(rec)) {
+		const struct poweraid_raid_common_ppl_record *rec =
+			(const struct poweraid_raid_common_ppl_record *)p;
+		if (rec->magic == POWERAID_RAID_COMMON_PPL_REC_MAGIC && ppl_rec_check(rec)) {
 			if (rec->seq > op->ctx->super.commit_seq) {
 				if (ppl_replay_insert(op, rec) != 0) {
 					op->status = -ENOMEM;
@@ -772,21 +772,21 @@ ppl_replay_read_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 static void
 ppl_replay_loop(struct ppl_replay_op *op)
 {
-	struct poweraid_raid5f_ppl_ctx *ctx = op->ctx;
+	struct poweraid_raid_common_ppl_ctx *ctx = op->ctx;
 	uint32_t remaining, slots_this;
 	uint64_t byte_off;
 	int rc;
 
 	if (op->status != 0 || op->cur_slot >= op->end_slot) {
 		if (op->status == 0 && op->result_cnt > 0) {
-			SPDK_NOTICELOG("poweraid_raid5f_ppl: replay found %u uncommitted records\n",
+			SPDK_NOTICELOG("poweraid_raid_common_ppl: replay found %u uncommitted records\n",
 				       op->result_cnt);
 			op->cb(0, op->result, op->result_cnt, op->cb_arg);
 		} else if (op->status == 0) {
-			SPDK_NOTICELOG("poweraid_raid5f_ppl: replay clean (no uncommitted)\n");
+			SPDK_NOTICELOG("poweraid_raid_common_ppl: replay clean (no uncommitted)\n");
 			op->cb(0, NULL, 0, op->cb_arg);
 		} else {
-			SPDK_ERRLOG("poweraid_raid5f_ppl: replay failed (%d)\n", op->status);
+			SPDK_ERRLOG("poweraid_raid_common_ppl: replay failed (%d)\n", op->status);
 			free(op->result);
 			op->cb(op->status, NULL, 0, op->cb_arg);
 		}
@@ -819,8 +819,8 @@ static void
 ppl_super_load_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct ppl_super_load_op *sop = cb_arg;
-	struct poweraid_raid5f_ppl_ctx *ctx = sop->ctx;
-	const struct poweraid_raid5f_ppl_super *s;
+	struct poweraid_raid_common_ppl_ctx *ctx = sop->ctx;
+	const struct poweraid_raid_common_ppl_super *s;
 	struct ppl_replay_op *op;
 	uint32_t chunk_blocks;
 	uint64_t byte_off;
@@ -835,8 +835,8 @@ ppl_super_load_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		return;
 	}
 
-	s = (const struct poweraid_raid5f_ppl_super *)sop->buf;
-	if (s->magic != POWERAID_RAID5F_PPL_SUPER_MAGIC || !ppl_super_check(s)) {
+	s = (const struct poweraid_raid_common_ppl_super *)sop->buf;
+	if (s->magic != POWERAID_RAID_COMMON_PPL_SUPER_MAGIC || !ppl_super_check(s)) {
 		SPDK_NOTICELOG("ppl_replay: no valid super (fresh disk?) → clean\n");
 		sop->cb(0, NULL, 0, sop->cb_arg);
 		spdk_free(sop->buf);
@@ -914,7 +914,7 @@ static void
 ppl_super_load_submit(void *arg)
 {
 	struct ppl_super_load_op *sop = arg;
-	struct poweraid_raid5f_ppl_ctx *ctx = sop->ctx;
+	struct poweraid_raid_common_ppl_ctx *ctx = sop->ctx;
 	int rc;
 
 	rc = spdk_bdev_read_blocks(ctx->bdev_desc, ctx->ch, sop->buf,
@@ -931,8 +931,8 @@ ppl_super_load_submit(void *arg)
 }
 
 void
-poweraid_raid5f_ppl_load_replay(struct poweraid_raid5f_ppl_ctx *ctx,
-				poweraid_raid5f_ppl_replay_cb cb, void *cb_arg)
+poweraid_raid_common_ppl_load_replay(struct poweraid_raid_common_ppl_ctx *ctx,
+				poweraid_raid_common_ppl_replay_cb cb, void *cb_arg)
 {
 	struct ppl_super_load_op *sop;
 
@@ -962,13 +962,13 @@ poweraid_raid5f_ppl_load_replay(struct poweraid_raid5f_ppl_ctx *ctx,
 }
 
 void
-poweraid_raid5f_ppl_free_replay_result(struct poweraid_raid5f_ppl_record *records)
+poweraid_raid_common_ppl_free_replay_result(struct poweraid_raid_common_ppl_record *records)
 {
 	free(records);
 }
 
 uint64_t
-poweraid_raid5f_ppl_data_hash(const void *buf, size_t len)
+poweraid_raid_common_ppl_data_hash(const void *buf, size_t len)
 {
 	uint32_t lo, hi;
 	/* 两段 crc32c，不同 seed，拼成 64-bit hash */
@@ -978,14 +978,14 @@ poweraid_raid5f_ppl_data_hash(const void *buf, size_t len)
 }
 
 void
-poweraid_raid5f_ppl_hash_init(struct poweraid_raid5f_ppl_hash_ctx *c)
+poweraid_raid_common_ppl_hash_init(struct poweraid_raid_common_ppl_hash_ctx *c)
 {
 	c->lo = 0;
 	c->hi = ~0u;
 }
 
 void
-poweraid_raid5f_ppl_hash_update(struct poweraid_raid5f_ppl_hash_ctx *c,
+poweraid_raid_common_ppl_hash_update(struct poweraid_raid_common_ppl_hash_ctx *c,
 				const void *buf, size_t len)
 {
 	c->lo = spdk_crc32c_update(buf, len, c->lo);
@@ -993,7 +993,7 @@ poweraid_raid5f_ppl_hash_update(struct poweraid_raid5f_ppl_hash_ctx *c,
 }
 
 uint64_t
-poweraid_raid5f_ppl_hash_final(struct poweraid_raid5f_ppl_hash_ctx *c)
+poweraid_raid_common_ppl_hash_final(struct poweraid_raid_common_ppl_hash_ctx *c)
 {
 	return ((uint64_t)c->hi << 32) | (uint64_t)c->lo;
 }

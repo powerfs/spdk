@@ -1,8 +1,8 @@
 /*   SPDX-License-Identifier: BSD-3-Clause
  *   Copyright (c) 2026 poweraid. All rights reserved.
  *
- *   BDEV 层 FSM handler（25 个事件，对应 poweraid_raid5f_sm.h 中
- *   enum poweraid_raid5f_bdev_event 全部真实事件）
+ *   BDEV 层 FSM handler（25 个事件，对应 poweraid_raid_common_sm.h 中
+ *   enum poweraid_raid_common_bdev_event 全部真实事件）
  *
  *   阶段 1：全部为 stub，仅 SPDK_DEBUGLOG 打印 + 立即返回。
  *   后续阶段逐个填充实际逻辑（参考 XISRC xnr_dev_* 函数族）。
@@ -13,15 +13,15 @@
 #include "spdk/stdinc.h"
 #include "spdk/log.h"
 
-#include "poweraid_raid5f.h"
+#include "poweraid_raid_common.h"
 
 SPDK_LOG_REGISTER_COMPONENT(raid5f_sm_bdev);
 
-/* 同 RAID 层 stub 模板，但参数对象为 poweraid_raid5f_bdev */
+/* 同 RAID 层 stub 模板，但参数对象为 poweraid_raid_common_bdev */
 #define DEFINE_BDEV_HANDLER(name)                                        \
 void                                                                     \
-poweraid_raid5f_sm_bdev_##name(struct poweraid_raid5f_bdev *bdev,        \
-			       enum poweraid_raid5f_bdev_event event)        \
+poweraid_raid_common_sm_bdev_##name(struct poweraid_raid_common_bdev *bdev,        \
+			       enum poweraid_raid_common_bdev_event event)        \
 {                                                                        \
 	SPDK_DEBUGLOG(raid5f_sm_bdev, "%s: bdev=%p state=0x%" PRIx64    \
 		       " event=%u\n", #name, bdev,                       \
@@ -74,15 +74,15 @@ DEFINE_BDEV_HANDLER(check_dev_ready)
  */
 static void
 bdev_try_read_md_sb_load_cb(int status,
-			     struct poweraid_raid5f_sb_ctx *loaded_ctx,
+			     struct poweraid_raid_common_sb_ctx *loaded_ctx,
 			     void *cb_arg)
 {
-	struct poweraid_raid5f_bdev *bdev = cb_arg;
+	struct poweraid_raid_common_bdev *bdev = cb_arg;
 
 	if (bdev == NULL) {
 		/* 异常：cb_arg 无 bdev，释放 ctx 后返回 */
 		if (loaded_ctx) {
-			poweraid_raid5f_sb_free_loaded(loaded_ctx);
+			poweraid_raid_common_sb_free_loaded(loaded_ctx);
 		}
 		return;
 	}
@@ -94,12 +94,12 @@ bdev_try_read_md_sb_load_cb(int status,
 		/* 盘上有 RAID sb → 持有 ctx，进入 VALIDATE_MD 校验 ext_signature */
 		bdev->md_present = true;
 		bdev->loaded_sb_ctx = loaded_ctx;
-		poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_BDEV, bdev,
+		poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_BDEV, bdev,
 					   POWERAID_BDEV_EV_VALIDATE_MD);
 	} else {
 		/* 无 MD（新卷）或加载失败 → 直接上线 */
 		assert(bdev->loaded_sb_ctx == NULL);
-		poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_BDEV, bdev,
+		poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_BDEV, bdev,
 					   POWERAID_BDEV_EV_SET_ONLINE);
 	}
 }
@@ -108,8 +108,8 @@ bdev_try_read_md_sb_load_cb(int status,
  * 参考：raid_base_bdev_info.desc 由 raid_bdev 框架在 raid_bdev_add_base_bdev 分配。
  */
 void
-poweraid_raid5f_sm_bdev_open(struct poweraid_raid5f_bdev *bdev,
-			     enum poweraid_raid5f_bdev_event event)
+poweraid_raid_common_sm_bdev_open(struct poweraid_raid_common_bdev *bdev,
+			     enum poweraid_raid_common_bdev_event event)
 {
 	SPDK_DEBUGLOG(raid5f_sm_bdev, "open: bdev=%p desc=%p event=%u\n", bdev,
 		      bdev ? bdev->desc : NULL, (uint32_t)event);
@@ -134,7 +134,7 @@ poweraid_raid5f_sm_bdev_open(struct poweraid_raid5f_bdev *bdev,
 	}
 
 	/* 触发元数据加载 */
-	poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_BDEV, bdev,
+	poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_BDEV, bdev,
 				   POWERAID_BDEV_EV_TRY_READ_MD);
 }
 
@@ -143,8 +143,8 @@ poweraid_raid5f_sm_bdev_open(struct poweraid_raid5f_bdev *bdev,
  * 注：bdev->ch 由 OPEN 在子任务 D 设置（NULL 时 sb_load 仍可读，spdk_bdev_read 用全局 ch）。
  */
 void
-poweraid_raid5f_sm_bdev_try_read_md(struct poweraid_raid5f_bdev *bdev,
-				    enum poweraid_raid5f_bdev_event event)
+poweraid_raid_common_sm_bdev_try_read_md(struct poweraid_raid_common_bdev *bdev,
+				    enum poweraid_raid_common_bdev_event event)
 {
 	SPDK_DEBUGLOG(raid5f_sm_bdev, "try_read_md: bdev=%p desc=%p ch=%p event=%u\n",
 		      bdev, bdev ? bdev->desc : NULL,
@@ -155,7 +155,7 @@ poweraid_raid5f_sm_bdev_try_read_md(struct poweraid_raid5f_bdev *bdev,
 		return;
 	}
 
-	poweraid_raid5f_sb_load(bdev->desc, (struct spdk_io_channel *)bdev->ch,
+	poweraid_raid_common_sb_load(bdev->desc, (struct spdk_io_channel *)bdev->ch,
 				bdev_try_read_md_sb_load_cb, bdev);
 }
 
@@ -164,10 +164,10 @@ poweraid_raid5f_sm_bdev_try_read_md(struct poweraid_raid5f_bdev *bdev,
  * 参考：XISRC xnr_dev_verify_md 检查 magic + ext_signature。
  */
 void
-poweraid_raid5f_sm_bdev_validate_md(struct poweraid_raid5f_bdev *bdev,
-				    enum poweraid_raid5f_bdev_event event)
+poweraid_raid_common_sm_bdev_validate_md(struct poweraid_raid_common_bdev *bdev,
+				    enum poweraid_raid_common_bdev_event event)
 {
-	const struct poweraid_raid5f_sb_v2_ext *ext;
+	const struct poweraid_raid_common_sb_v2_ext *ext;
 	const struct raid_bdev_superblock *v1;
 
 	SPDK_DEBUGLOG(raid5f_sm_bdev, "validate_md: bdev=%p event=%u\n", bdev,
@@ -178,27 +178,27 @@ poweraid_raid5f_sm_bdev_validate_md(struct poweraid_raid5f_bdev *bdev,
 		return;
 	}
 
-	v1 = poweraid_raid5f_sb_loaded_get_v1(bdev->loaded_sb_ctx);
+	v1 = poweraid_raid_common_sb_loaded_get_v1(bdev->loaded_sb_ctx);
 	if (v1 == NULL) {
 		SPDK_ERRLOG("validate_md: no loaded_ctx bdev=%p\n", bdev);
 		poweraid_raid_state_set(&bdev->state, POWERAID_BDEV_ST_FAULTED);
 		return;
 	}
 
-	ext = poweraid_raid5f_sb_loaded_get_ext(bdev->loaded_sb_ctx);
+	ext = poweraid_raid_common_sb_loaded_get_ext(bdev->loaded_sb_ctx);
 	if (ext == NULL) {
 		/* v1 兼容加载（无 ext 区）：跳过 ext 校验，直接上线 */
 		SPDK_DEBUGLOG(raid5f_sm_bdev, "validate_md: v1 disk (no ext) bdev=%p\n", bdev);
 		poweraid_raid_state_set(&bdev->state, POWERAID_BDEV_ST_MD_VALID);
-		poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_BDEV, bdev,
+		poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_BDEV, bdev,
 					   POWERAID_BDEV_EV_SET_ONLINE);
 		return;
 	}
 
-	if (memcmp(ext->ext_signature, POWERAID_RAID5F_SB_V2_EXT_SIG,
+	if (memcmp(ext->ext_signature, POWERAID_RAID_COMMON_SB_V2_EXT_SIG,
 		   sizeof(ext->ext_signature)) != 0) {
 		SPDK_ERRLOG("validate_md: ext_signature mismatch bdev=%p\n", bdev);
-		poweraid_raid5f_sb_free_loaded(bdev->loaded_sb_ctx);
+		poweraid_raid_common_sb_free_loaded(bdev->loaded_sb_ctx);
 		bdev->loaded_sb_ctx = NULL;
 		poweraid_raid_state_set(&bdev->state, POWERAID_BDEV_ST_FAULTED);
 		return;
@@ -207,10 +207,10 @@ poweraid_raid5f_sm_bdev_validate_md(struct poweraid_raid5f_bdev *bdev,
 	/* 阶段 2 子任务 C：若启用 PPL 特性，在此为该盘分配 PPL 上下文（仅内存，
 	 * 不做 IO）。实际的 ppl_load_replay / recovery_run 由 RAID ONLINE（子任务 D）
 	 * 在所有盘就绪 + read_fn 就绪后触发。bdev->ch 由 OPEN 阶段（子任务 D）设置。*/
-	if ((ext->feature_flags & POWERAID_RAID5F_SB_F_PPL) &&
+	if ((ext->feature_flags & POWERAID_RAID_COMMON_SB_F_PPL) &&
 	    bdev->ppl_ctx == NULL && bdev->desc != NULL &&
 	    v1->block_size != 0 && ext->ppl_region_size != 0) {
-		bdev->ppl_ctx = poweraid_raid5f_ppl_alloc(
+		bdev->ppl_ctx = poweraid_raid_common_ppl_alloc(
 			bdev->desc, (struct spdk_io_channel *)bdev->ch,
 			v1->block_size,
 			ext->ppl_region_offset, ext->ppl_region_size);
@@ -225,7 +225,7 @@ poweraid_raid5f_sm_bdev_validate_md(struct poweraid_raid5f_bdev *bdev,
 	}
 
 	poweraid_raid_state_set(&bdev->state, POWERAID_BDEV_ST_MD_VALID);
-	poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_BDEV, bdev,
+	poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_BDEV, bdev,
 				   POWERAID_BDEV_EV_SET_ONLINE);
 }
 
@@ -234,10 +234,10 @@ poweraid_raid5f_sm_bdev_validate_md(struct poweraid_raid5f_bdev *bdev,
  * 参考：XISRC xnr_dev_online + raid5f 全盘就绪后框架注册 bdev。
  */
 void
-poweraid_raid5f_sm_bdev_set_online(struct poweraid_raid5f_bdev *bdev,
-				   enum poweraid_raid5f_bdev_event event)
+poweraid_raid_common_sm_bdev_set_online(struct poweraid_raid_common_bdev *bdev,
+				   enum poweraid_raid_common_bdev_event event)
 {
-	struct poweraid_raid5f_raid *raid;
+	struct poweraid_raid_common_raid *raid;
 	uint8_t i;
 	bool all_online = true;
 
@@ -253,7 +253,7 @@ poweraid_raid5f_sm_bdev_set_online(struct poweraid_raid5f_bdev *bdev,
 
 	/* 释放 loaded_sb_ctx（VALIDATE_MD 已用完） */
 	if (bdev->loaded_sb_ctx != NULL) {
-		poweraid_raid5f_sb_free_loaded(bdev->loaded_sb_ctx);
+		poweraid_raid_common_sb_free_loaded(bdev->loaded_sb_ctx);
 		bdev->loaded_sb_ctx = NULL;
 	}
 
@@ -276,41 +276,41 @@ poweraid_raid5f_sm_bdev_set_online(struct poweraid_raid5f_bdev *bdev,
 	}
 
 	if (all_online) {
-		poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_RAID, raid,
+		poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_RAID, raid,
 					   POWERAID_RAID_EV_ONLINE);
 	}
 }
 
 /* ===== 全局 BDEV FSM 分派表 ===== */
-poweraid_raid5f_bdev_handler_t
-poweraid_raid5f_bdev_fsm[POWERAID_BDEV_EV_COUNT] = {
-	[POWERAID_BDEV_EV_START]              = poweraid_raid5f_sm_bdev_start,
-	[POWERAID_BDEV_EV_DEV_START]          = poweraid_raid5f_sm_bdev_dev_start,
-	[POWERAID_BDEV_EV_OPEN]              = poweraid_raid5f_sm_bdev_open,
-	[POWERAID_BDEV_EV_TRY_OPEN]           = poweraid_raid5f_sm_bdev_try_open,
-	[POWERAID_BDEV_EV_CLOSE]             = poweraid_raid5f_sm_bdev_close,
-	[POWERAID_BDEV_EV_CLOSE_FINISH]      = poweraid_raid5f_sm_bdev_close_finish,
-	[POWERAID_BDEV_EV_CALLBACK]          = poweraid_raid5f_sm_bdev_callback,
-	[POWERAID_BDEV_EV_FINISH]            = poweraid_raid5f_sm_bdev_finish,
-	[POWERAID_BDEV_EV_DESTROY]           = poweraid_raid5f_sm_bdev_destroy,
-	[POWERAID_BDEV_EV_TRY_READ_MD]       = poweraid_raid5f_sm_bdev_try_read_md,
-	[POWERAID_BDEV_EV_READ_MD]           = poweraid_raid5f_sm_bdev_read_md,
-	[POWERAID_BDEV_EV_TEST_MD_EMPTY]     = poweraid_raid5f_sm_bdev_test_md_empty,
-	[POWERAID_BDEV_EV_DEV_IN_RAID]       = poweraid_raid5f_sm_bdev_dev_in_raid,
-	[POWERAID_BDEV_EV_DEV_NOT_IN_RAID]   = poweraid_raid5f_sm_bdev_dev_not_in_raid,
-	[POWERAID_BDEV_EV_VALIDATE_MD]       = poweraid_raid5f_sm_bdev_validate_md,
-	[POWERAID_BDEV_EV_VALIDATE_EMPTY_MD] = poweraid_raid5f_sm_bdev_validate_empty_md,
-	[POWERAID_BDEV_EV_COMPARE_MD]         = poweraid_raid5f_sm_bdev_compare_md,
-	[POWERAID_BDEV_EV_MERGE_MD]          = poweraid_raid5f_sm_bdev_merge_md,
-	[POWERAID_BDEV_EV_WRITE_MD]          = poweraid_raid5f_sm_bdev_write_md,
-	[POWERAID_BDEV_EV_FLUSH_MD_ALL]      = poweraid_raid5f_sm_bdev_flush_md_all,
-	[POWERAID_BDEV_EV_WAIT_FLUSH_MD]     = poweraid_raid5f_sm_bdev_wait_flush_md,
-	[POWERAID_BDEV_EV_ZERO_MD]           = poweraid_raid5f_sm_bdev_zero_md,
-	[POWERAID_BDEV_EV_WAIT_CH_OP]        = poweraid_raid5f_sm_bdev_wait_ch_op,
-	[POWERAID_BDEV_EV_CHECK_DEV_READY]   = poweraid_raid5f_sm_bdev_check_dev_ready,
-	[POWERAID_BDEV_EV_SET_ONLINE]        = poweraid_raid5f_sm_bdev_set_online,
+poweraid_raid_common_bdev_handler_t
+poweraid_raid_common_bdev_fsm[POWERAID_BDEV_EV_COUNT] = {
+	[POWERAID_BDEV_EV_START]              = poweraid_raid_common_sm_bdev_start,
+	[POWERAID_BDEV_EV_DEV_START]          = poweraid_raid_common_sm_bdev_dev_start,
+	[POWERAID_BDEV_EV_OPEN]              = poweraid_raid_common_sm_bdev_open,
+	[POWERAID_BDEV_EV_TRY_OPEN]           = poweraid_raid_common_sm_bdev_try_open,
+	[POWERAID_BDEV_EV_CLOSE]             = poweraid_raid_common_sm_bdev_close,
+	[POWERAID_BDEV_EV_CLOSE_FINISH]      = poweraid_raid_common_sm_bdev_close_finish,
+	[POWERAID_BDEV_EV_CALLBACK]          = poweraid_raid_common_sm_bdev_callback,
+	[POWERAID_BDEV_EV_FINISH]            = poweraid_raid_common_sm_bdev_finish,
+	[POWERAID_BDEV_EV_DESTROY]           = poweraid_raid_common_sm_bdev_destroy,
+	[POWERAID_BDEV_EV_TRY_READ_MD]       = poweraid_raid_common_sm_bdev_try_read_md,
+	[POWERAID_BDEV_EV_READ_MD]           = poweraid_raid_common_sm_bdev_read_md,
+	[POWERAID_BDEV_EV_TEST_MD_EMPTY]     = poweraid_raid_common_sm_bdev_test_md_empty,
+	[POWERAID_BDEV_EV_DEV_IN_RAID]       = poweraid_raid_common_sm_bdev_dev_in_raid,
+	[POWERAID_BDEV_EV_DEV_NOT_IN_RAID]   = poweraid_raid_common_sm_bdev_dev_not_in_raid,
+	[POWERAID_BDEV_EV_VALIDATE_MD]       = poweraid_raid_common_sm_bdev_validate_md,
+	[POWERAID_BDEV_EV_VALIDATE_EMPTY_MD] = poweraid_raid_common_sm_bdev_validate_empty_md,
+	[POWERAID_BDEV_EV_COMPARE_MD]         = poweraid_raid_common_sm_bdev_compare_md,
+	[POWERAID_BDEV_EV_MERGE_MD]          = poweraid_raid_common_sm_bdev_merge_md,
+	[POWERAID_BDEV_EV_WRITE_MD]          = poweraid_raid_common_sm_bdev_write_md,
+	[POWERAID_BDEV_EV_FLUSH_MD_ALL]      = poweraid_raid_common_sm_bdev_flush_md_all,
+	[POWERAID_BDEV_EV_WAIT_FLUSH_MD]     = poweraid_raid_common_sm_bdev_wait_flush_md,
+	[POWERAID_BDEV_EV_ZERO_MD]           = poweraid_raid_common_sm_bdev_zero_md,
+	[POWERAID_BDEV_EV_WAIT_CH_OP]        = poweraid_raid_common_sm_bdev_wait_ch_op,
+	[POWERAID_BDEV_EV_CHECK_DEV_READY]   = poweraid_raid_common_sm_bdev_check_dev_ready,
+	[POWERAID_BDEV_EV_SET_ONLINE]        = poweraid_raid_common_sm_bdev_set_online,
 };
 
-SPDK_STATIC_ASSERT(SPDK_COUNTOF(poweraid_raid5f_bdev_fsm) ==
+SPDK_STATIC_ASSERT(SPDK_COUNTOF(poweraid_raid_common_bdev_fsm) ==
 		   POWERAID_BDEV_EV_COUNT,
 		   "bdev fsm table size mismatch with enum");

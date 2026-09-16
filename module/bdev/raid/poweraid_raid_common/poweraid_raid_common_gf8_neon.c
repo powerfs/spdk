@@ -18,7 +18,7 @@
 #include "spdk/stdinc.h"
 #include "spdk/log.h"
 
-#include "poweraid_raid5f_gf8.h"
+#include "poweraid_raid_common_gf8.h"
 
 SPDK_LOG_REGISTER_COMPONENT(raid5f_gf8_neon);
 
@@ -35,8 +35,8 @@ SPDK_LOG_REGISTER_COMPONENT(raid5f_gf8_neon);
 static void
 build_mul_lut_neon(uint8_t c, uint8_t hi_lut[16], uint8_t lo_lut[16])
 {
-	const uint8_t *exp = poweraid_raid5f_gf8_exp;
-	const uint8_t *log = poweraid_raid5f_gf8_log;
+	const uint8_t *exp = poweraid_raid_common_gf8_exp;
+	const uint8_t *log = poweraid_raid_common_gf8_log;
 	uint8_t lc;
 	int i;
 
@@ -182,9 +182,9 @@ gf8_mul_const_xor_neon(const uint8_t *src, uint8_t c, uint8_t *dst, uint64_t len
 /* ===== SIMD 路径选择入口 ===== */
 
 void
-poweraid_raid5f_gf8_try_select_simd(
-	poweraid_raid5f_gf8_mul_const_fn     *p_mul_const,
-	poweraid_raid5f_gf8_mul_const_xor_fn *p_mul_const_xor,
+poweraid_raid_common_gf8_try_select_simd(
+	poweraid_raid_common_gf8_mul_const_fn     *p_mul_const,
+	poweraid_raid_common_gf8_mul_const_xor_fn *p_mul_const_xor,
 	const char                          **p_impl_name)
 {
 	/* ARM64 NEON 总是可用 */
@@ -198,9 +198,9 @@ poweraid_raid5f_gf8_try_select_simd(
 
 /* 非 ARM 平台: 不覆盖函数指针，保持标量或 x86 路径 */
 void
-poweraid_raid5f_gf8_try_select_simd(
-	poweraid_raid5f_gf8_mul_const_fn     *p_mul_const,
-	poweraid_raid5f_gf8_mul_const_xor_fn *p_mul_const_xor,
+poweraid_raid_common_gf8_try_select_simd(
+	poweraid_raid_common_gf8_mul_const_fn     *p_mul_const,
+	poweraid_raid_common_gf8_mul_const_xor_fn *p_mul_const_xor,
 	const char                          **p_impl_name)
 {
 	/* x86 平台由 gf8_x86.c 处理；其他平台保持标量 */

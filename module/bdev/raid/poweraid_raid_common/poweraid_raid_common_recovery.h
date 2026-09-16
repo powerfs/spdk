@@ -14,44 +14,44 @@
  *   恢复期间置 RAID_ST_RESTORING，完成后清除。
  */
 
-#ifndef POWERAID_RAID5F_RECOVERY_H
-#define POWERAID_RAID5F_RECOVERY_H
+#ifndef POWERAID_RAID_COMMON_RECOVERY_H
+#define POWERAID_RAID_COMMON_RECOVERY_H
 
 #include "spdk/stdinc.h"
-#include "poweraid_raid5f_ppl.h"
-#include "poweraid_raid5f_sm.h"
+#include "poweraid_raid_common_ppl.h"
+#include "poweraid_raid_common_sm.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /* 恢复动作（三分支结果）*/
-enum poweraid_raid5f_recovery_action {
+enum poweraid_raid_common_recovery_action {
 	POWERAID_RECOVERY_ACT_NONE = 0,         /* data==old → 跳过（IO 未到达）*/
 	POWERAID_RECOVERY_ACT_REWRITE_PARITY,     /* data==new → 补写 parity */
 	POWERAID_RECOVERY_ACT_INCONSISTENT,       /* 都不匹配 → 标记 faulty，触发 scrub */
 };
 
-struct poweraid_raid5f_recovery_result {
+struct poweraid_raid_common_recovery_result {
 	uint64_t	seq;
 	uint64_t	stripe_id;
 	uint64_t	chunk_bitmap;
 	uint64_t	cur_data_hash;  /* 恢复时读盘算出的当前 data hash */
-	enum poweraid_raid5f_recovery_action action;
+	enum poweraid_raid_common_recovery_action action;
 };
 
 /* 读单个 data chunk 的回调签名（layout 无关）。
  * chunk_idx 为 record.chunk_bitmap 中置位的位（升序），chunk_len_blocks = strip_size。
  * cb 返回 buf（len 字节，>= chunk_len_blocks*block_size）。status!=0 表示读失败。 */
-typedef void (*poweraid_raid5f_recovery_read_data_cb)(int status, const void *buf,
+typedef void (*poweraid_raid_common_recovery_read_data_cb)(int status, const void *buf,
 		size_t len, void *cb_arg);
-typedef void (*poweraid_raid5f_recovery_read_data_fn)(
-	struct poweraid_raid5f_raid *raid,
+typedef void (*poweraid_raid_common_recovery_read_data_fn)(
+	struct poweraid_raid_common_raid *raid,
 	uint64_t stripe_id, uint32_t chunk_idx, uint32_t chunk_len_blocks,
-	poweraid_raid5f_recovery_read_data_cb cb, void *cb_arg);
+	poweraid_raid_common_recovery_read_data_cb cb, void *cb_arg);
 
-typedef void (*poweraid_raid5f_recovery_done_cb)(int status,
-		const struct poweraid_raid5f_recovery_result *results, uint32_t num_results,
+typedef void (*poweraid_raid_common_recovery_done_cb)(int status,
+		const struct poweraid_raid_common_recovery_result *results, uint32_t num_results,
 		void *cb_arg);
 
 /**
@@ -60,28 +60,28 @@ typedef void (*poweraid_raid5f_recovery_done_cb)(int status,
  * read_fn 由集成层提供；为 NULL 时仅做 PPL 扫描，所有 record 标 NONE（安全降级）。
  * 恢复期间置 raid->state |= RAID_ST_RESTORING，完成时清除。
  */
-void poweraid_raid5f_recovery_run(
-	struct poweraid_raid5f_ppl_ctx *ppl_ctx,
-	struct poweraid_raid5f_raid *raid,
-	poweraid_raid5f_recovery_read_data_fn read_fn,
-	poweraid_raid5f_recovery_done_cb cb, void *cb_arg);
+void poweraid_raid_common_recovery_run(
+	struct poweraid_raid_common_ppl_ctx *ppl_ctx,
+	struct poweraid_raid_common_raid *raid,
+	poweraid_raid_common_recovery_read_data_fn read_fn,
+	poweraid_raid_common_recovery_done_cb cb, void *cb_arg);
 
 /**
  * 释放 recovery_run 回调返回的 result 数组。
  */
-void poweraid_raid5f_recovery_free_result(struct poweraid_raid5f_recovery_result *results);
+void poweraid_raid_common_recovery_free_result(struct poweraid_raid_common_recovery_result *results);
 
 /**
  * 集成层提供的 read_data_fn 实现（poweraid_raid5f.c）：按 RAID5F 布局
  * 读指定 stripe 的某个 data chunk（整 strip）。
  */
-void poweraid_raid5f_recovery_read_strip(
-	struct poweraid_raid5f_raid *raid,
+void poweraid_raid_common_recovery_read_strip(
+	struct poweraid_raid_common_raid *raid,
 	uint64_t stripe_id, uint32_t chunk_idx, uint32_t chunk_len_blocks,
-	poweraid_raid5f_recovery_read_data_cb cb, void *cb_arg);
+	poweraid_raid_common_recovery_read_data_cb cb, void *cb_arg);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* POWERAID_RAID5F_RECOVERY_H */
+#endif /* POWERAID_RAID_COMMON_RECOVERY_H */

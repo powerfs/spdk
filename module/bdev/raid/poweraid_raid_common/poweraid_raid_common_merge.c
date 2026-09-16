@@ -5,7 +5,7 @@
  *
  *   收集同一 stripe 的多个部分 stripe 写，凑齐后一次性提交：
  *     - 全 chunk 覆盖 → 全 stripe 写路径（carrier approach + REQ FSM）
- *     - 部分 chunk 覆盖 → RMW（poweraid_raid5f_rmw_submit_merged）
+ *     - 部分 chunk 覆盖 → RMW（poweraid_raid_common_rmw_submit_merged）
  *
  *   收集阶段数据仅在内存（chunk_bufs），不写 PPL。
  *   最终写路径（全 stripe 或 RMW）包含 PPL。
@@ -25,9 +25,9 @@
 #include "spdk/env.h"
 
 #include "../bdev_raid.h"
-#include "poweraid_raid5f.h"
-#include "poweraid_raid5f_merge.h"
-#include "poweraid_raid5f_rmw.h"
+#include "poweraid_raid_common.h"
+#include "poweraid_raid_common_merge.h"
+#include "poweraid_raid_common_rmw.h"
 
 SPDK_LOG_REGISTER_COMPONENT(raid5f_merge);
 
@@ -44,8 +44,8 @@ static void merge_check_drain(struct merge_ctx *mctx);
 static struct merge_entry *
 merge_entry_alloc(struct merge_ctx *mctx,
 		   struct raid_bdev_io_channel *raid_ch,
-		   struct poweraid_raid5f_io_channel *mod_ch,
-		   struct poweraid_raid5f_raid *raid,
+		   struct poweraid_raid_common_io_channel *mod_ch,
+		   struct poweraid_raid_common_raid *raid,
 		   uint64_t stripe_index)
 {
 	uint32_t data_chunks = raid->num_base_bdevs - 1;
@@ -188,9 +188,9 @@ merge_carrier_complete_cb(struct raid_bdev_io *carrier,
 static int
 merge_full_stripe_write(struct merge_entry *entry)
 {
-	struct poweraid_raid5f_raid *raid = entry->raid;
-	struct poweraid_raid5f_io_channel *ch = entry->mod_ch;
-	struct poweraid_raid5f_req *req;
+	struct poweraid_raid_common_raid *raid = entry->raid;
+	struct poweraid_raid_common_io_channel *ch = entry->mod_ch;
+	struct poweraid_raid_common_req *req;
 	struct raid_bdev_io *carrier;
 	struct merge_pending_io *first_pio;
 	uint32_t strip_bytes = entry->strip_bytes;
@@ -215,7 +215,7 @@ merge_full_stripe_write(struct merge_entry *entry)
 	carrier->module_private = entry;
 
 	/* 填充 req */
-	req->type = POWERAID_RAID5F_STRIPE_REQ_WRITE;
+	req->type = POWERAID_RAID_COMMON_STRIPE_REQ_WRITE;
 	req->raid_io = carrier;
 	req->stripe_index = entry->stripe_index;
 	req->raid = raid;
@@ -258,7 +258,7 @@ merge_full_stripe_write(struct merge_entry *entry)
 		      " carrier=%p\n", req, entry->stripe_index, carrier);
 
 	/* 触发 REQ FSM：ASSIGN → CALC → WRITE_FULL → ... → IO_COMPLETE */
-	poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_REQ, req,
+	poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
 				   POWERAID_REQ_EV_ASSIGN);
 	return 0;
 
@@ -303,7 +303,7 @@ merge_rmw_dispatch(struct merge_entry *entry)
 		      " bitmap=0x%"PRIx64"\n", entry, entry->stripe_index,
 		      entry->chunk_bitmap);
 
-	rc = poweraid_raid5f_rmw_submit_merged(entry->raid_ch,
+	rc = poweraid_raid_common_rmw_submit_merged(entry->raid_ch,
 					       entry->raid,
 					       entry->stripe_index,
 					       entry->chunk_bitmap,
@@ -409,9 +409,9 @@ merge_check_drain(struct merge_ctx *mctx)
 /* ===== 公开 API ===== */
 
 int
-poweraid_raid5f_merge_init(struct merge_ctx *mctx,
-			    struct poweraid_raid5f_raid *raid,
-			    struct poweraid_raid5f_io_channel *mod_ch)
+poweraid_raid_common_merge_init(struct merge_ctx *mctx,
+			    struct poweraid_raid_common_raid *raid,
+			    struct poweraid_raid_common_io_channel *mod_ch)
 {
 	memset(mctx, 0, sizeof(*mctx));
 	TAILQ_INIT(&mctx->pending_list);
@@ -435,7 +435,7 @@ poweraid_raid5f_merge_init(struct merge_ctx *mctx,
 }
 
 void
-poweraid_raid5f_merge_destroy(struct merge_ctx *mctx)
+poweraid_raid_common_merge_destroy(struct merge_ctx *mctx)
 {
 	struct merge_entry *entry;
 	struct merge_pending_io *pio;
@@ -474,11 +474,11 @@ poweraid_raid5f_merge_destroy(struct merge_ctx *mctx)
 }
 
 int
-poweraid_raid5f_merge_submit(struct raid_bdev_io *raid_io)
+poweraid_raid_common_merge_submit(struct raid_bdev_io *raid_io)
 {
 	struct raid_bdev *raid_bdev = raid_io->raid_bdev;
-	struct poweraid_raid5f_raid *raid = raid_bdev->module_private;
-	struct poweraid_raid5f_io_channel *ch;
+	struct poweraid_raid_common_raid *raid = raid_bdev->module_private;
+	struct poweraid_raid_common_io_channel *ch;
 	uint32_t data_chunks = raid->num_base_bdevs - 1;
 	uint32_t stripe_blocks = raid->strip_size * data_chunks;
 	uint64_t stripe_index = raid_io->offset_blocks / stripe_blocks;
@@ -524,7 +524,7 @@ poweraid_raid5f_merge_submit(struct raid_bdev_io *raid_io)
 		if (mctx->num_pending >= MERGE_MAX_PENDING) {
 			/* 超限：直接走 RMW 单 strip 路径（不合并）*/
 			free(pio);
-			return poweraid_raid5f_rmw_submit(raid_io);
+			return poweraid_raid_common_rmw_submit(raid_io);
 		}
 
 		/* 创建新 entry */
@@ -575,9 +575,9 @@ poweraid_raid5f_merge_submit(struct raid_bdev_io *raid_io)
 }
 
 void
-poweraid_raid5f_merge_flush_all(struct raid_bdev_io *raid_io)
+poweraid_raid_common_merge_flush_all(struct raid_bdev_io *raid_io)
 {
-	struct poweraid_raid5f_io_channel *ch;
+	struct poweraid_raid_common_io_channel *ch;
 	struct merge_ctx *mctx;
 	struct merge_entry *entry, *tmp;
 

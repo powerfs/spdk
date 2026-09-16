@@ -1,8 +1,8 @@
 /*   SPDX-License-Identifier: BSD-3-Clause
  *   Copyright (c) 2026 poweraid. All rights reserved.
  *
- *   REQ 层 FSM handler（20 个事件，对应 poweraid_raid5f_sm.h 中
- *   enum poweraid_raid5f_req_event 全部真实事件）
+ *   REQ 层 FSM handler（20 个事件，对应 poweraid_raid_common_sm.h 中
+ *   enum poweraid_raid_common_req_event 全部真实事件）
  *
  *   阶段 1：全部为 stub，仅 SPDK_DEBUGLOG 打印 + 立即返回。
  *   后续阶段逐个填充实际逻辑（参考 XISRC xnr_req_* 函数族）。
@@ -15,15 +15,15 @@
 #include "spdk/thread.h"
 #include "spdk/accel.h"
 
-#include "poweraid_raid5f.h"
+#include "poweraid_raid_common.h"
 
 SPDK_LOG_REGISTER_COMPONENT(raid5f_sm_req);
 
 /* REQ 层状态位图为 uint32_t（节省内存），打印时用 PRIx32 */
 #define DEFINE_REQ_HANDLER(name)                                        \
 void                                                                     \
-poweraid_raid5f_sm_req_##name(struct poweraid_raid5f_req *req,           \
-			      enum poweraid_raid5f_req_event event)          \
+poweraid_raid_common_sm_req_##name(struct poweraid_raid_common_req *req,           \
+			      enum poweraid_raid_common_req_event event)          \
 {                                                                        \
 	SPDK_DEBUGLOG(raid5f_sm_req, "%s: req=%p state=0x%" PRIx32       \
 		       " event=%u\n", #name, req,                         \
@@ -66,8 +66,8 @@ DEFINE_REQ_HANDLER(write1)
  * 参考：XISRC xnr_req_assign + raid5f_submit_rw_request 分配 stripe_request（L816）。
  */
 void
-poweraid_raid5f_sm_req_assign(struct poweraid_raid5f_req *req,
-			      enum poweraid_raid5f_req_event event)
+poweraid_raid_common_sm_req_assign(struct poweraid_raid_common_req *req,
+			      enum poweraid_raid_common_req_event event)
 {
 	SPDK_DEBUGLOG(raid5f_sm_req, "assign: req=%p io=%p event=%u\n", req,
 		      req ? req->io : NULL, (uint32_t)event);
@@ -81,7 +81,7 @@ poweraid_raid5f_sm_req_assign(struct poweraid_raid5f_req *req,
 			  __ATOMIC_ACQ_REL);
 
 	/* 阶段 1：统一进入 CALC；阶段 2 按读/写类型分流到 READ0/READ1 或 WRITE_FULL */
-	poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_REQ, req,
+	poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
 				   POWERAID_REQ_EV_CALC);
 }
 
@@ -89,7 +89,7 @@ poweraid_raid5f_sm_req_assign(struct poweraid_raid5f_req *req,
  * 将 n_src 个 src_bufs XOR 到 parity_buf（uint64_t 粒度 + 尾部逐字节）。
  * xor_len 须为 8 的倍数（stripe block 对齐，NVMe 块 ≥ 512）。*/
 static void
-poweraid_raid5f_req_xor_sync(struct poweraid_raid5f_req *req)
+poweraid_raid_common_req_xor_sync(struct poweraid_raid_common_req *req)
 {
 	uint64_t *dst = req->parity_buf;
 	uint64_t len = req->xor_len / sizeof(uint64_t);
@@ -115,27 +115,27 @@ poweraid_raid5f_req_xor_sync(struct poweraid_raid5f_req *req)
  *           无 buffer（阶段 1 兼容）：直接 IO_COMPLETE。
  */
 static void
-poweraid_raid5f_req_xor_cb(void *cb_arg, int status)
+poweraid_raid_common_req_xor_cb(void *cb_arg, int status)
 {
-	struct poweraid_raid5f_req *req = cb_arg;
+	struct poweraid_raid_common_req *req = cb_arg;
 
 	if (status != 0) {
 		SPDK_ERRLOG("req calc: accel xor failed (%d), fallback sync\n", status);
-		poweraid_raid5f_req_xor_sync(req);
+		poweraid_raid_common_req_xor_sync(req);
 	}
 	/* XOR 完成后按写/读类型分流 */
-	if (req->type == POWERAID_RAID5F_STRIPE_REQ_WRITE) {
-		poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_REQ, req,
+	if (req->type == POWERAID_RAID_COMMON_STRIPE_REQ_WRITE) {
+		poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
 					   POWERAID_REQ_EV_WRITE_FULL);
 	} else {
-		poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_REQ, req,
+		poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
 					   POWERAID_REQ_EV_IO_COMPLETE);
 	}
 }
 
 void
-poweraid_raid5f_sm_req_calc(struct poweraid_raid5f_req *req,
-			    enum poweraid_raid5f_req_event event)
+poweraid_raid_common_sm_req_calc(struct poweraid_raid_common_req *req,
+			    enum poweraid_raid_common_req_event event)
 {
 	struct spdk_io_channel *accel_ch;
 	int rc;
@@ -153,7 +153,7 @@ poweraid_raid5f_sm_req_calc(struct poweraid_raid5f_req *req,
 	/* 无 buffer（阶段 1 兼容路径）：直接完成 */
 	if (req->src_bufs == NULL || req->parity_buf == NULL ||
 	    req->n_src == 0 || req->xor_len == 0) {
-		poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_REQ, req,
+		poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
 					   POWERAID_REQ_EV_IO_COMPLETE);
 		return;
 	}
@@ -161,12 +161,12 @@ poweraid_raid5f_sm_req_calc(struct poweraid_raid5f_req *req,
 	accel_ch = spdk_accel_get_io_channel();
 	if (accel_ch == NULL) {
 		SPDK_WARNLOG("req calc: no accel_ch, sync xor\n");
-		poweraid_raid5f_req_xor_sync(req);
-		if (req->type == POWERAID_RAID5F_STRIPE_REQ_WRITE) {
-			poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_REQ, req,
+		poweraid_raid_common_req_xor_sync(req);
+		if (req->type == POWERAID_RAID_COMMON_STRIPE_REQ_WRITE) {
+			poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
 						   POWERAID_REQ_EV_WRITE_FULL);
 		} else {
-			poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_REQ, req,
+			poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
 						   POWERAID_REQ_EV_IO_COMPLETE);
 		}
 		return;
@@ -174,7 +174,7 @@ poweraid_raid5f_sm_req_calc(struct poweraid_raid5f_req *req,
 
 	rc = spdk_accel_submit_xor(accel_ch, req->parity_buf, req->src_bufs,
 				   req->n_src, req->xor_len,
-				   poweraid_raid5f_req_xor_cb, req);
+				   poweraid_raid_common_req_xor_cb, req);
 	spdk_put_io_channel(accel_ch);
 
 	if (rc == 0) {
@@ -184,12 +184,12 @@ poweraid_raid5f_sm_req_calc(struct poweraid_raid5f_req *req,
 
 	/* 提交失败（含 -ENOMEM）：同步 fallback，保证前进 */
 	SPDK_WARNLOG("req calc: submit_xor rc=%d, sync fallback\n", rc);
-	poweraid_raid5f_req_xor_sync(req);
-	if (req->type == POWERAID_RAID5F_STRIPE_REQ_WRITE) {
-		poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_REQ, req,
+	poweraid_raid_common_req_xor_sync(req);
+	if (req->type == POWERAID_RAID_COMMON_STRIPE_REQ_WRITE) {
+		poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
 					   POWERAID_REQ_EV_WRITE_FULL);
 	} else {
-		poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_REQ, req,
+		poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
 					   POWERAID_REQ_EV_IO_COMPLETE);
 	}
 }
@@ -205,18 +205,18 @@ poweraid_raid5f_sm_req_calc(struct poweraid_raid5f_req *req,
  */
 
 /* 前向声明 */
-static void poweraid_raid5f_req_start_flushes(struct poweraid_raid5f_req *req);
-static void poweraid_raid5f_req_chunk_io_cb(struct spdk_bdev_io *bdev_io,
+static void poweraid_raid_common_req_start_flushes(struct poweraid_raid_common_req *req);
+static void poweraid_raid_common_req_chunk_io_cb(struct spdk_bdev_io *bdev_io,
 					   bool success, void *cb_arg);
 
 /* Step 1 完成：PPL append 回调 → 进入 Step 2（写 data+parity）*/
 static void
-poweraid_raid5f_req_ppl_append_done(int status, uint64_t seq, void *cb_arg)
+poweraid_raid_common_req_ppl_append_done(int status, uint64_t seq, void *cb_arg)
 {
-	struct poweraid_raid5f_req *req = cb_arg;
+	struct poweraid_raid_common_req *req = cb_arg;
 	struct raid_bdev_io *raid_io = req->raid_io;
 	struct raid_bdev *raid_bdev = raid_io->raid_bdev;
-	struct poweraid_raid5f_raid *raid = req->raid;
+	struct poweraid_raid_common_raid *raid = req->raid;
 	uint32_t strip_size_bytes = raid->strip_size * raid->block_size;
 	uint8_t p_idx, data_chunks = raid->num_base_bdevs - 1;
 	uint8_t i, chunk_idx;
@@ -252,7 +252,7 @@ poweraid_raid5f_req_ppl_append_done(int status, uint64_t seq, void *cb_arg)
 			SPDK_ERRLOG("write_full: no channel for chunk %u\n", i);
 			req->base_bdev_io_status = -EIO;
 			if (--req->base_bdev_io_remaining == 0) {
-				poweraid_raid5f_req_start_flushes(req);
+				poweraid_raid_common_req_start_flushes(req);
 			}
 			continue;
 		}
@@ -273,7 +273,7 @@ poweraid_raid5f_req_ppl_append_done(int status, uint64_t seq, void *cb_arg)
 		/* 回调：decrement remaining，全部完成后 → flush */
 		rc = raid_bdev_writev_blocks_ext(base_info, base_ch, &iov, 1,
 						 base_offset, raid->strip_size,
-						 poweraid_raid5f_req_chunk_io_cb, req, &io_opts);
+						 poweraid_raid_common_req_chunk_io_cb, req, &io_opts);
 		if (rc != 0) {
 			if (rc == -ENOMEM) {
 				/* TODO: queue IO wait；阶段 2 简化为失败 */
@@ -281,7 +281,7 @@ poweraid_raid5f_req_ppl_append_done(int status, uint64_t seq, void *cb_arg)
 			SPDK_ERRLOG("write_full: write chunk %u failed rc=%d\n", i, rc);
 			req->base_bdev_io_status = rc;
 			if (--req->base_bdev_io_remaining == 0) {
-				poweraid_raid5f_req_start_flushes(req);
+				poweraid_raid_common_req_start_flushes(req);
 			}
 		}
 	}
@@ -290,9 +290,9 @@ poweraid_raid5f_req_ppl_append_done(int status, uint64_t seq, void *cb_arg)
 /* Step 2/3 共用回调：base bdev IO（write 或 flush）完成。
  * spdk_bdev_io_completion_cb 签名：success 为布尔值（非 errno）。*/
 static void
-poweraid_raid5f_req_chunk_io_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+poweraid_raid_common_req_chunk_io_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
-	struct poweraid_raid5f_req *req = cb_arg;
+	struct poweraid_raid_common_req *req = cb_arg;
 
 	spdk_bdev_free_io(bdev_io);
 	if (!success) {
@@ -307,15 +307,15 @@ poweraid_raid5f_req_chunk_io_cb(struct spdk_bdev_io *bdev_io, bool success, void
 		    !poweraid_raid_state_test((uint64_t *)&req->state,
 					      POWERAID_REQ_ST_WRITE1)) {
 			/* write 阶段完成 → 进入 flush 阶段 */
-			poweraid_raid5f_req_start_flushes(req);
+			poweraid_raid_common_req_start_flushes(req);
 		} else if (poweraid_raid_state_test((uint64_t *)&req->state,
 						    POWERAID_REQ_ST_WRITE1)) {
 			/* flush 阶段完成 → 进入 Step 4 (ppl_commit) */
-			poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_REQ, req,
+			poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
 						   POWERAID_REQ_EV_WRITE_PARITY);
 		} else {
 			/* write 阶段有失败 → 跳过 flush，直接完成 */
-			poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_REQ, req,
+			poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
 						   POWERAID_REQ_EV_IO_COMPLETE);
 		}
 	}
@@ -323,17 +323,17 @@ poweraid_raid5f_req_chunk_io_cb(struct spdk_bdev_io *bdev_io, bool success, void
 
 /* Step 3：flush 所有 base bdev */
 static void
-poweraid_raid5f_req_start_flushes(struct poweraid_raid5f_req *req)
+poweraid_raid_common_req_start_flushes(struct poweraid_raid_common_req *req)
 {
 	struct raid_bdev_io *raid_io = req->raid_io;
 	struct raid_bdev *raid_bdev = raid_io->raid_bdev;
-	struct poweraid_raid5f_raid *raid = req->raid;
+	struct poweraid_raid_common_raid *raid = req->raid;
 	uint8_t i;
 	int rc;
 
 	if (req->base_bdev_io_status != 0) {
 		/* write 有失败，跳过 flush 直接完成 */
-		poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_REQ, req,
+		poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
 					   POWERAID_REQ_EV_IO_COMPLETE);
 		return;
 	}
@@ -351,7 +351,7 @@ poweraid_raid5f_req_start_flushes(struct poweraid_raid5f_req *req)
 		if (base_ch == NULL || base_info->desc == NULL) {
 			if (--req->base_bdev_io_remaining == 0) {
 				/* 全部 flush 完成 → Step 4 */
-				poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_REQ, req,
+				poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
 						   POWERAID_REQ_EV_WRITE_PARITY);
 			}
 			continue;
@@ -361,12 +361,12 @@ poweraid_raid5f_req_start_flushes(struct poweraid_raid5f_req *req)
 			       req->stripe_index * raid->strip_size;
 		rc = raid_bdev_flush_blocks(base_info, base_ch, base_offset,
 					    raid->strip_size,
-					    poweraid_raid5f_req_chunk_io_cb, req);
+					    poweraid_raid_common_req_chunk_io_cb, req);
 		if (rc != 0) {
 			SPDK_ERRLOG("flush chunk %u failed rc=%d\n", i, rc);
 			req->base_bdev_io_status = rc;
 			if (--req->base_bdev_io_remaining == 0) {
-				poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_REQ, req,
+				poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
 						   POWERAID_REQ_EV_WRITE_PARITY);
 			}
 		}
@@ -375,25 +375,25 @@ poweraid_raid5f_req_start_flushes(struct poweraid_raid5f_req *req)
 
 /* Step 4：ppl_commit 回调 → Step 5 IO_COMPLETE */
 static void
-poweraid_raid5f_req_ppl_commit_done(int status, void *cb_arg)
+poweraid_raid_common_req_ppl_commit_done(int status, void *cb_arg)
 {
-	struct poweraid_raid5f_req *req = cb_arg;
+	struct poweraid_raid_common_req *req = cb_arg;
 
 	if (status != 0) {
 		SPDK_ERRLOG("ppl commit failed (%d)\n", status);
 	}
-	poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_REQ, req,
+	poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
 				   POWERAID_REQ_EV_IO_COMPLETE);
 }
 
 /* WRITE_FULL handler：入口，触发 Step 1（ppl_append_record）*/
 void
-poweraid_raid5f_sm_req_write_full(struct poweraid_raid5f_req *req,
-				  enum poweraid_raid5f_req_event event)
+poweraid_raid_common_sm_req_write_full(struct poweraid_raid_common_req *req,
+				  enum poweraid_raid_common_req_event event)
 {
 	struct raid_bdev_io *raid_io = req->raid_io;
-	struct poweraid_raid5f_raid *raid = req->raid;
-	struct poweraid_raid5f_ppl_ctx *ppl_ctx = NULL;
+	struct poweraid_raid_common_raid *raid = req->raid;
+	struct poweraid_raid_common_ppl_ctx *ppl_ctx = NULL;
 	struct spdk_io_channel *ppl_ch = NULL;
 	uint8_t i;
 	uint64_t chunk_bitmap = 0;
@@ -422,32 +422,32 @@ poweraid_raid5f_sm_req_write_full(struct poweraid_raid5f_req *req,
 	if (ppl_ctx != NULL && ppl_ch != NULL) {
 		/* Step 1: PPL append（FUA 落盘 intent）*/
 		/* old_data_hash=0（全 stripe 写无旧数据），new_data_hash 用 data_buf 算 */
-		uint64_t new_hash = poweraid_raid5f_ppl_data_hash(
+		uint64_t new_hash = poweraid_raid_common_ppl_data_hash(
 			req->data_buf, (raid->num_base_bdevs - 1) *
 			raid->strip_size * raid->block_size);
 
 		__atomic_fetch_or(&req->state, POWERAID_REQ_ST_WRITE,
 				  __ATOMIC_ACQ_REL);
-		poweraid_raid5f_ppl_append_record(ppl_ctx, ppl_ch,
+		poweraid_raid_common_ppl_append_record(ppl_ctx, ppl_ch,
 						  req->stripe_index,
 						  chunk_bitmap, 0 /* old_data_hash */,
 						  new_hash,
-						  poweraid_raid5f_req_ppl_append_done, req);
+						  poweraid_raid_common_req_ppl_append_done, req);
 	} else {
 		/* 无 PPL：直接进入 Step 2（写 data+parity），降级但保证数据可用 */
 		SPDK_WARNLOG("write_full: no ppl_ctx, write without PPL protection\n");
-		poweraid_raid5f_req_ppl_append_done(0, 0, req);
+		poweraid_raid_common_req_ppl_append_done(0, 0, req);
 	}
 }
 
 /* WRITE_PARITY handler（复用为 Step 4：ppl_commit 入口）*/
 void
-poweraid_raid5f_sm_req_write_parity(struct poweraid_raid5f_req *req,
-				    enum poweraid_raid5f_req_event event)
+poweraid_raid_common_sm_req_write_parity(struct poweraid_raid_common_req *req,
+				    enum poweraid_raid_common_req_event event)
 {
-	struct poweraid_raid5f_raid *raid = req->raid;
+	struct poweraid_raid_common_raid *raid = req->raid;
 	struct raid_bdev_io *raid_io = req->raid_io;
-	struct poweraid_raid5f_ppl_ctx *ppl_ctx = NULL;
+	struct poweraid_raid_common_ppl_ctx *ppl_ctx = NULL;
 	struct spdk_io_channel *ppl_ch = NULL;
 	uint8_t i;
 
@@ -457,7 +457,7 @@ poweraid_raid5f_sm_req_write_parity(struct poweraid_raid5f_req *req,
 
 	if (req->ppl_seq == 0) {
 		/* 无 PPL record（append 失败或无 ppl_ctx），直接完成 */
-		poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_REQ, req,
+		poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
 					   POWERAID_REQ_EV_IO_COMPLETE);
 		return;
 	}
@@ -473,10 +473,10 @@ poweraid_raid5f_sm_req_write_parity(struct poweraid_raid5f_req *req,
 	}
 
 	if (ppl_ctx != NULL && ppl_ch != NULL) {
-		poweraid_raid5f_ppl_commit(ppl_ctx, ppl_ch, req->ppl_seq,
-					   poweraid_raid5f_req_ppl_commit_done, req);
+		poweraid_raid_common_ppl_commit(ppl_ctx, ppl_ch, req->ppl_seq,
+					   poweraid_raid_common_req_ppl_commit_done, req);
 	} else {
-		poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_REQ, req,
+		poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
 					   POWERAID_REQ_EV_IO_COMPLETE);
 	}
 }
@@ -485,8 +485,8 @@ poweraid_raid5f_sm_req_write_parity(struct poweraid_raid5f_req *req,
  * 参考：raid5f raid5f_stripe_request_complete → raid_bdev_io_complete（bdev_raid.c L605）。
  */
 void
-poweraid_raid5f_sm_req_io_complete(struct poweraid_raid5f_req *req,
-				   enum poweraid_raid5f_req_event event)
+poweraid_raid_common_sm_req_io_complete(struct poweraid_raid_common_req *req,
+				   enum poweraid_raid_common_req_event event)
 {
 	(void)event;
 
@@ -503,7 +503,7 @@ poweraid_raid5f_sm_req_io_complete(struct poweraid_raid5f_req *req,
 		raid_bdev_io_complete((struct raid_bdev_io *)req->io, status);
 	}
 
-	poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_REQ, req,
+	poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
 				   POWERAID_REQ_EV_DESTROY);
 }
 
@@ -511,8 +511,8 @@ poweraid_raid5f_sm_req_io_complete(struct poweraid_raid5f_req *req,
  * 参考：XISRC xnr_req_destroy + raid5f_stripe_request_release（IO channel 池回收）。
  */
 void
-poweraid_raid5f_sm_req_destroy(struct poweraid_raid5f_req *req,
-			       enum poweraid_raid5f_req_event event)
+poweraid_raid_common_sm_req_destroy(struct poweraid_raid_common_req *req,
+			       enum poweraid_raid_common_req_event event)
 {
 	SPDK_DEBUGLOG(raid5f_sm_req, "destroy: req=%p event=%u\n", req,
 		      (uint32_t)event);
@@ -551,7 +551,7 @@ poweraid_raid5f_sm_req_destroy(struct poweraid_raid5f_req *req,
 	req->base_bdev_io_status = 0;
 
 	if (req->ch != NULL) {
-		if (req->type == POWERAID_RAID5F_STRIPE_REQ_WRITE) {
+		if (req->type == POWERAID_RAID_COMMON_STRIPE_REQ_WRITE) {
 			TAILQ_INSERT_HEAD(&req->ch->free_write_stripe_requests,
 					   req, link);
 		} else {
@@ -562,30 +562,30 @@ poweraid_raid5f_sm_req_destroy(struct poweraid_raid5f_req *req,
 }
 
 /* ===== 全局 REQ FSM 分派表 ===== */
-poweraid_raid5f_req_handler_t
-poweraid_raid5f_req_fsm[POWERAID_REQ_EV_COUNT] = {
-	[POWERAID_REQ_EV_ASSIGN]                 = poweraid_raid5f_sm_req_assign,
-	[POWERAID_REQ_EV_REASSIGN]               = poweraid_raid5f_sm_req_reassign,
-	[POWERAID_REQ_EV_COMPLETE_SERVICE_REQ]   = poweraid_raid5f_sm_req_complete_service_req,
-	[POWERAID_REQ_EV_IO_COMPLETE]            = poweraid_raid5f_sm_req_io_complete,
-	[POWERAID_REQ_EV_WAIT_MD]                = poweraid_raid5f_sm_req_wait_md,
-	[POWERAID_REQ_EV_DESTROY]               = poweraid_raid5f_sm_req_destroy,
-	[POWERAID_REQ_EV_READ_RESTRIPE]         = poweraid_raid5f_sm_req_read_restripe,
-	[POWERAID_REQ_EV_READ_FULL]             = poweraid_raid5f_sm_req_read_full,
-	[POWERAID_REQ_EV_READ_ALL_FULL]         = poweraid_raid5f_sm_req_read_all_full,
-	[POWERAID_REQ_EV_READ0]                 = poweraid_raid5f_sm_req_read0,
-	[POWERAID_REQ_EV_READ1]                 = poweraid_raid5f_sm_req_read1,
-	[POWERAID_REQ_EV_READ_RECON1]           = poweraid_raid5f_sm_req_read_recon1,
-	[POWERAID_REQ_EV_WRITE_FULL]            = poweraid_raid5f_sm_req_write_full,
-	[POWERAID_REQ_EV_WRITE_PARITY]          = poweraid_raid5f_sm_req_write_parity,
-	[POWERAID_REQ_EV_WRITE_ALL_FULL]        = poweraid_raid5f_sm_req_write_all_full,
-	[POWERAID_REQ_EV_WRITE_RECON]           = poweraid_raid5f_sm_req_write_recon,
-	[POWERAID_REQ_EV_WRITE]                 = poweraid_raid5f_sm_req_write,
-	[POWERAID_REQ_EV_WRITE_ALL]             = poweraid_raid5f_sm_req_write_all,
-	[POWERAID_REQ_EV_WRITE1]                = poweraid_raid5f_sm_req_write1,
-	[POWERAID_REQ_EV_CALC]                 = poweraid_raid5f_sm_req_calc,
+poweraid_raid_common_req_handler_t
+poweraid_raid_common_req_fsm[POWERAID_REQ_EV_COUNT] = {
+	[POWERAID_REQ_EV_ASSIGN]                 = poweraid_raid_common_sm_req_assign,
+	[POWERAID_REQ_EV_REASSIGN]               = poweraid_raid_common_sm_req_reassign,
+	[POWERAID_REQ_EV_COMPLETE_SERVICE_REQ]   = poweraid_raid_common_sm_req_complete_service_req,
+	[POWERAID_REQ_EV_IO_COMPLETE]            = poweraid_raid_common_sm_req_io_complete,
+	[POWERAID_REQ_EV_WAIT_MD]                = poweraid_raid_common_sm_req_wait_md,
+	[POWERAID_REQ_EV_DESTROY]               = poweraid_raid_common_sm_req_destroy,
+	[POWERAID_REQ_EV_READ_RESTRIPE]         = poweraid_raid_common_sm_req_read_restripe,
+	[POWERAID_REQ_EV_READ_FULL]             = poweraid_raid_common_sm_req_read_full,
+	[POWERAID_REQ_EV_READ_ALL_FULL]         = poweraid_raid_common_sm_req_read_all_full,
+	[POWERAID_REQ_EV_READ0]                 = poweraid_raid_common_sm_req_read0,
+	[POWERAID_REQ_EV_READ1]                 = poweraid_raid_common_sm_req_read1,
+	[POWERAID_REQ_EV_READ_RECON1]           = poweraid_raid_common_sm_req_read_recon1,
+	[POWERAID_REQ_EV_WRITE_FULL]            = poweraid_raid_common_sm_req_write_full,
+	[POWERAID_REQ_EV_WRITE_PARITY]          = poweraid_raid_common_sm_req_write_parity,
+	[POWERAID_REQ_EV_WRITE_ALL_FULL]        = poweraid_raid_common_sm_req_write_all_full,
+	[POWERAID_REQ_EV_WRITE_RECON]           = poweraid_raid_common_sm_req_write_recon,
+	[POWERAID_REQ_EV_WRITE]                 = poweraid_raid_common_sm_req_write,
+	[POWERAID_REQ_EV_WRITE_ALL]             = poweraid_raid_common_sm_req_write_all,
+	[POWERAID_REQ_EV_WRITE1]                = poweraid_raid_common_sm_req_write1,
+	[POWERAID_REQ_EV_CALC]                 = poweraid_raid_common_sm_req_calc,
 };
 
-SPDK_STATIC_ASSERT(SPDK_COUNTOF(poweraid_raid5f_req_fsm) ==
+SPDK_STATIC_ASSERT(SPDK_COUNTOF(poweraid_raid_common_req_fsm) ==
 		   POWERAID_REQ_EV_COUNT,
 		   "req fsm table size mismatch with enum");

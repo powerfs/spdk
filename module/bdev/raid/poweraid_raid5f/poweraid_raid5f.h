@@ -1,7 +1,10 @@
 /*   SPDX-License-Identifier: BSD-3-Clause
  *   Copyright (c) 2026 poweraid. All rights reserved.
  *
- *   增强 RAID5F 模块：poweraid_raid5f 公共接口
+ *   增强 RAID5F 模块：poweraid_raid5f 薄壳公共接口
+ *
+ *   Stage 4 公共层抽取后，本头文件仅声明 5f 模块注册相关符号，
+ *   其余公共数据结构与 API 来自 poweraid_raid_common/。
  */
 
 #ifndef POWERAID_RAID5F_H
@@ -12,10 +15,7 @@
 #include "spdk/uuid.h"
 
 #include "../bdev_raid.h"
-#include "poweraid_raid5f_sm.h"
-#include "poweraid_raid5f_sb.h"
-#include "poweraid_raid5f_ppl.h"
-#include "poweraid_raid5f_recovery.h"
+#include "../poweraid_raid_common/poweraid_raid_common.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,7 +27,7 @@ extern "C" {
  */
 extern struct raid_bdev_module g_poweraid_raid5f_module;
 
-/* 模块生命周期 stub（阶段 1 仅占位，后续阶段填充）*/
+/* 模块生命周期 */
 int poweraid_raid5f_start(struct raid_bdev *raid_bdev);
 bool poweraid_raid5f_stop(struct raid_bdev *raid_bdev);
 void poweraid_raid5f_submit_rw_request(struct raid_bdev_io *raid_io);

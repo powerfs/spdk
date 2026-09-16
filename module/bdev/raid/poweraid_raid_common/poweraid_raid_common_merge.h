@@ -16,8 +16,8 @@
  *   详见 raid5f-enhanced-design.md 第 3.2 节（阶段 3b）。
  */
 
-#ifndef POWERAID_RAID5F_MERGE_H
-#define POWERAID_RAID5F_MERGE_H
+#ifndef POWERAID_RAID_COMMON_MERGE_H
+#define POWERAID_RAID_COMMON_MERGE_H
 
 #include "spdk/stdinc.h"
 #include "spdk/queue.h"
@@ -25,8 +25,8 @@
 
 struct raid_bdev_io;
 struct raid_bdev_io_channel;
-struct poweraid_raid5f_raid;
-struct poweraid_raid5f_io_channel;
+struct poweraid_raid_common_raid;
+struct poweraid_raid_common_io_channel;
 
 #ifdef __cplusplus
 extern "C" {
@@ -47,9 +47,9 @@ struct merge_pending_io {
 
 /* Per-stripe 合并条目 */
 struct merge_entry {
-	struct poweraid_raid5f_raid     *raid;
+	struct poweraid_raid_common_raid     *raid;
 	struct raid_bdev_io_channel     *raid_ch;      /* 框架 IO channel */
-	struct poweraid_raid5f_io_channel *mod_ch;     /* 模块 IO channel（free 池用）*/
+	struct poweraid_raid_common_io_channel *mod_ch;     /* 模块 IO channel（free 池用）*/
 	struct merge_ctx               *mctx;          /* 回指，drain 检查用 */
 	uint64_t                         stripe_index;
 	uint8_t                          p_idx;
@@ -68,8 +68,8 @@ struct merge_entry {
 
 /* Per-IO-channel 合并上下文 */
 struct merge_ctx {
-	struct poweraid_raid5f_raid     *raid;
-	struct poweraid_raid5f_io_channel *mod_ch;
+	struct poweraid_raid_common_raid     *raid;
+	struct poweraid_raid_common_io_channel *mod_ch;
 
 	TAILQ_HEAD(, merge_entry)        pending_list;
 	uint32_t                         num_pending;
@@ -87,15 +87,15 @@ struct merge_ctx {
  * 初始化 merge_ctx（ioch_create 调用）。
  * 注册 poller，初始化 TAILQ。
  */
-int poweraid_raid5f_merge_init(struct merge_ctx *mctx,
-			       struct poweraid_raid5f_raid *raid,
-			       struct poweraid_raid5f_io_channel *mod_ch);
+int poweraid_raid_common_merge_init(struct merge_ctx *mctx,
+			       struct poweraid_raid_common_raid *raid,
+			       struct poweraid_raid_common_io_channel *mod_ch);
 
 /**
  * 销毁 merge_ctx（ioch_destroy 调用）。
  * 注销 poller，fail 所有 pending IO。
  */
-void poweraid_raid5f_merge_destroy(struct merge_ctx *mctx);
+void poweraid_raid_common_merge_destroy(struct merge_ctx *mctx);
 
 /**
  * 提交一个部分 stripe 写到合并层。
@@ -103,16 +103,16 @@ void poweraid_raid5f_merge_destroy(struct merge_ctx *mctx);
  * 异步完成：通过 raid_bdev_io_complete 通知框架。
  * 返回 0 表示已接受，非 0 表示立即失败（调用方负责 complete）。
  */
-int poweraid_raid5f_merge_submit(struct raid_bdev_io *raid_io);
+int poweraid_raid_common_merge_submit(struct raid_bdev_io *raid_io);
 
 /**
  * Flush 所有 pending entry（FLUSH IO 到达时调用）。
  * 若有 inflight flush 则排队 flush IO，等 drain 后完成。
  */
-void poweraid_raid5f_merge_flush_all(struct raid_bdev_io *raid_io);
+void poweraid_raid_common_merge_flush_all(struct raid_bdev_io *raid_io);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* POWERAID_RAID5F_MERGE_H */
+#endif /* POWERAID_RAID_COMMON_MERGE_H */

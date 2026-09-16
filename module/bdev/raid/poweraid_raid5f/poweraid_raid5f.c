@@ -15,18 +15,18 @@
 
 #include "../bdev_raid.h"
 #include "poweraid_raid5f.h"
-#include "poweraid_raid5f_rmw.h"
-#include "poweraid_raid5f_merge.h"
+#include "../poweraid_raid_common/poweraid_raid_common_rmw.h"
+#include "../poweraid_raid_common/poweraid_raid_common_merge.h"
 
 SPDK_LOG_REGISTER_COMPONENT(poweraid_raid5f)
 
 /* ===== stripe_request 池化管理（参考 raid5f stripe_request alloc/free）===== */
 
-static struct poweraid_raid5f_req *
-poweraid_raid5f_stripe_request_alloc(struct poweraid_raid5f_io_channel *ch,
-				     enum poweraid_raid5f_stripe_type type)
+static struct poweraid_raid_common_req *
+poweraid_raid_common_stripe_request_alloc(struct poweraid_raid_common_io_channel *ch,
+				     enum poweraid_raid_common_stripe_type type)
 {
-	struct poweraid_raid5f_req *req;
+	struct poweraid_raid_common_req *req;
 
 	req = calloc(1, sizeof(*req));
 	if (!req) {
@@ -38,7 +38,7 @@ poweraid_raid5f_stripe_request_alloc(struct poweraid_raid5f_io_channel *ch,
 }
 
 static void
-poweraid_raid5f_stripe_request_free(struct poweraid_raid5f_req *req)
+poweraid_raid_common_stripe_request_free(struct poweraid_raid_common_req *req)
 {
 	if (!req) {
 		return;
@@ -50,29 +50,29 @@ poweraid_raid5f_stripe_request_free(struct poweraid_raid5f_req *req)
 /* ===== per-thread IO channel（参考 raid5f_ioch_create/destroy L997-1049）===== */
 
 static int
-poweraid_raid5f_ioch_create(void *io_device, void *ctx_buf)
+poweraid_raid_common_ioch_create(void *io_device, void *ctx_buf)
 {
-	struct poweraid_raid5f_raid *raid = io_device;
-	struct poweraid_raid5f_io_channel *ch = ctx_buf;
-	struct poweraid_raid5f_req *req;
+	struct poweraid_raid_common_raid *raid = io_device;
+	struct poweraid_raid_common_io_channel *ch = ctx_buf;
+	struct poweraid_raid_common_req *req;
 	int i;
 
 	TAILQ_INIT(&ch->free_write_stripe_requests);
 	TAILQ_INIT(&ch->free_reconstruct_stripe_requests);
 	TAILQ_INIT(&ch->xor_retry_queue);
 
-	for (i = 0; i < POWERAID_RAID5F_MAX_STRIPES; i++) {
-		req = poweraid_raid5f_stripe_request_alloc(ch,
-				POWERAID_RAID5F_STRIPE_REQ_WRITE);
+	for (i = 0; i < POWERAID_RAID_COMMON_MAX_STRIPES; i++) {
+		req = poweraid_raid_common_stripe_request_alloc(ch,
+				POWERAID_RAID_COMMON_STRIPE_REQ_WRITE);
 		if (!req) {
 			goto err;
 		}
 		TAILQ_INSERT_HEAD(&ch->free_write_stripe_requests, req, link);
 	}
 
-	for (i = 0; i < POWERAID_RAID5F_MAX_STRIPES; i++) {
-		req = poweraid_raid5f_stripe_request_alloc(ch,
-				POWERAID_RAID5F_STRIPE_REQ_RECONSTRUCT);
+	for (i = 0; i < POWERAID_RAID_COMMON_MAX_STRIPES; i++) {
+		req = poweraid_raid_common_stripe_request_alloc(ch,
+				POWERAID_RAID_COMMON_STRIPE_REQ_RECONSTRUCT);
 		if (!req) {
 			goto err;
 		}
@@ -86,7 +86,7 @@ poweraid_raid5f_ioch_create(void *io_device, void *ctx_buf)
 	}
 
 	/* 合并层初始化（阶段 3b）*/
-	if (poweraid_raid5f_merge_init(&ch->merge_ctx, raid, ch) != 0) {
+	if (poweraid_raid_common_merge_init(&ch->merge_ctx, raid, ch) != 0) {
 		SPDK_ERRLOG("poweraid_raid5f: merge_init failed\n");
 		spdk_put_io_channel(ch->accel_ch);
 		ch->accel_ch = NULL;
@@ -100,34 +100,34 @@ err:
 	SPDK_ERRLOG("poweraid_raid5f: ioch_create failed\n");
 	while ((req = TAILQ_FIRST(&ch->free_write_stripe_requests))) {
 		TAILQ_REMOVE(&ch->free_write_stripe_requests, req, link);
-		poweraid_raid5f_stripe_request_free(req);
+		poweraid_raid_common_stripe_request_free(req);
 	}
 	while ((req = TAILQ_FIRST(&ch->free_reconstruct_stripe_requests))) {
 		TAILQ_REMOVE(&ch->free_reconstruct_stripe_requests, req, link);
-		poweraid_raid5f_stripe_request_free(req);
+		poweraid_raid_common_stripe_request_free(req);
 	}
 	return -ENOMEM;
 }
 
 static void
-poweraid_raid5f_ioch_destroy(void *io_device, void *ctx_buf)
+poweraid_raid_common_ioch_destroy(void *io_device, void *ctx_buf)
 {
-	struct poweraid_raid5f_io_channel *ch = ctx_buf;
-	struct poweraid_raid5f_req *req;
+	struct poweraid_raid_common_io_channel *ch = ctx_buf;
+	struct poweraid_raid_common_req *req;
 
 	assert(TAILQ_EMPTY(&ch->xor_retry_queue));
 
 	/* 合并层销毁（先于 stripe_request 池，确保 pending IO 完成）*/
-	poweraid_raid5f_merge_destroy(&ch->merge_ctx);
+	poweraid_raid_common_merge_destroy(&ch->merge_ctx);
 
 	while ((req = TAILQ_FIRST(&ch->free_write_stripe_requests))) {
 		TAILQ_REMOVE(&ch->free_write_stripe_requests, req, link);
-		poweraid_raid5f_stripe_request_free(req);
+		poweraid_raid_common_stripe_request_free(req);
 	}
 
 	while ((req = TAILQ_FIRST(&ch->free_reconstruct_stripe_requests))) {
 		TAILQ_REMOVE(&ch->free_reconstruct_stripe_requests, req, link);
-		poweraid_raid5f_stripe_request_free(req);
+		poweraid_raid_common_stripe_request_free(req);
 	}
 
 	if (ch->accel_ch) {
@@ -141,8 +141,8 @@ poweraid_raid5f_ioch_destroy(void *io_device, void *ctx_buf)
 /* ===== 模块生命周期 ===== */
 
 /* start()：raid_bdev 框架在 base bdev 就绪后调用。
- * 1. 分配 struct poweraid_raid5f_raid（FSM 对象），从 raid_bdev 填充字段。
- * 2. 分配 base_bdevs[]，按 base_bdev_info 创建 poweraid_raid5f_bdev（desc/slot/uuid）。
+ * 1. 分配 struct poweraid_raid_common_raid（FSM 对象），从 raid_bdev 填充字段。
+ * 2. 分配 base_bdevs[]，按 base_bdev_info 创建 poweraid_raid_common_bdev（desc/slot/uuid）。
  * 3. raid_bdev->module_private = raid（桥接）。
  * 4. 计算 stripe 几何，设置 raid_bdev->bdev blockcnt/write_unit/optimal_io_boundary。
  * 5. 触发 RAID FSM EV_CREATE_DSC（→ sb_alloc → sb_init → OPEN_BDEVS → ... → ONLINE）。
@@ -151,7 +151,7 @@ poweraid_raid5f_ioch_destroy(void *io_device, void *ctx_buf)
 int
 poweraid_raid5f_start(struct raid_bdev *raid_bdev)
 {
-	struct poweraid_raid5f_raid *raid;
+	struct poweraid_raid_common_raid *raid;
 	struct raid_base_bdev_info *base_info;
 	uint64_t min_blockcnt = UINT64_MAX;
 	uint64_t base_data_size, total_stripes, stripe_blocks;
@@ -189,10 +189,10 @@ poweraid_raid5f_start(struct raid_bdev *raid_bdev)
 		return -ENOMEM;
 	}
 
-	/* 桥接每个 base_bdev_info → poweraid_raid5f_bdev；求 min data_size */
+	/* 桥接每个 base_bdev_info → poweraid_raid_common_bdev；求 min data_size */
 	i = 0;
 	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
-		struct poweraid_raid5f_bdev *bdev = calloc(1, sizeof(*bdev));
+		struct poweraid_raid_common_bdev *bdev = calloc(1, sizeof(*bdev));
 		if (!bdev) {
 			SPDK_ERRLOG("poweraid_raid5f: alloc bdev[%u] failed\n", i);
 			/* 回滚 */
@@ -223,8 +223,8 @@ poweraid_raid5f_start(struct raid_bdev *raid_bdev)
 	/* 数据区保留：LBA0 sb + PPL 区（固定 1MiB+4MiB）。
 	 * 4K 块下 = 1280 块；要求按 strip 对齐。*/
 	{
-		uint64_t reserve = (POWERAID_RAID5F_PPL_REGION_OFFSET +
-				    POWERAID_RAID5F_PPL_REGION_SIZE) /
+		uint64_t reserve = (POWERAID_RAID_COMMON_PPL_REGION_OFFSET +
+				    POWERAID_RAID_COMMON_PPL_REGION_SIZE) /
 				   raid->block_size;
 		if (reserve % raid->strip_size != 0) {
 			SPDK_ERRLOG("poweraid_raid5f: PPL reserve %"PRIu64
@@ -262,16 +262,16 @@ poweraid_raid5f_start(struct raid_bdev *raid_bdev)
 	raid_bdev->module_private = raid;
 
 	/* 注册 io device（参考 raid5f L1097-1098），get_io_channel 时按此 ctx 分配 */
-	spdk_io_device_register(raid, poweraid_raid5f_ioch_create,
-				poweraid_raid5f_ioch_destroy,
-				sizeof(struct poweraid_raid5f_io_channel), NULL);
+	spdk_io_device_register(raid, poweraid_raid_common_ioch_create,
+				poweraid_raid_common_ioch_destroy,
+				sizeof(struct poweraid_raid_common_io_channel), NULL);
 
 	SPDK_NOTICELOG("poweraid_raid5f: raid=%p stripe_blocks=%"PRIu64
 		       " total_stripes=%"PRIu64" blockcnt=%"PRIu64"\n",
 		       raid, stripe_blocks, total_stripes, raid_bdev->bdev.blockcnt);
 
 	/* 触发 FSM：CREATE_DSC → sb_alloc/init → OPEN_BDEVS → ... → ONLINE → recovery */
-	poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_RAID, raid,
+	poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_RAID, raid,
 				   POWERAID_RAID_EV_CREATE_DSC);
 	return 0;
 }
@@ -279,9 +279,9 @@ poweraid_raid5f_start(struct raid_bdev *raid_bdev)
 /* io_device_unregister 完成回调：所有 io channel 释放后释放 raid 对象并通知框架 stop 完成。
  * 参考 raid5f_io_device_unregister_done（L1103-1111）。*/
 static void
-poweraid_raid5f_io_device_unregister_done(void *io_device)
+poweraid_raid_common_io_device_unregister_done(void *io_device)
 {
-	struct poweraid_raid5f_raid *raid = io_device;
+	struct poweraid_raid_common_raid *raid = io_device;
 	struct raid_bdev *raid_bdev = raid->raid_bdev;
 	uint8_t i;
 
@@ -289,7 +289,7 @@ poweraid_raid5f_io_device_unregister_done(void *io_device)
 	for (i = 0; i < raid->num_base_bdevs; i++) {
 		if (raid->base_bdevs[i] != NULL) {
 			if (raid->base_bdevs[i]->ppl_ctx != NULL) {
-				poweraid_raid5f_ppl_free(raid->base_bdevs[i]->ppl_ctx);
+				poweraid_raid_common_ppl_free(raid->base_bdevs[i]->ppl_ctx);
 			}
 			if (raid->base_bdevs[i]->ch != NULL) {
 				spdk_put_io_channel(
@@ -302,7 +302,7 @@ poweraid_raid5f_io_device_unregister_done(void *io_device)
 
 	/* sb_ctx 在 sb_alloc/sb_free 生命周期内管理；stop 时若仍有引用则释放 */
 	if (raid->sb_ctx != NULL) {
-		poweraid_raid5f_sb_free(raid);
+		poweraid_raid_common_sb_free(raid);
 	}
 
 	SPDK_NOTICELOG("poweraid_raid5f: io_device unregistered, raid=%p\n", raid);
@@ -318,7 +318,7 @@ poweraid_raid5f_io_device_unregister_done(void *io_device)
 bool
 poweraid_raid5f_stop(struct raid_bdev *raid_bdev)
 {
-	struct poweraid_raid5f_raid *raid = raid_bdev->module_private;
+	struct poweraid_raid_common_raid *raid = raid_bdev->module_private;
 	uint8_t i;
 
 	SPDK_NOTICELOG("poweraid_raid5f: stop raid=%s\n", raid_bdev->bdev.name);
@@ -328,25 +328,25 @@ poweraid_raid5f_stop(struct raid_bdev *raid_bdev)
 	}
 
 	/* 触发 OFFLINE：FSM 清理运行时状态（停止 IO 接受、刷 PPL 等）*/
-	poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_RAID, raid,
+	poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_RAID, raid,
 				   POWERAID_RAID_EV_OFFLINE);
 
 	/* 释放每盘 ppl_ctx（OFFLINE FSM 内部也会处理，此处确保释放）*/
 	for (i = 0; i < raid->num_base_bdevs; i++) {
 		if (raid->base_bdevs[i] != NULL && raid->base_bdevs[i]->ppl_ctx != NULL) {
-			poweraid_raid5f_ppl_free(raid->base_bdevs[i]->ppl_ctx);
+			poweraid_raid_common_ppl_free(raid->base_bdevs[i]->ppl_ctx);
 			raid->base_bdevs[i]->ppl_ctx = NULL;
 		}
 	}
 
 	/* 注销 io device：所有 io channel 释放后回调 io_device_unregister_done */
-	spdk_io_device_unregister(raid, poweraid_raid5f_io_device_unregister_done);
+	spdk_io_device_unregister(raid, poweraid_raid_common_io_device_unregister_done);
 	return false;  /* 异步：stop_done 在 unregister_done 回调中调用 */
 }
 
 /* D-6 read 完成回调：直接读单 chunk 成功后完成 raid_io */
 static void
-poweraid_raid5f_read_complete_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+poweraid_raid_common_read_complete_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct raid_bdev_io *raid_io = cb_arg;
 
@@ -362,7 +362,7 @@ poweraid_raid5f_read_complete_cb(struct spdk_bdev_io *bdev_io, bool success, voi
 /* recovery 用：读某 stripe 的某个 data chunk（整 strip），供三分支 hash 判定。
  * chunk_idx 为 data 序号（0..N-2），内部映射到物理盘。*/
 struct recovery_read_ctx {
-	poweraid_raid5f_recovery_read_data_cb	cb;
+	poweraid_raid_common_recovery_read_data_cb	cb;
 	void					*cb_arg;
 	void					*buf;
 	size_t					len;
@@ -386,13 +386,13 @@ recovery_strip_read_io_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_a
 }
 
 void
-poweraid_raid5f_recovery_read_strip(struct poweraid_raid5f_raid *raid,
+poweraid_raid_common_recovery_read_strip(struct poweraid_raid_common_raid *raid,
 				    uint64_t stripe_id, uint32_t chunk_idx,
 				    uint32_t chunk_len_blocks,
-				    poweraid_raid5f_recovery_read_data_cb cb,
+				    poweraid_raid_common_recovery_read_data_cb cb,
 				    void *cb_arg)
 {
-	struct poweraid_raid5f_bdev *bdev;
+	struct poweraid_raid_common_bdev *bdev;
 	struct recovery_read_ctx *rctx;
 	uint32_t data_chunks = raid->num_base_bdevs - 1;
 	uint8_t p_idx = data_chunks - (stripe_id % raid->num_base_bdevs);
@@ -440,10 +440,10 @@ poweraid_raid5f_recovery_read_strip(struct poweraid_raid5f_raid *raid,
 /* D-6 layout-aware read：直接读目标 chunk（非降级路径）。
  * 降级路径（目标盘故障→重建）留阶段 3 接入 recovery_run。 */
 static int
-poweraid_raid5f_submit_read_request(struct raid_bdev_io *raid_io)
+poweraid_raid_common_submit_read_request(struct raid_bdev_io *raid_io)
 {
 	struct raid_bdev *raid_bdev = raid_io->raid_bdev;
-	struct poweraid_raid5f_raid *raid = raid_bdev->module_private;
+	struct poweraid_raid_common_raid *raid = raid_bdev->module_private;
 	uint32_t data_chunks = raid->num_base_bdevs - 1;
 	uint32_t stripe_blocks = raid->strip_size * data_chunks;
 	uint64_t stripe_index = raid_io->offset_blocks / stripe_blocks;
@@ -474,7 +474,7 @@ poweraid_raid5f_submit_read_request(struct raid_bdev_io *raid_io)
 	return raid_bdev_readv_blocks_ext(base_info, base_ch,
 					 raid_io->iovs, raid_io->iovcnt,
 					 base_offset, raid_io->num_blocks,
-					 poweraid_raid5f_read_complete_cb, raid_io,
+					 poweraid_raid_common_read_complete_cb, raid_io,
 					 &io_opts);
 }
 
@@ -482,9 +482,9 @@ void
 poweraid_raid5f_submit_rw_request(struct raid_bdev_io *raid_io)
 {
 	struct raid_bdev *raid_bdev = raid_io->raid_bdev;
-	struct poweraid_raid5f_raid *raid = raid_bdev->module_private;
-	struct poweraid_raid5f_io_channel *ch;
-	struct poweraid_raid5f_req *req;
+	struct poweraid_raid_common_raid *raid = raid_bdev->module_private;
+	struct poweraid_raid_common_io_channel *ch;
+	struct poweraid_raid_common_req *req;
 	uint32_t data_chunks = raid->num_base_bdevs - 1;
 	uint32_t stripe_blocks = raid->strip_size * data_chunks;
 	uint64_t stripe_index, stripe_offset;
@@ -507,7 +507,7 @@ poweraid_raid5f_submit_rw_request(struct raid_bdev_io *raid_io)
 	switch (raid_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
 		assert(raid_io->num_blocks <= raid->strip_size);
-		rc = poweraid_raid5f_submit_read_request(raid_io);
+		rc = poweraid_raid_common_submit_read_request(raid_io);
 		if (rc != 0) {
 			raid_bdev_io_complete(raid_io, rc == -ENOMEM ?
 					      SPDK_BDEV_IO_STATUS_NOMEM :
@@ -529,7 +529,7 @@ poweraid_raid5f_submit_rw_request(struct raid_bdev_io *raid_io)
 	stripe_index = raid_io->offset_blocks / stripe_blocks;
 	stripe_offset = raid_io->offset_blocks % stripe_blocks;
 	if (stripe_offset != 0 || raid_io->num_blocks != stripe_blocks) {
-		int merge_rc = poweraid_raid5f_merge_submit(raid_io);
+		int merge_rc = poweraid_raid_common_merge_submit(raid_io);
 		if (merge_rc != 0) {
 			raid_bdev_io_complete(raid_io, merge_rc == -ENOMEM ?
 					      SPDK_BDEV_IO_STATUS_NOMEM :
@@ -555,7 +555,7 @@ poweraid_raid5f_submit_rw_request(struct raid_bdev_io *raid_io)
 	TAILQ_REMOVE(&ch->free_write_stripe_requests, req, link);
 
 	/* 填充 req */
-	req->type = POWERAID_RAID5F_STRIPE_REQ_WRITE;
+	req->type = POWERAID_RAID_COMMON_STRIPE_REQ_WRITE;
 	req->raid_io = raid_io;
 	req->stripe_index = stripe_index;
 	req->raid = raid;
@@ -607,7 +607,7 @@ poweraid_raid5f_submit_rw_request(struct raid_bdev_io *raid_io)
 		      req, stripe_index, req->parity_buf, req->data_buf);
 
 	/* 触发 REQ FSM：ASSIGN → CALC → WRITE_FULL → ... → IO_COMPLETE → DESTROY */
-	poweraid_raid5f_sm_process(POWERAID_FSM_LAYER_REQ, req,
+	poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
 				   POWERAID_REQ_EV_ASSIGN);
 	return;
 
@@ -627,7 +627,7 @@ err_free_req:
 struct spdk_io_channel *
 poweraid_raid5f_get_io_channel(struct raid_bdev *raid_bdev)
 {
-	struct poweraid_raid5f_raid *raid = raid_bdev->module_private;
+	struct poweraid_raid_common_raid *raid = raid_bdev->module_private;
 
 	return spdk_get_io_channel(raid);
 }
@@ -650,7 +650,7 @@ poweraid_raid5f_submit_null_payload_request(struct raid_bdev_io *raid_io)
 {
 	switch (raid_io->type) {
 	case SPDK_BDEV_IO_TYPE_FLUSH:
-		poweraid_raid5f_merge_flush_all(raid_io);
+		poweraid_raid_common_merge_flush_all(raid_io);
 		break;
 
 	case SPDK_BDEV_IO_TYPE_UNMAP:

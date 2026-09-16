@@ -2,7 +2,7 @@
  *   Copyright (c) 2026 poweraid. All rights reserved.
  *
  *   RMW（Read-Modify-Write）部分 stripe 写路径实现。
- *   详见 poweraid_raid5f_rmw.h 与 raid5f-enhanced-design.md 第 3.2 节。
+ *   详见 poweraid_raid_common_rmw.h 与 raid5f-enhanced-design.md 第 3.2 节。
  *
  *   op + 回调状态机（参考 parity_fixup 模式），与 REQ FSM 独立：
  *     submit → READ_OLD(data+parity 并行) → CALC → PPL_APPEND
@@ -15,8 +15,8 @@
  *     PPL record 已 append 但未 commit，recovery 三分支判定处理（data==old → NONE）。
  *
  *   两种入口：
- *     A) poweraid_raid5f_rmw_submit(raid_io) — 直接单 strip 写（raid_io 完成回调）
- *     B) poweraid_raid5f_rmw_submit_merged(...) — 合并层调用（自定义完成回调）
+ *     A) poweraid_raid_common_rmw_submit(raid_io) — 直接单 strip 写（raid_io 完成回调）
+ *     B) poweraid_raid_common_rmw_submit_merged(...) — 合并层调用（自定义完成回调）
  *
  *   data_idx → 物理盘映射：phys = (data_idx < p_idx) ? data_idx : data_idx + 1
  *     （left-symmetric，与 recovery_read_strip 一致）
@@ -29,9 +29,9 @@
 #include "spdk/bdev_module.h"
 
 #include "../bdev_raid.h"
-#include "poweraid_raid5f.h"
-#include "poweraid_raid5f_rmw.h"
-#include "poweraid_raid5f_ppl.h"
+#include "poweraid_raid_common.h"
+#include "poweraid_raid_common_rmw.h"
+#include "poweraid_raid_common_ppl.h"
 
 SPDK_LOG_REGISTER_COMPONENT(raid5f_rmw);
 
@@ -49,7 +49,7 @@ enum rmw_state {
 struct rmw_op {
 	struct raid_bdev_io			*raid_io;	/* NULL 当合并层调用 */
 	struct raid_bdev_io_channel		*raid_ch;	/* 框架 IO channel（合并层路径 raid_io=NULL 时使用）*/
-	struct poweraid_raid5f_raid		*raid;
+	struct poweraid_raid_common_raid		*raid;
 	struct raid_bdev			*raid_bdev;	/* 缓存，避免重复解引用 */
 
 	uint64_t				stripe_index;
@@ -65,7 +65,7 @@ struct rmw_op {
 	void					*parity_buf;	/* strip_bytes：读旧 parity → 原地 XOR 成新 parity */
 
 	/* PPL */
-	struct poweraid_raid5f_ppl_ctx		*ppl_ctx;
+	struct poweraid_raid_common_ppl_ctx		*ppl_ctx;
 	struct spdk_io_channel			*ppl_ch;
 	uint64_t				ppl_seq;	/* 0 表示无 PPL 保护 */
 
@@ -151,7 +151,7 @@ rmw_can_proceed(struct rmw_op *op)
 static void
 rmw_find_ppl(struct rmw_op *op)
 {
-	struct poweraid_raid5f_raid *raid = op->raid;
+	struct poweraid_raid_common_raid *raid = op->raid;
 	uint8_t i;
 
 	for (i = 0; i < raid->num_base_bdevs; i++) {
@@ -171,7 +171,7 @@ static void
 rmw_start_reads(struct rmw_op *op)
 {
 	struct raid_bdev *raid_bdev = op->raid_bdev;
-	struct poweraid_raid5f_raid *raid = op->raid;
+	struct poweraid_raid_common_raid *raid = op->raid;
 	uint64_t base_offset = raid->data_offset_blocks +
 			       op->stripe_index * raid->strip_size;
 	uint64_t bits = op->chunk_bitmap;
@@ -285,7 +285,7 @@ rmw_calc_and_next(struct rmw_op *op)
 {
 	uint32_t strip_u64 = op->strip_bytes / sizeof(uint64_t);
 	uint64_t *parity = op->parity_buf;
-	struct poweraid_raid5f_ppl_hash_ctx old_h, new_h;
+	struct poweraid_raid_common_ppl_hash_ctx old_h, new_h;
 	uint64_t old_hash, new_hash;
 	uint64_t bits;
 	uint32_t buf_idx, j;
@@ -322,22 +322,22 @@ rmw_calc_and_next(struct rmw_op *op)
 	}
 
 	/* old/new hash：按 chunk_bitmap set bit 升序 */
-	poweraid_raid5f_ppl_hash_init(&old_h);
-	poweraid_raid5f_ppl_hash_init(&new_h);
+	poweraid_raid_common_ppl_hash_init(&old_h);
+	poweraid_raid_common_ppl_hash_init(&new_h);
 	bits = op->chunk_bitmap;
 	buf_idx = 0;
 	while (bits) {
-		poweraid_raid5f_ppl_hash_update(&old_h,
+		poweraid_raid_common_ppl_hash_update(&old_h,
 			(char *)op->old_data_buf + buf_idx * op->strip_bytes,
 			op->strip_bytes);
-		poweraid_raid5f_ppl_hash_update(&new_h,
+		poweraid_raid_common_ppl_hash_update(&new_h,
 			(char *)op->new_data_buf + buf_idx * op->strip_bytes,
 			op->strip_bytes);
 		bits &= bits - 1;
 		buf_idx++;
 	}
-	old_hash = poweraid_raid5f_ppl_hash_final(&old_h);
-	new_hash = poweraid_raid5f_ppl_hash_final(&new_h);
+	old_hash = poweraid_raid_common_ppl_hash_final(&old_h);
+	new_hash = poweraid_raid_common_ppl_hash_final(&new_h);
 
 	SPDK_DEBUGLOG(raid5f_rmw, "rmw calc: op=%p old_hash=0x%"PRIx64
 		      " new_hash=0x%"PRIx64" bitmap=0x%"PRIx64"\n",
@@ -346,7 +346,7 @@ rmw_calc_and_next(struct rmw_op *op)
 	/* Step 3: PPL append（FUA intent）*/
 	op->state = RMW_S_PPL_APPEND;
 	if (op->ppl_ctx != NULL && op->ppl_ch != NULL) {
-		poweraid_raid5f_ppl_append_record(op->ppl_ctx, op->ppl_ch,
+		poweraid_raid_common_ppl_append_record(op->ppl_ctx, op->ppl_ch,
 						 op->stripe_index, op->chunk_bitmap,
 						 old_hash, new_hash,
 						 rmw_ppl_append_done, op);
@@ -384,7 +384,7 @@ static void
 rmw_start_writes(struct rmw_op *op)
 {
 	struct raid_bdev *raid_bdev = op->raid_bdev;
-	struct poweraid_raid5f_raid *raid = op->raid;
+	struct poweraid_raid_common_raid *raid = op->raid;
 	uint64_t base_offset = raid->data_offset_blocks +
 			       op->stripe_index * raid->strip_size;
 	uint64_t bits = op->chunk_bitmap;
@@ -491,7 +491,7 @@ static void
 rmw_start_flushes(struct rmw_op *op)
 {
 	struct raid_bdev *raid_bdev = op->raid_bdev;
-	struct poweraid_raid5f_raid *raid = op->raid;
+	struct poweraid_raid_common_raid *raid = op->raid;
 	uint64_t base_offset = raid->data_offset_blocks +
 			       op->stripe_index * raid->strip_size;
 	uint64_t bits = op->chunk_bitmap;
@@ -609,7 +609,7 @@ rmw_start_commit(struct rmw_op *op)
 
 	op->state = RMW_S_PPL_COMMIT;
 	if (op->ppl_seq != 0 && op->ppl_ctx != NULL && op->ppl_ch != NULL) {
-		poweraid_raid5f_ppl_commit(op->ppl_ctx, op->ppl_ch, op->ppl_seq,
+		poweraid_raid_common_ppl_commit(op->ppl_ctx, op->ppl_ch, op->ppl_seq,
 					   rmw_ppl_commit_done, op);
 	} else {
 		/* 无 PPL record（append 失败或无 ppl_ctx）：直接完成 */
@@ -672,10 +672,10 @@ rmw_op_alloc(struct rmw_op *op)
 /* ===== 入口 A：直接单 strip 写（raid_io 完成回调）===== */
 
 int
-poweraid_raid5f_rmw_submit(struct raid_bdev_io *raid_io)
+poweraid_raid_common_rmw_submit(struct raid_bdev_io *raid_io)
 {
 	struct raid_bdev *raid_bdev = raid_io->raid_bdev;
-	struct poweraid_raid5f_raid *raid = raid_bdev->module_private;
+	struct poweraid_raid_common_raid *raid = raid_bdev->module_private;
 	uint32_t data_chunks = raid->num_base_bdevs - 1;
 	uint32_t stripe_blocks = raid->strip_size * data_chunks;
 	uint64_t stripe_index = raid_io->offset_blocks / stripe_blocks;
@@ -754,9 +754,9 @@ poweraid_raid5f_rmw_submit(struct raid_bdev_io *raid_io)
 /* ===== 入口 B：合并层调用（自定义完成回调，非连续 chunk_bitmap）===== */
 
 int
-poweraid_raid5f_rmw_submit_merged(
+poweraid_raid_common_rmw_submit_merged(
 	struct raid_bdev_io_channel *raid_ch,
-	struct poweraid_raid5f_raid *raid,
+	struct poweraid_raid_common_raid *raid,
 	uint64_t stripe_index,
 	uint64_t chunk_bitmap,
 	void **new_chunk_bufs,
