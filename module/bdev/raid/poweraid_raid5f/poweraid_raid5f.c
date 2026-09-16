@@ -15,6 +15,7 @@
 
 #include "../bdev_raid.h"
 #include "poweraid_raid5f.h"
+#include "poweraid_raid5f_rmw.h"
 
 SPDK_LOG_REGISTER_COMPONENT(poweraid_raid5f)
 
@@ -232,9 +233,16 @@ poweraid_raid5f_start(struct raid_bdev *raid_bdev)
 	stripe_blocks = raid->strip_size * data_chunks;
 
 	raid_bdev->bdev.blockcnt = stripe_blocks * total_stripes;
+	/* 几何门控（阶段 3a）：
+	 * optimal_io_boundary=strip_size + split_on_optimal_io_boundary：
+	 *   读写均在 strip 边界拆分，保证模块收到的 IO 不跨 strip。
+	 *   - 写：每个 IO ≤ strip_size，部分 stripe → RMW 路径。
+	 *     全 stripe 写也被拆成多个 strip 写走 RMW；阶段 3b Merge 优化合并。
+	 *   - 读：每个 IO ≤ strip_size，单 chunk 直读路径可处理。
+	 * write_unit_size=strip_size：要求写 strip 对齐，sub-strip 写被拒绝。*/
 	raid_bdev->bdev.optimal_io_boundary = raid->strip_size;
 	raid_bdev->bdev.split_on_optimal_io_boundary = true;
-	raid_bdev->bdev.write_unit_size = stripe_blocks;
+	raid_bdev->bdev.write_unit_size = raid->strip_size;
 	raid_bdev->bdev.split_on_write_unit = true;
 
 	raid->raid_size = raid_bdev->bdev.blockcnt;
@@ -502,14 +510,18 @@ poweraid_raid5f_submit_rw_request(struct raid_bdev_io *raid_io)
 		return;
 	}
 
-	/* 验证 full-stripe 写对齐 */
+	/* 写分流：完整 stripe → 全 stripe 写路径（5 步 barrier）；
+	 * 部分 stripe（框架 split_on_write_unit/optimal_io_boundary 保证 strip 对齐且不跨 stripe）
+	 * → RMW 路径（读旧 data+parity → 算新 parity → PPL → 写 → flush → commit）。*/
 	stripe_index = raid_io->offset_blocks / stripe_blocks;
 	stripe_offset = raid_io->offset_blocks % stripe_blocks;
 	if (stripe_offset != 0 || raid_io->num_blocks != stripe_blocks) {
-		SPDK_ERRLOG("poweraid_raid5f: unaligned write offset=%"PRIu64
-			    " num=%"PRIu64" stripe_blocks=%u\n",
-			    raid_io->offset_blocks, raid_io->num_blocks, stripe_blocks);
-		raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
+		int rmw_rc = poweraid_raid5f_rmw_submit(raid_io);
+		if (rmw_rc != 0) {
+			raid_bdev_io_complete(raid_io, rmw_rc == -ENOMEM ?
+					      SPDK_BDEV_IO_STATUS_NOMEM :
+					      SPDK_BDEV_IO_STATUS_FAILED);
+		}
 		return;
 	}
 
@@ -561,7 +573,7 @@ poweraid_raid5f_submit_rw_request(struct raid_bdev_io *raid_io)
 				  .iov_len = stripe_blocks * blocklen }, 1);
 	if (rc != (int)(stripe_blocks * blocklen)) {
 		SPDK_ERRLOG("poweraid_raid5f: iovcpy short copied=%d expect=%"PRIu64"\n",
-			    rc, stripe_blocks * blocklen);
+			    rc, (uint64_t)stripe_blocks * blocklen);
 		goto err_free_data;
 	}
 

@@ -19,7 +19,8 @@ C_SRCS = poweraid_raid5f.c \
 	 poweraid_raid5f_sm_bdev.c \
 	 poweraid_raid5f_sm_req.c \
 	 poweraid_raid5f_sb.c \
-	 poweraid_raid5f_ppl.c
+	 poweraid_raid5f_ppl.c \
+	 poweraid_raid5f_rmw.c
 
 LIBNAME = poweraid_raid5f
 

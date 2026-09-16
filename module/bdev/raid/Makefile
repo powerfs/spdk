@@ -18,13 +18,14 @@ endif
 
 ifeq ($(CONFIG_POWERAID_RAID5F),y)
 C_SRCS += poweraid_raid5f/poweraid_raid5f.c \
-          poweraid_raid5f/poweraid_raid5f_sm_dispatch.c \
-          poweraid_raid5f/poweraid_raid5f_sm_raid.c \
-          poweraid_raid5f/poweraid_raid5f_sm_bdev.c \
-          poweraid_raid5f/poweraid_raid5f_sm_req.c \
-          poweraid_raid5f/poweraid_raid5f_sb.c \
-          poweraid_raid5f/poweraid_raid5f_ppl.c \
-          poweraid_raid5f/poweraid_raid5f_recovery.c
+	          poweraid_raid5f/poweraid_raid5f_sm_dispatch.c \
+	          poweraid_raid5f/poweraid_raid5f_sm_raid.c \
+	          poweraid_raid5f/poweraid_raid5f_sm_bdev.c \
+	          poweraid_raid5f/poweraid_raid5f_sm_req.c \
+	          poweraid_raid5f/poweraid_raid5f_sb.c \
+	          poweraid_raid5f/poweraid_raid5f_ppl.c \
+	          poweraid_raid5f/poweraid_raid5f_recovery.c \
+	          poweraid_raid5f/poweraid_raid5f_rmw.c
 endif
 
 LIBNAME = bdev_raid
