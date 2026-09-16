@@ -177,6 +177,7 @@ poweraid_raid5f_start(struct raid_bdev *raid_bdev)
 	raid->strip_size = raid_bdev->strip_size;
 	raid->block_size = raid_bdev->bdev.blocklen;
 	raid->num_base_bdevs = raid_bdev->num_base_bdevs;
+	raid->delay_us = MERGE_DELAY_US_DEFAULT;  /* Stage 3c：默认 1ms，RPC 可改 */
 	spdk_uuid_copy(&raid->uuid, &raid_bdev->bdev.uuid);
 	snprintf(raid->name, sizeof(raid->name), "%s", raid_bdev->bdev.name);
 

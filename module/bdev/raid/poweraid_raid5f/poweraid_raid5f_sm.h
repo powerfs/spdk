@@ -209,6 +209,10 @@ struct poweraid_raid5f_raid {
 	/* superblock v2 上下文，由 poweraid_raid5f_sb.c 内部管理，
 	 * 对外 opaque；NULL 表示尚未分配。 */
 	void *sb_ctx;
+	/* 合并层延迟（Stage 3c 可配置；0 = merge OFF，submit 即 flush）。
+	 * start() 置默认值 MERGE_DELAY_US_DEFAULT，RPC bdev_poweraid_raid5f_set_merge_delay
+	 * 运行时修改，ioch_create 时复制到各 channel 的 merge_ctx。 */
+	uint64_t delay_us;
 	/* 回指 SPDK raid_bdev 框架对象，start() 建立桥接，供 IO 路径访问 base_bdev_info。 */
 	struct raid_bdev *raid_bdev;
 	TAILQ_ENTRY(poweraid_raid5f_raid) link;
@@ -267,8 +271,10 @@ struct poweraid_raid5f_req {
 
 /* per-thread IO channel：参考 raid5f_io_channel（L120-136）。
  * D-4 基础设施：stripe_request 池 + accel_ch + xor_retry_queue。
- * D-5 在此基础上扩展 PPL 5 步 barrier 状态。*/
-#define POWERAID_RAID5F_MAX_STRIPES 32
+ * D-5 在此基础上扩展 PPL 5 步 barrier 状态。
+ * 3c：MAX_STRIPES 32→64（1M 写 qd=8 拆分为 32 并发 stripe，2× 余量；
+ *     耗尽时 merge 层延迟重试，不再 fail IO）。*/
+#define POWERAID_RAID5F_MAX_STRIPES 64
 
 struct poweraid_raid5f_io_channel {
 	/* 空闲 stripe_request 池（write/reconstruct 分离，参考 raid5f）*/

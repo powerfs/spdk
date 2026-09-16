@@ -200,7 +200,8 @@ merge_full_stripe_write(struct merge_entry *entry)
 	/* 从 free 池取一个 write stripe_request */
 	req = TAILQ_FIRST(&ch->free_write_stripe_requests);
 	if (req == NULL) {
-		SPDK_ERRLOG("merge full: no free stripe_request\n");
+		/* 池暂时耗尽：返回 ENOMEM，由 merge_flush_entry 延迟重试（Stage 3c）*/
+		SPDK_DEBUGLOG(raid5f_merge, "merge full: no free stripe_request, defer\n");
 		return -ENOMEM;
 	}
 	TAILQ_REMOVE(&ch->free_write_stripe_requests, req, link);
@@ -348,7 +349,17 @@ merge_flush_entry(struct merge_entry *entry)
 	}
 
 	if (rc != 0) {
-		/* flush 启动失败：完成所有 pending_io 为 FAILED，释放 entry */
+		if (rc == -ENOMEM) {
+			/* 资源暂时不足（stripe_request 池耗尽等）：保持 entry pending，
+			 * 由 poller 200μs 后重试。inflight 写完成后必然释放 req，有进展保证。
+			 * 注意不得 fail pending IO——bdev 层对 merge 内部发起的 flush 无重试路径。*/
+			entry->flushing = false;
+			__atomic_fetch_sub(&mctx->inflight_flushes, 1, __ATOMIC_ACQ_REL);
+			SPDK_DEBUGLOG(raid5f_merge, "flush entry deferred (ENOMEM), stripe=%"PRIu64"\n",
+				      entry->stripe_index);
+			return;
+		}
+		/* 其他错误：完成所有 pending_io 为 FAILED，释放 entry */
 		SPDK_ERRLOG("flush entry failed rc=%d, failing pending ios\n", rc);
 		merge_complete_pending_ios(entry, SPDK_BDEV_IO_STATUS_FAILED);
 		merge_entry_remove_and_free(entry);
@@ -406,7 +417,7 @@ poweraid_raid5f_merge_init(struct merge_ctx *mctx,
 	TAILQ_INIT(&mctx->pending_list);
 	mctx->raid = raid;
 	mctx->mod_ch = mod_ch;
-	mctx->delay_us = MERGE_DELAY_US_DEFAULT;
+	mctx->delay_us = raid->delay_us;  /* Stage 3c：raid 级配置，RPC 可改 */
 	mctx->num_pending = 0;
 	mctx->inflight_flushes = 0;
 	mctx->pending_flush_io = NULL;
@@ -554,8 +565,9 @@ poweraid_raid5f_merge_submit(struct raid_bdev_io *raid_io)
 		      stripe_index, chunk_data_idx, entry->chunk_bitmap,
 		      (uint32_t)__builtin_popcountll(entry->chunk_bitmap));
 
-	/* 全 chunk 覆盖 → 立即 flush */
-	if ((uint32_t)__builtin_popcountll(entry->chunk_bitmap) == entry->data_chunks) {
+	/* 全 chunk 覆盖 → 立即 flush；delay=0（merge OFF）→ 每个 IO 立即 flush（纯 RMW 基线）*/
+	if ((uint32_t)__builtin_popcountll(entry->chunk_bitmap) == entry->data_chunks ||
+	    mctx->delay_us == 0) {
 		merge_flush_entry(entry);
 	}
 
