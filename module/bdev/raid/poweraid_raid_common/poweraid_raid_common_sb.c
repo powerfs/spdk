@@ -202,10 +202,25 @@ poweraid_raid_common_sb_init(struct poweraid_raid_common_raid *raid,
 	ctx->ext->feature_flags = feature_flags;
 	ctx->ext->dif_mode = POWERAID_RAID_COMMON_DIF_NONE;
 	ctx->ext->raid_level_ext = (uint8_t)level;
-	ctx->ext->synd_cnt = (level == 6) ? 2 : 1;
-	ctx->ext->ppl_region_offset = POWERAID_RAID_COMMON_PPL_REGION_OFFSET;
-	ctx->ext->ppl_region_size = POWERAID_RAID_COMMON_PPL_REGION_SIZE;
-	ctx->ext->ppl_seq = 0;
+	if (level == SPDK_BDEV_RAID_LEVEL_RAID6F) {
+		ctx->ext->synd_cnt = 2;
+	} else if (level == SPDK_BDEV_RAID_LEVEL_RAID1F) {
+		/* 镜像卷无 parity syndrome */
+		ctx->ext->synd_cnt = 0;
+	} else {
+		ctx->ext->synd_cnt = 1;
+	}
+	if (feature_flags & POWERAID_RAID_COMMON_SB_F_PPL) {
+		ctx->ext->ppl_region_offset = POWERAID_RAID_COMMON_PPL_REGION_OFFSET;
+		ctx->ext->ppl_region_size = POWERAID_RAID_COMMON_PPL_REGION_SIZE;
+		ctx->ext->ppl_seq = 0;
+	}
+	if (feature_flags & POWERAID_RAID_COMMON_SB_F_MWL) {
+		ctx->ext->mwl_region_offset = POWERAID_RAID_COMMON_MWL_REGION_OFFSET;
+		ctx->ext->mwl_region_size = POWERAID_RAID_COMMON_MWL_REGION_SIZE;
+		ctx->ext->mwl_seq = 0;
+		ctx->ext->mwl_lead_slot = POWERAID_RAID1F_LEAD_SLOT;
+	}
 	ctx->ext->scrub_progress = 0;
 	ctx->ext->scrub_last_complete_ts = 0;
 	ctx->ext->recon_progress_summary = 0;
@@ -411,17 +426,20 @@ sb_load_parse_and_continue(struct poweraid_raid_common_sb_ctx *ctx)
 	void *new_buf;
 	int rc;
 
-	/* 1. 校验 signature */
+	/* 1. 校验 signature。
+	 * 无 SPDKRAID 签名 = 空白盘或异族盘（malloc/全新 NVMe 扇区为零），
+	 * 返回 -ENODATA 供 FSM 走"新卷"分支；凡签名命中但后续校验失败的，
+	 * 一律是本族 sb 损坏/版本不可用，返回 -EILSEQ 拒绝装配。*/
 	if (memcmp(sb->signature, RAID_BDEV_SB_SIG, sizeof(sb->signature)) != 0) {
-		SPDK_DEBUGLOG(raid5f_sb, "sb_load: signature mismatch (not a RAID disk)\n");
-		return -EINVAL;
+		SPDK_DEBUGLOG(raid5f_sb, "sb_load: signature mismatch (blank/foreign disk)\n");
+		return -ENODATA;
 	}
 
 	/* 2. 校验 v1->length 合法性 */
 	if (sb->length < sizeof(struct raid_bdev_superblock) ||
 	    sb->length > RAID_BDEV_SB_MAX_LENGTH) {
 		SPDK_WARNLOG("sb_load: invalid length %u\n", sb->length);
-		return -EINVAL;
+		return -EILSEQ;
 	}
 
 	/* 3. 计算总需要大小（v2 时 + ext 256B）*/
@@ -433,7 +451,7 @@ sb_load_parse_and_continue(struct poweraid_raid_common_sb_ctx *ctx)
 		ctx->is_v2 = 0;
 	} else {
 		SPDK_ERRLOG("sb_load: unsupported version major %u\n", sb->version.major);
-		return -EINVAL;
+		return -EILSEQ;
 	}
 
 	/* 4. 当前 buf 不够 → 续读 */
@@ -472,7 +490,7 @@ sb_load_parse_and_continue(struct poweraid_raid_common_sb_ctx *ctx)
 		sb->crc = prev;
 		if (crc != prev) {
 			SPDK_WARNLOG("sb_load: v1 crc mismatch\n");
-			return -EINVAL;
+			return -EILSEQ;
 		}
 	}
 
@@ -488,12 +506,12 @@ sb_load_parse_and_continue(struct poweraid_raid_common_sb_ctx *ctx)
 		if (memcmp(ctx->ext->ext_signature, POWERAID_RAID_COMMON_SB_V2_EXT_SIG,
 			   sizeof(ctx->ext->ext_signature)) != 0) {
 			SPDK_ERRLOG("sb_load: ext_signature mismatch\n");
-			return -EINVAL;
+			return -EILSEQ;
 		}
 		/* 8. 校验 ext crc */
 		if (!sb_check_ext_crc(ctx)) {
 			SPDK_WARNLOG("sb_load: ext crc mismatch\n");
-			return -EINVAL;
+			return -EILSEQ;
 		}
 	} else {
 		ctx->ext = NULL;
@@ -581,7 +599,8 @@ poweraid_raid_common_sb_get_ppl_region(struct poweraid_raid_common_raid *raid,
 		return -ENOENT;
 	}
 	ctx = raid->sb_ctx;
-	if (ctx->ext == NULL) {
+	if (ctx->ext == NULL ||
+	    !(ctx->ext->feature_flags & POWERAID_RAID_COMMON_SB_F_PPL)) {
 		return -ENOENT;
 	}
 	if (region_offset_bytes) {
@@ -589,6 +608,30 @@ poweraid_raid_common_sb_get_ppl_region(struct poweraid_raid_common_raid *raid,
 	}
 	if (region_size_bytes) {
 		*region_size_bytes = ctx->ext->ppl_region_size;
+	}
+	return 0;
+}
+
+int
+poweraid_raid_common_sb_get_mwl_region(struct poweraid_raid_common_raid *raid,
+				   uint64_t *region_offset_bytes,
+				   uint64_t *region_size_bytes)
+{
+	struct poweraid_raid_common_sb_ctx *ctx;
+
+	if (raid == NULL || raid->sb_ctx == NULL) {
+		return -ENOENT;
+	}
+	ctx = raid->sb_ctx;
+	if (ctx->ext == NULL ||
+	    !(ctx->ext->feature_flags & POWERAID_RAID_COMMON_SB_F_MWL)) {
+		return -ENOENT;
+	}
+	if (region_offset_bytes) {
+		*region_offset_bytes = ctx->ext->mwl_region_offset;
+	}
+	if (region_size_bytes) {
+		*region_size_bytes = ctx->ext->mwl_region_size;
 	}
 	return 0;
 }

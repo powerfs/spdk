@@ -19,6 +19,7 @@ enum spdk_bdev_raid_level {
 	SPDK_BDEV_RAID_LEVEL_RAID1	= 1,
 	SPDK_BDEV_RAID_LEVEL_RAID5F	= 95, /* 0x5f */
 	SPDK_BDEV_RAID_LEVEL_RAID6F	= 96, /* 0x60, P+Q 双校验（Stage 4）*/
+	SPDK_BDEV_RAID_LEVEL_RAID1F	= 97, /* 0x61, poweraid 镜像 + MWL 写意图日志 */
 	SPDK_BDEV_RAID_LEVEL_CONCAT	= 99,
 };
 

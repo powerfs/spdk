@@ -28,6 +28,7 @@
 #include "poweraid_raid_common.h"
 #include "poweraid_raid_common_merge.h"
 #include "poweraid_raid_common_rmw.h"
+#include "poweraid_raid_common_rebuild.h"
 
 SPDK_LOG_REGISTER_COMPONENT(raid5f_merge);
 
@@ -48,8 +49,9 @@ merge_entry_alloc(struct merge_ctx *mctx,
 		   struct poweraid_raid_common_raid *raid,
 		   uint64_t stripe_index)
 {
-	uint32_t data_chunks = raid->num_base_bdevs - 1;
-	uint8_t p_idx = data_chunks - (stripe_index % raid->num_base_bdevs);
+	uint32_t data_chunks = raid->num_base_bdevs - raid->num_parity;
+	uint8_t p_idx, q_idx;
+	poweraid_raid_common_get_parity_idx(raid, stripe_index, &p_idx, &q_idx);
 	uint32_t strip_bytes = raid->strip_size * raid->block_size;
 	struct merge_entry *entry;
 	uint32_t i;
@@ -75,6 +77,7 @@ merge_entry_alloc(struct merge_ctx *mctx,
 
 	entry->raid = raid;
 	entry->raid_ch = raid_ch;
+	entry->eff_raid_ch = raid_ch;
 	entry->mod_ch = mod_ch;
 	entry->mctx = mctx;
 	entry->stripe_index = stripe_index;
@@ -216,6 +219,7 @@ merge_full_stripe_write(struct merge_entry *entry)
 	/* 填充 req */
 	req->type = POWERAID_RAID_COMMON_STRIPE_REQ_WRITE;
 	req->raid_io = carrier;
+	req->eff_raid_ch = entry->eff_raid_ch;
 	req->stripe_index = entry->stripe_index;
 	req->raid = raid;
 	req->io = carrier;  /* IO_COMPLETE 调 raid_bdev_io_complete 用 */
@@ -228,11 +232,21 @@ merge_full_stripe_write(struct merge_entry *entry)
 	}
 	req->parity_buf = req->parity_buf_alloc;
 
+	/* RAID6: 从缓冲池取 Q 缓冲 */
+	if (raid->num_parity >= 2) {
+		req->q_buf_alloc = poweraid_raid_common_get_q_buf(ch);
+		if (req->q_buf_alloc == NULL) {
+			SPDK_ERRLOG("merge full: alloc q_buf failed\n");
+			goto err_free_parity;
+		}
+		req->q_buf = req->q_buf_alloc;
+	}
+
 	/* 从缓冲池取全 stripe 数据缓冲 */
 	req->data_buf = poweraid_raid_common_get_data_buf(ch);
 	if (req->data_buf == NULL) {
 		SPDK_ERRLOG("merge full: alloc data_buf failed\n");
-		goto err_free_parity;
+		goto err_free_q;
 	}
 
 	/* 从 chunk_bufs 拷贝到 data_buf（按 data chunk 序号排列）*/
@@ -264,6 +278,12 @@ merge_full_stripe_write(struct merge_entry *entry)
 err_free_data:
 	poweraid_raid_common_put_data_buf(ch, req->data_buf);
 	req->data_buf = NULL;
+err_free_q:
+	if (req->q_buf_alloc != NULL) {
+		poweraid_raid_common_put_q_buf(ch, req->q_buf_alloc);
+		req->q_buf_alloc = NULL;
+		req->q_buf = NULL;
+	}
 err_free_parity:
 	poweraid_raid_common_put_parity_buf(ch, req->parity_buf_alloc);
 	req->parity_buf_alloc = NULL;
@@ -302,7 +322,7 @@ merge_rmw_dispatch(struct merge_entry *entry)
 		      " bitmap=0x%"PRIx64"\n", entry, entry->stripe_index,
 		      entry->chunk_bitmap);
 
-	rc = poweraid_raid_common_rmw_submit_merged(entry->raid_ch,
+	rc = poweraid_raid_common_rmw_submit_merged(entry->eff_raid_ch,
 					       entry->raid,
 					       entry->stripe_index,
 					       entry->chunk_bitmap,
@@ -321,12 +341,40 @@ static void
 merge_flush_entry(struct merge_entry *entry)
 {
 	struct merge_ctx *mctx = entry->mctx;
+	struct raid_bdev_io_channel *eff_ch;
+	enum poweraid_raid_common_gate gate;
 	uint32_t num_modified;
 	int rc;
 
 	if (entry->flushing) {
 		return;
 	}
+
+	/* 重建窗口门控：未越过窗口的 stripe 必须等重构完成（引擎通过窗口推进
+	 * hook 触发重放，poller 也会周期重试）。此处不标记 flushing/不计 inflight。*/
+	gate = poweraid_raid_common_rebuild_gate_classify(entry->raid, entry->raid_ch,
+			entry->stripe_index, &eff_ch);
+	if (gate == POWERAID_RAID_COMMON_GATE_WAIT) {
+		/* pending IOs 已在 bdev 层 io_submitted 链表上（merge_submit 返回 0
+		 * 后 raid_io 归 merge 所有，未完成）。若仅 return 不 flush，raid_io
+		 * 永不离开 io_submitted → 框架 quiesce drain 死锁（窗口永远锁不住，
+		 * 重建引擎永远不被调用）。
+		 *
+		 * 将 pending IOs 以 NOMEM 交还 bdev 层：
+		 * 1. raid_bdev_io_complete(NOMEM) → bdev 层从 io_submitted 摘除 →
+		 *    入 nomem 队列（不计 outstanding）
+		 * 2. quiesce drain 成功 → 窗口锁定 → 重建引擎启动 → stripe 重构
+		 * 3. 重建推进 → unquiesce → nomem 重试的 IO 命中 LBA range lock（已解锁）
+		 *    → 提交到模块 → gate PASS（窗口已越过）→ 正常写入 */
+		SPDK_DEBUGLOG(raid5f_merge, "flush gated, NOMEM pending ios stripe=%"PRIu64"\n",
+			      entry->stripe_index);
+		merge_complete_pending_ios(entry, SPDK_BDEV_IO_STATUS_NOMEM);
+		merge_entry_remove_and_free(entry);
+		merge_check_drain(mctx);
+		return;
+	}
+	entry->eff_raid_ch = eff_ch;
+
 	entry->flushing = true;
 
 	/* 增加 inflight 计数 */
@@ -478,7 +526,7 @@ poweraid_raid_common_merge_submit(struct raid_bdev_io *raid_io)
 	struct raid_bdev *raid_bdev = raid_io->raid_bdev;
 	struct poweraid_raid_common_raid *raid = raid_bdev->module_private;
 	struct poweraid_raid_common_io_channel *ch;
-	uint32_t data_chunks = raid->num_base_bdevs - 1;
+	uint32_t data_chunks = raid->num_base_bdevs - raid->num_parity;
 	uint32_t stripe_blocks = raid->strip_size * data_chunks;
 	uint64_t stripe_index = raid_io->offset_blocks / stripe_blocks;
 	uint64_t stripe_offset = raid_io->offset_blocks % stripe_blocks;
@@ -495,6 +543,22 @@ poweraid_raid_common_merge_submit(struct raid_bdev_io *raid_io)
 		return -ENODEV;
 	}
 	mctx = &ch->merge_ctx;
+
+	/* 重建窗口门控必须在吸收 raid_io 之前：一旦插入 pending entry，raid_io
+	 * 所有权转给 merge，在 flush 完成前一直是模块在途 IO。框架 quiesce
+	 * 窗口要等在途 IO 全部 drain 才放重建引擎进来，而 flush 又在等窗口推进
+	 * —— 内部持有的 gated IO 会与之死锁（quiesce 回调永不触发）。
+	 * 故这里直接 -ENOMEM，把 IO 交还 bdev 层 nomem 队列（不计 outstanding，
+	 * 且会被 LBA range lock 自动挂起/解锁后重投），窗口推进后自然重试。*/
+	{
+		struct raid_bdev_io_channel *eff_ch;
+		enum poweraid_raid_common_gate gate =
+			poweraid_raid_common_rebuild_gate_classify(raid, raid_io->raid_ch,
+					stripe_index, &eff_ch);
+		if (gate == POWERAID_RAID_COMMON_GATE_WAIT) {
+			return -ENOMEM;
+		}
+	}
 
 	/* 防御性校验：strip 对齐 */
 	if (stripe_offset % raid->strip_size != 0 ||
@@ -606,5 +670,20 @@ poweraid_raid_common_merge_flush_all(struct raid_bdev_io *raid_io)
 	} else {
 		/* 无 pending，立即完成 flush */
 		raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+	}
+}
+
+void
+poweraid_raid_common_merge_replay_gated(struct poweraid_raid_common_io_channel *mod_ch)
+{
+	struct merge_ctx *mctx = &mod_ch->merge_ctx;
+	struct merge_entry *entry, *tmp;
+
+	/* 被重建窗口门控的条目重新分类并尝试提交；仍被门控的留在 pending 列表。
+	 * 窗口结束（ended=true）时 shadow 为 NULL，所有条目必然放行。*/
+	TAILQ_FOREACH_SAFE(entry, &mctx->pending_list, link, tmp) {
+		if (!entry->flushing) {
+			merge_flush_entry(entry);
+		}
 	}
 }

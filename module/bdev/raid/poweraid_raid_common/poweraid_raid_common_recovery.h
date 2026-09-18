@@ -71,15 +71,6 @@ void poweraid_raid_common_recovery_run(
  */
 void poweraid_raid_common_recovery_free_result(struct poweraid_raid_common_recovery_result *results);
 
-/**
- * 集成层提供的 read_data_fn 实现（poweraid_raid5f.c）：按 RAID5F 布局
- * 读指定 stripe 的某个 data chunk（整 strip）。
- */
-void poweraid_raid_common_recovery_read_strip(
-	struct poweraid_raid_common_raid *raid,
-	uint64_t stripe_id, uint32_t chunk_idx, uint32_t chunk_len_blocks,
-	poweraid_raid_common_recovery_read_data_cb cb, void *cb_arg);
-
 #ifdef __cplusplus
 }
 #endif

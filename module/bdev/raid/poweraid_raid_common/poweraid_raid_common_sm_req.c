@@ -192,7 +192,7 @@ poweraid_raid_common_req_ppl_append_done(int status, uint64_t seq, void *cb_arg)
 	struct raid_bdev *raid_bdev = raid_io->raid_bdev;
 	struct poweraid_raid_common_raid *raid = req->raid;
 	uint32_t strip_size_bytes = raid->strip_size * raid->block_size;
-	uint8_t p_idx, data_chunks = raid->num_base_bdevs - 1;
+	uint8_t p_idx, q_idx;
 	uint8_t i, chunk_idx;
 	int rc;
 
@@ -204,12 +204,11 @@ poweraid_raid_common_req_ppl_append_done(int status, uint64_t seq, void *cb_arg)
 	}
 	req->ppl_seq = (status == 0) ? seq : 0;
 
-	/* Step 2: 写 data chunks + parity chunk 到所有 base bdev */
+	/* Step 2: 写 data chunks + parity chunk(s) 到所有 base bdev */
 	req->base_bdev_io_remaining = raid->num_base_bdevs;
 	req->base_bdev_io_status = 0;
 
-	/* RAID5 left-symmetric parity 位置 */
-	p_idx = data_chunks - (req->stripe_index % raid->num_base_bdevs);
+	poweraid_raid_common_get_parity_idx(raid, req->stripe_index, &p_idx, &q_idx);
 
 	for (i = 0; i < raid->num_base_bdevs; i++) {
 		struct raid_base_bdev_info *base_info = &raid_bdev->base_bdev_info[i];
@@ -221,7 +220,7 @@ poweraid_raid_common_req_ppl_append_done(int status, uint64_t seq, void *cb_arg)
 
 		io_opts.size = sizeof(io_opts);
 
-		base_ch = raid_bdev_channel_get_base_channel(raid_io->raid_ch, i);
+		base_ch = raid_bdev_channel_get_base_channel(req->eff_raid_ch, i);
 		if (base_ch == NULL || base_info->desc == NULL) {
 			SPDK_ERRLOG("write_full: no channel for chunk %u\n", i);
 			req->base_bdev_io_status = -EIO;
@@ -233,9 +232,10 @@ poweraid_raid_common_req_ppl_append_done(int status, uint64_t seq, void *cb_arg)
 
 		if (i == p_idx) {
 			buf = req->parity_buf_alloc;
+		} else if (i == q_idx) {
+			buf = req->q_buf_alloc;   /* RAID6: Q */
 		} else {
-			/* data chunk j → physical chunk i，data_buf 按 data chunk 序号排列 */
-			chunk_idx = (i < p_idx) ? i : (i - 1);
+			chunk_idx = poweraid_raid_common_phys_to_data(i, p_idx, q_idx);
 			buf = (char *)req->data_buf + chunk_idx * strip_size_bytes;
 		}
 
@@ -321,7 +321,7 @@ poweraid_raid_common_req_start_flushes(struct poweraid_raid_common_req *req)
 		struct spdk_io_channel *base_ch;
 		uint64_t base_offset;
 
-		base_ch = raid_bdev_channel_get_base_channel(raid_io->raid_ch, i);
+		base_ch = raid_bdev_channel_get_base_channel(req->eff_raid_ch, i);
 		if (base_ch == NULL || base_info->desc == NULL) {
 			if (--req->base_bdev_io_remaining == 0) {
 				/* 全部 flush 完成 → Step 4 */
@@ -383,13 +383,13 @@ poweraid_raid_common_sm_req_write_full(struct poweraid_raid_common_req *req,
 		if (raid->base_bdevs[i] != NULL &&
 		    raid->base_bdevs[i]->ppl_ctx != NULL) {
 			ppl_ctx = raid->base_bdevs[i]->ppl_ctx;
-			ppl_ch = raid_bdev_channel_get_base_channel(raid_io->raid_ch, i);
+			ppl_ch = raid_bdev_channel_get_base_channel(req->eff_raid_ch, i);
 			break;
 		}
 	}
 
 	/* 构造 chunk_bitmap：标记本次写的所有 data chunk */
-	for (i = 0; i < raid->num_base_bdevs - 1; i++) {
+	for (i = 0; i < raid->num_base_bdevs - raid->num_parity; i++) {
 		chunk_bitmap |= (1ULL << i);
 	}
 
@@ -397,7 +397,7 @@ poweraid_raid_common_sm_req_write_full(struct poweraid_raid_common_req *req,
 		/* Step 1: PPL append（FUA 落盘 intent）*/
 		/* old_data_hash=0（全 stripe 写无旧数据），new_data_hash 用 data_buf 算 */
 		uint64_t new_hash = poweraid_raid_common_ppl_data_hash(
-			req->data_buf, (raid->num_base_bdevs - 1) *
+			req->data_buf, (raid->num_base_bdevs - raid->num_parity) *
 			raid->strip_size * raid->block_size);
 
 		__atomic_fetch_or(&req->state, POWERAID_REQ_ST_WRITE,
@@ -441,7 +441,7 @@ poweraid_raid_common_sm_req_write_parity(struct poweraid_raid_common_req *req,
 		if (raid->base_bdevs[i] != NULL &&
 		    raid->base_bdevs[i]->ppl_ctx != NULL) {
 			ppl_ctx = raid->base_bdevs[i]->ppl_ctx;
-			ppl_ch = raid_bdev_channel_get_base_channel(raid_io->raid_ch, i);
+			ppl_ch = raid_bdev_channel_get_base_channel(req->eff_raid_ch, i);
 			break;
 		}
 	}
@@ -505,6 +505,10 @@ poweraid_raid_common_sm_req_destroy(struct poweraid_raid_common_req *req,
 			poweraid_raid_common_put_parity_buf(req->ch, req->parity_buf_alloc);
 			req->parity_buf_alloc = NULL;
 		}
+		if (req->q_buf_alloc != NULL) {
+			poweraid_raid_common_put_q_buf(req->ch, req->q_buf_alloc);
+			req->q_buf_alloc = NULL;
+		}
 		if (req->data_buf != NULL) {
 			poweraid_raid_common_put_data_buf(req->ch, req->data_buf);
 			req->data_buf = NULL;
@@ -513,6 +517,10 @@ poweraid_raid_common_sm_req_destroy(struct poweraid_raid_common_req *req,
 		if (req->parity_buf_alloc != NULL) {
 			spdk_dma_free(req->parity_buf_alloc);
 			req->parity_buf_alloc = NULL;
+		}
+		if (req->q_buf_alloc != NULL) {
+			spdk_dma_free(req->q_buf_alloc);
+			req->q_buf_alloc = NULL;
 		}
 		if (req->data_buf != NULL) {
 			spdk_dma_free(req->data_buf);
@@ -528,7 +536,9 @@ poweraid_raid_common_sm_req_destroy(struct poweraid_raid_common_req *req,
 	req->state = 0;
 	req->io = NULL;
 	req->raid_io = NULL;
+	req->eff_raid_ch = NULL;
 	req->parity_buf = NULL;
+	req->q_buf = NULL;
 	req->n_src = 0;
 	req->xor_len = 0;
 	req->ppl_seq = 0;

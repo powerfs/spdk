@@ -33,6 +33,15 @@ extern "C" {
 #define POWERAID_RAID_COMMON_PPL_REGION_OFFSET  (1024ULL * 1024)
 #define POWERAID_RAID_COMMON_PPL_REGION_SIZE    (4ULL * 1024 * 1024)
 
+/* MWL（Mirror Write Log，raid1f 意图日志）区固定布局（每盘；字节单位）：
+ *   与 PPL 同构：[1MiB, 5MiB) 4MiB；数据区从 5MiB 起（4K 块下 = 1280 块）。*/
+#define POWERAID_RAID_COMMON_MWL_REGION_OFFSET  (1024ULL * 1024)
+#define POWERAID_RAID_COMMON_MWL_REGION_SIZE    (4ULL * 1024 * 1024)
+
+/* lead 副本的固定槽位（MWL 定序写与 replay 扇出的权威源）。
+ * lead 缺失时由最低在场槽位担任 acting lead（标记在 MWL record/super）。 */
+#define POWERAID_RAID1F_LEAD_SLOT              0
+
 /* feature_flags：标识 v2 启用的特性 */
 #define POWERAID_RAID_COMMON_SB_F_PPL         (1u << 0)
 #define POWERAID_RAID_COMMON_SB_F_DIF         (1u << 1)
@@ -40,6 +49,10 @@ extern "C" {
 #define POWERAID_RAID_COMMON_SB_F_RAID6       (1u << 3)
 #define POWERAID_RAID_COMMON_SB_F_SPARE_POOL  (1u << 4)
 #define POWERAID_RAID_COMMON_SB_F_RESTRIPE    (1u << 5)
+/* raid1f：MWL 意图日志（record 仅 hash 无载荷）*/
+#define POWERAID_RAID_COMMON_SB_F_MWL         (1u << 6)
+/* 预留升级位：MWL record 携带数据载荷的未来格式 */
+#define POWERAID_RAID_COMMON_SB_F_MWL_PAYLOAD (1u << 7)
 
 /* dif_mode：DIF/DIX 工作模式 */
 enum poweraid_raid_common_dif_mode {
@@ -87,6 +100,16 @@ struct poweraid_raid_common_sb_v2_ext {
 	/* PPL 当前 seq（启动恢复时用）*/
 	uint64_t ppl_seq;
 
+	/* MWL（Mirror Write Log，raid1f）区位置（每盘的相对偏移）*/
+	uint64_t mwl_region_offset;
+	/* MWL 区大小（字节，每盘）*/
+	uint64_t mwl_region_size;
+	/* MWL 当前已 commit seq（启动恢复时用）*/
+	uint64_t mwl_seq;
+	/* lead 槽位（永久 slot0；acting lead 标记在 MWL record/super，
+	 * 正常情况下本字段恒为 POWERAID_RAID1F_LEAD_SLOT）*/
+	uint64_t mwl_lead_slot;
+
 	/* Scrub 进度（stripe_id）*/
 	uint64_t scrub_progress;
 	/* 上次完整 scrub 完成的时间戳（unix 秒）*/
@@ -107,8 +130,8 @@ struct poweraid_raid_common_sb_v2_ext {
 	uint64_t create_ts;
 	uint64_t last_modified_ts;
 
-	/* 预留（填满至 256B：8+2+2+4+4+1+1+1+5+4pad+8*11=120，剩 136）*/
-	uint8_t reserved[136];
+	/* 预留（ext 固定 256B；MWL 切走 32B 后剩 104）*/
+	uint8_t reserved[104];
 };
 SPDK_STATIC_ASSERT(sizeof(struct poweraid_raid_common_sb_v2_ext) ==
 		   POWERAID_RAID_COMMON_SB_V2_EXT_LENGTH,
@@ -172,6 +195,14 @@ void poweraid_raid_common_sb_free_loaded(struct poweraid_raid_common_sb_ctx *ctx
  * 仅当 sb_alloc+sb_init（建卷）后可用；无 ext 时返回 -ENOENT。
  */
 int poweraid_raid_common_sb_get_ppl_region(struct poweraid_raid_common_raid *raid,
+				      uint64_t *region_offset_bytes,
+				      uint64_t *region_size_bytes);
+
+/**
+ * 取 raid->sb_ctx v2 ext 中的 MWL 区布局（字节单位）。
+ * 仅当 sb_alloc+sb_init（建卷）后可用；无 ext 时返回 -ENOENT。
+ */
+int poweraid_raid_common_sb_get_mwl_region(struct poweraid_raid_common_raid *raid,
 				      uint64_t *region_offset_bytes,
 				      uint64_t *region_size_bytes);
 

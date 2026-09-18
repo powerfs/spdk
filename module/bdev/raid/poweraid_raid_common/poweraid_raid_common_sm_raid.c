@@ -14,6 +14,7 @@
 #include "spdk/log.h"
 
 #include "poweraid_raid_common.h"
+#include "poweraid_raid_common_gf8.h"
 
 SPDK_LOG_REGISTER_COMPONENT(raid5f_sm_raid);
 
@@ -113,9 +114,18 @@ poweraid_raid_common_sm_raid_create_dsc(struct poweraid_raid_common_raid *raid,
 	}
 
 	/* 初始化 superblock 字段（v2 版本号、ext_signature、CRC 双区）。
-	 * 阶段 2 默认开启 PPL（write hole 根治）；后续阶段按 raid 配置增减。*/
-	poweraid_raid_common_sb_init(raid, raid->level, raid->strip_size,
-				POWERAID_RAID_COMMON_SB_F_PPL);
+	 * 特性位按级别选择：raid1f 写 MWL 意图日志，5f/6f 写 PPL。*/
+	{
+		uint32_t feature_flags;
+
+		if (raid->level == SPDK_BDEV_RAID_LEVEL_RAID1F) {
+			feature_flags = POWERAID_RAID_COMMON_SB_F_MWL;
+		} else {
+			feature_flags = POWERAID_RAID_COMMON_SB_F_PPL;
+		}
+		poweraid_raid_common_sb_init(raid, raid->level, raid->strip_size,
+					    feature_flags);
+	}
 
 	/* 标记配置待持久化（阶段 2 由 EV_SAVE_CONFIG 落盘）*/
 	poweraid_raid_state_set(&raid->state, POWERAID_RAID_ST_CONFIG_DIRTY);
@@ -158,7 +168,8 @@ poweraid_raid_common_sm_raid_open_bdevs(struct poweraid_raid_common_raid *raid,
 }
 
 /* ===== parity fixup：对 data==old/data==new 的未提交 stripe，用当前数据重算
- * 并重写 parity（写+flush）。INCONSISTENT 仅告警（阶段 2 不做数据重构）。===== */
+ * 并重写 parity（写+flush）。INCONSISTENT 仅告警（阶段 2 不做数据重构）。
+ * RAID5: 重算 P；RAID6: 重算 P + Q。===== */
 struct parity_fixup {
 	struct poweraid_raid_common_raid		*raid;
 	struct poweraid_raid_common_recovery_result	*results;
@@ -166,12 +177,17 @@ struct parity_fixup {
 	uint32_t				idx;
 	uint32_t				chunk;
 	uint32_t				data_chunks;
+	uint8_t					num_parity;
 	void					*pbuf;
+	void					*qbuf;   /* RAID6 Q 缓冲 */
 	size_t					strip_bytes;
+	/* Q 写状态（RAID6）：write_remaining 跟踪 P+Q 写和 flush 完成 */
+	uint32_t				write_remaining;
 };
 
 static void parity_fixup_next(struct parity_fixup *op);
 static void parity_fixup_read_cb(int status, const void *buf, size_t len, void *cb_arg);
+static void parity_fixup_write_or_next(struct parity_fixup *op);
 static void parity_fixup_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
 static void parity_fixup_flush_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
 
@@ -199,6 +215,9 @@ parity_fixup_abort(struct parity_fixup *op, const char *why)
 	if (op->pbuf != NULL) {
 		spdk_dma_free(op->pbuf);
 	}
+	if (op->qbuf != NULL) {
+		spdk_dma_free(op->qbuf);
+	}
 	poweraid_raid_common_recovery_free_result(op->results);
 	free(op);
 	poweraid_raid_state_clear(&raid->state, POWERAID_RAID_ST_RESTORING);
@@ -211,7 +230,7 @@ parity_fixup_write_or_next(struct parity_fixup *op)
 	struct spdk_bdev_desc *desc;
 	struct spdk_io_channel *ch;
 	uint64_t stripe = op->results[op->idx].stripe_id;
-	uint8_t p_idx;
+	uint8_t p_idx, q_idx;
 	uint64_t offset;
 	int rc;
 
@@ -219,27 +238,51 @@ parity_fixup_write_or_next(struct parity_fixup *op)
 		parity_fixup_abort(op, "stop before parity write");
 		return;
 	}
-	p_idx = op->data_chunks - (stripe % op->raid->num_base_bdevs);
+
+	poweraid_raid_common_get_parity_idx(op->raid, stripe, &p_idx, &q_idx);
+
+	/* 写 P */
 	bdev = op->raid->base_bdevs[p_idx];
 	desc = (struct spdk_bdev_desc *)bdev->desc;
 	ch = (struct spdk_io_channel *)bdev->ch;
-	offset = op->raid->data_offset_blocks +
-		 stripe * op->raid->strip_size;
+	offset = op->raid->data_offset_blocks + stripe * op->raid->strip_size;
+
+	op->write_remaining = op->num_parity;  /* RAID5=1, RAID6=2 */
 
 	rc = spdk_bdev_write_blocks(desc, ch, op->pbuf, offset,
 				    op->raid->strip_size,
 				    parity_fixup_write_cb, op);
-	if (rc == -ENOMEM) {
-		/* 简化处理：阶段 2 启动期资源紧张直接报错跳过，不排队 */
-		SPDK_ERRLOG("fixup: parity write ENOMEM stripe=%"PRIu64"\n", stripe);
+	if (rc != 0) {
+		SPDK_ERRLOG("fixup: P write rc=%d stripe=%"PRIu64"\n", rc, stripe);
+		op->write_remaining--;
+	}
+
+	/* RAID6: 写 Q */
+	if (op->num_parity >= 2 && op->write_remaining > 0) {
+		bdev = op->raid->base_bdevs[q_idx];
+		desc = (struct spdk_bdev_desc *)bdev->desc;
+		ch = (struct spdk_io_channel *)bdev->ch;
+		rc = spdk_bdev_write_blocks(desc, ch, op->qbuf, offset,
+					    op->raid->strip_size,
+					    parity_fixup_write_cb, op);
+		if (rc != 0) {
+			SPDK_ERRLOG("fixup: Q write rc=%d stripe=%"PRIu64"\n", rc, stripe);
+			if (--op->write_remaining == 0) {
+				/* P 也失败了，直接进下一个 */
+				spdk_dma_free(op->pbuf);
+				op->pbuf = NULL;
+				if (op->qbuf) { spdk_dma_free(op->qbuf); op->qbuf = NULL; }
+				op->idx++;
+				parity_fixup_next(op);
+			}
+		}
+	}
+
+	if (op->write_remaining == 0) {
+		/* 所有写都同步失败，进下一个 */
 		spdk_dma_free(op->pbuf);
 		op->pbuf = NULL;
-		op->idx++;
-		parity_fixup_next(op);
-	} else if (rc != 0) {
-		SPDK_ERRLOG("fixup: parity write rc=%d stripe=%"PRIu64"\n", rc, stripe);
-		spdk_dma_free(op->pbuf);
-		op->pbuf = NULL;
+		if (op->qbuf) { spdk_dma_free(op->qbuf); op->qbuf = NULL; }
 		op->idx++;
 		parity_fixup_next(op);
 	}
@@ -262,17 +305,29 @@ parity_fixup_read_cb(int status, const void *buf, size_t len, void *cb_arg)
 			    op->chunk, status, op->results[op->idx].stripe_id);
 		spdk_dma_free(op->pbuf);
 		op->pbuf = NULL;
+		if (op->qbuf) { spdk_dma_free(op->qbuf); op->qbuf = NULL; }
 		op->idx++;
 		parity_fixup_next(op);
 		return;
 	}
 
+	/* P: XOR 累加 */
 	for (i = 0; i < len; i++) {
 		dst[i] ^= src[i];
 	}
+
+	/* Q: GF8 累加 qbuf[j] ^= α^chunk × src[j]（标量实现，fixup 非热路径）*/
+	if (op->num_parity >= 2) {
+		uint8_t *q = op->qbuf;
+		uint8_t coeff = poweraid_raid_common_gf8_exp[op->chunk];  /* α^chunk */
+		for (i = 0; i < len; i++) {
+			q[i] ^= poweraid_raid_common_gf8_mul_scalar(coeff, src[i]);
+		}
+	}
+
 	op->chunk++;
 	if (op->chunk < op->data_chunks) {
-		poweraid_raid_common_recovery_read_strip(op->raid,
+		op->raid->ops.read_strip(op->raid,
 			op->results[op->idx].stripe_id, op->chunk,
 			op->raid->strip_size, parity_fixup_read_cb, op);
 		return;
@@ -286,37 +341,51 @@ parity_fixup_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	struct parity_fixup *op = cb_arg;
 	struct poweraid_raid_common_bdev *bdev;
 	uint64_t stripe = op->results[op->idx].stripe_id;
-	uint8_t p_idx;
+	uint8_t p_idx, q_idx;
 	uint64_t offset;
 	int rc;
 
-	spdk_bdev_free_io(bdev_io);
+	if (bdev_io != NULL) {
+		spdk_bdev_free_io(bdev_io);
+	}
 	if (poweraid_raid_state_test(&op->raid->state, POWERAID_RAID_ST_OFFLINE)) {
 		parity_fixup_abort(op, "stop after parity write");
 		return;
 	}
 	if (!success) {
 		SPDK_ERRLOG("fixup: parity write failed stripe=%"PRIu64"\n", stripe);
-		spdk_dma_free(op->pbuf);
-		op->pbuf = NULL;
-		op->idx++;
-		parity_fixup_next(op);
+	}
+
+	if (--op->write_remaining > 0) {
+		/* 等待另一个 parity 写完成（RAID6）*/
 		return;
 	}
 
-	p_idx = op->data_chunks - (stripe % op->raid->num_base_bdevs);
+	/* 所有 parity 写完成，发起 flush */
+	poweraid_raid_common_get_parity_idx(op->raid, stripe, &p_idx, &q_idx);
+	op->write_remaining = op->num_parity;
+
+	/* flush P */
 	bdev = op->raid->base_bdevs[p_idx];
-	offset = op->raid->data_offset_blocks +
-		 stripe * op->raid->strip_size;
+	offset = op->raid->data_offset_blocks + stripe * op->raid->strip_size;
 	rc = spdk_bdev_flush_blocks((struct spdk_bdev_desc *)bdev->desc,
 				    (struct spdk_io_channel *)bdev->ch,
 				    offset, op->raid->strip_size,
 				    parity_fixup_flush_cb, op);
 	if (rc != 0) {
-		/* -ENOTSUP/不支持 flush 的盘视为持久完成 */
-		SPDK_WARNLOG("fixup: flush rc=%d stripe=%"PRIu64" (continue)\n",
-			     rc, stripe);
 		parity_fixup_flush_cb(NULL, true, op);
+	}
+
+	/* RAID6: flush Q */
+	if (op->num_parity >= 2 && op->write_remaining > 0) {
+		bdev = op->raid->base_bdevs[q_idx];
+		rc = spdk_bdev_flush_blocks((struct spdk_bdev_desc *)bdev->desc,
+					    (struct spdk_io_channel *)bdev->ch,
+					    offset, op->raid->strip_size,
+					    parity_fixup_flush_cb, op);
+		if (rc != 0) {
+			parity_fixup_flush_cb(NULL, true, op);
+		}
 	}
 }
 
@@ -336,8 +405,15 @@ parity_fixup_flush_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		SPDK_ERRLOG("fixup: flush failed stripe=%"PRIu64"\n",
 			    op->results[op->idx].stripe_id);
 	}
+	if (--op->write_remaining > 0) {
+		return;
+	}
 	spdk_dma_free(op->pbuf);
 	op->pbuf = NULL;
+	if (op->qbuf) {
+		spdk_dma_free(op->qbuf);
+		op->qbuf = NULL;
+	}
 	op->idx++;
 	parity_fixup_next(op);
 }
@@ -364,7 +440,18 @@ parity_fixup_next(struct parity_fixup *op)
 			continue;
 		}
 		memset(op->pbuf, 0, op->strip_bytes);
-		poweraid_raid_common_recovery_read_strip(op->raid,
+		if (op->num_parity >= 2) {
+			op->qbuf = spdk_dma_malloc(op->strip_bytes, 0x1000, NULL);
+			if (op->qbuf == NULL) {
+				SPDK_ERRLOG("fixup: alloc qbuf failed\n");
+				spdk_dma_free(op->pbuf);
+				op->pbuf = NULL;
+				op->idx++;
+				continue;
+			}
+			memset(op->qbuf, 0, op->strip_bytes);
+		}
+		op->raid->ops.read_strip(op->raid,
 			op->results[op->idx].stripe_id, 0,
 			op->raid->strip_size, parity_fixup_read_cb, op);
 		return;
@@ -416,7 +503,8 @@ poweraid_raid_common_online_recovery_done(int status,
 	op->raid = raid;
 	op->results = (struct poweraid_raid_common_recovery_result *)results;
 	op->num = num_results;
-	op->data_chunks = raid->num_base_bdevs - 1;
+	op->num_parity = raid->num_parity;
+	op->data_chunks = raid->num_base_bdevs - raid->num_parity;
 	op->strip_bytes = (size_t)raid->strip_size * raid->block_size;
 	parity_fixup_next(op);
 }
@@ -446,7 +534,7 @@ raid_enter_online(struct poweraid_raid_common_raid *raid)
 			SPDK_NOTICELOG("online: kick recovery on bdev[%u] ppl_ctx=%p\n",
 				       i, raid->base_bdevs[i]->ppl_ctx);
 			poweraid_raid_common_recovery_run(raid->base_bdevs[i]->ppl_ctx, raid,
-						     poweraid_raid_common_recovery_read_strip,
+						     raid->ops.read_strip,
 						     poweraid_raid_common_online_recovery_done, raid);
 			break;
 		}
@@ -536,7 +624,11 @@ fresh_sb_write_cb(int status, void *cb_arg)
 	op->raid = raid;
 	if (poweraid_raid_common_sb_get_ppl_region(raid, &op->region_offset,
 					      &op->region_size) != 0) {
-		SPDK_ERRLOG("fresh_init: no PPL region in sb ext\n");
+		/* 非 F_PPL 卷（raid1f/F_MWL）无 PPL 区为正常情况：
+		 * Task 3 起在此分支接入 MWL 区 fresh 初始化，当前直接上线。*/
+		SPDK_DEBUGLOG(raid5f_sm_raid,
+			      "fresh_init: no PPL region (level=%u raid=%s), skip\n",
+			      raid->level, raid->name);
 		free(op);
 		raid_enter_online(raid);
 		return;
@@ -672,18 +764,21 @@ int
 poweraid_raid_common_buf_pool_init(struct poweraid_raid_common_io_channel *ch,
 				   struct poweraid_raid_common_raid *raid)
 {
-	uint32_t data_chunks = raid->num_base_bdevs - 1;
+	uint32_t data_chunks = raid->num_base_bdevs - raid->num_parity;
 	uint32_t strip_bytes = raid->strip_size * raid->block_size;
 	struct poweraid_raid_common_buf *entry;
 	int i;
 
 	ch->data_buf_size = strip_bytes * data_chunks;
 	ch->parity_buf_size = strip_bytes;
+	ch->q_buf_size = strip_bytes;
 	ch->n_data_bufs = 0;
 	ch->n_parity_bufs = 0;
+	ch->n_q_bufs = 0;
 
 	TAILQ_INIT(&ch->free_data_bufs);
 	TAILQ_INIT(&ch->free_parity_bufs);
+	TAILQ_INIT(&ch->free_q_bufs);
 
 	for (i = 0; i < POWERAID_RAID_COMMON_MAX_STRIPES; i++) {
 		entry = calloc(1, sizeof(*entry));
@@ -713,10 +808,28 @@ poweraid_raid_common_buf_pool_init(struct poweraid_raid_common_io_channel *ch,
 		ch->n_parity_bufs++;
 	}
 
+	/* RAID6：预分配 Q 缓冲池 */
+	if (raid->num_parity >= 2) {
+		for (i = 0; i < POWERAID_RAID_COMMON_MAX_STRIPES; i++) {
+			entry = calloc(1, sizeof(*entry));
+			if (entry == NULL) {
+				goto err;
+			}
+			entry->buf = spdk_dma_malloc(ch->q_buf_size, 0, NULL);
+			if (entry->buf == NULL) {
+				free(entry);
+				goto err;
+			}
+			TAILQ_INSERT_HEAD(&ch->free_q_bufs, entry, link);
+			ch->n_q_bufs++;
+		}
+	}
+
 	SPDK_DEBUGLOG(raid5f_sm_raid, "buf_pool_init: data_buf=%"PRIu32
-		      "B x%d parity_buf=%"PRIu32"B x%d\n",
+		      "B x%d parity_buf=%"PRIu32"B x%d q_buf=%"PRIu32"B x%d\n",
 		      ch->data_buf_size, ch->n_data_bufs,
-		      ch->parity_buf_size, ch->n_parity_bufs);
+		      ch->parity_buf_size, ch->n_parity_bufs,
+		      ch->q_buf_size, ch->n_q_bufs);
 	return 0;
 
 err:
@@ -742,6 +855,13 @@ poweraid_raid_common_buf_pool_destroy(struct poweraid_raid_common_io_channel *ch
 		free(entry);
 	}
 	ch->n_parity_bufs = 0;
+
+	while ((entry = TAILQ_FIRST(&ch->free_q_bufs))) {
+		TAILQ_REMOVE(&ch->free_q_bufs, entry, link);
+		spdk_dma_free(entry->buf);
+		free(entry);
+	}
+	ch->n_q_bufs = 0;
 }
 
 void *
@@ -819,4 +939,95 @@ poweraid_raid_common_put_parity_buf(struct poweraid_raid_common_io_channel *ch, 
 		}
 	}
 	spdk_dma_free(buf);
+}
+
+void *
+poweraid_raid_common_get_q_buf(struct poweraid_raid_common_io_channel *ch)
+{
+	struct poweraid_raid_common_buf *entry;
+	void *buf;
+
+	entry = TAILQ_FIRST(&ch->free_q_bufs);
+	if (entry != NULL) {
+		TAILQ_REMOVE(&ch->free_q_bufs, entry, link);
+		ch->n_q_bufs--;
+		buf = entry->buf;
+		free(entry);
+		return buf;
+	}
+	buf = spdk_dma_malloc(ch->q_buf_size, 0, NULL);
+	return buf;
+}
+
+void
+poweraid_raid_common_put_q_buf(struct poweraid_raid_common_io_channel *ch, void *buf)
+{
+	struct poweraid_raid_common_buf *entry;
+
+	if (buf == NULL) {
+		return;
+	}
+	if (ch->n_q_bufs < POWERAID_RAID_COMMON_MAX_STRIPES) {
+		entry = calloc(1, sizeof(*entry));
+		if (entry != NULL) {
+			entry->buf = buf;
+			TAILQ_INSERT_HEAD(&ch->free_q_bufs, entry, link);
+			ch->n_q_bufs++;
+			return;
+		}
+	}
+	spdk_dma_free(buf);
+}
+
+/* ===== 布局 helper（left-symmetric）===== */
+
+void
+poweraid_raid_common_get_parity_idx(struct poweraid_raid_common_raid *raid,
+				    uint64_t stripe_index,
+				    uint8_t *p_idx, uint8_t *q_idx)
+{
+	uint8_t n = raid->num_base_bdevs;
+	uint64_t s = stripe_index % n;
+
+	/* P: left-symmetric，stripe 0 在 n-1，每 stripe 左移 */
+	*p_idx = (uint8_t)(n - 1 - s);
+
+	if (raid->num_parity >= 2) {
+		/* Q: 在 P 左侧（即 n-2-s），处理回卷 */
+		*q_idx = (uint8_t)((n - 2 - s + n) % n);
+	} else {
+		*q_idx = n;  /* 无效值（RAID5 无 Q）*/
+	}
+}
+
+uint8_t
+poweraid_raid_common_data_to_phys(uint8_t data_idx, uint8_t p_idx,
+				   uint8_t q_idx, uint8_t num_base_bdevs)
+{
+	uint8_t phys = 0;
+	uint8_t seen = 0;
+
+	for (phys = 0; phys < num_base_bdevs; phys++) {
+		if (phys != p_idx && phys != q_idx) {
+			if (seen == data_idx) {
+				return phys;
+			}
+			seen++;
+		}
+	}
+	return num_base_bdevs;  /* 不应到达 */
+}
+
+uint8_t
+poweraid_raid_common_phys_to_data(uint8_t phys, uint8_t p_idx, uint8_t q_idx)
+{
+	uint8_t count = 0;
+	uint8_t i;
+
+	for (i = 0; i < phys; i++) {
+		if (i != p_idx && i != q_idx) {
+			count++;
+		}
+	}
+	return count;
 }

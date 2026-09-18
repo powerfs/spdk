@@ -23,10 +23,12 @@ C_SRCS += poweraid_raid_common/poweraid_raid_common_sm_dispatch.c \
 	          poweraid_raid_common/poweraid_raid_common_sm_bdev.c \
 	          poweraid_raid_common/poweraid_raid_common_sm_req.c \
 	          poweraid_raid_common/poweraid_raid_common_sb.c \
-	          poweraid_raid_common/poweraid_raid_common_ppl.c \
-	          poweraid_raid_common/poweraid_raid_common_recovery.c \
+		  poweraid_raid_common/poweraid_raid_common_ppl.c \
+		  poweraid_raid_common/poweraid_raid_common_mwl.c \
+		  poweraid_raid_common/poweraid_raid_common_recovery.c \
 	          poweraid_raid_common/poweraid_raid_common_rmw.c \
 	          poweraid_raid_common/poweraid_raid_common_merge.c \
+	          poweraid_raid_common/poweraid_raid_common_rebuild.c \
 	          poweraid_raid_common/poweraid_raid_common_rpc.c \
 	          poweraid_raid_common/poweraid_raid_common_gf8.c
 # GF8 SIMD 路径: 按架构选择
@@ -37,6 +39,12 @@ C_SRCS += poweraid_raid_common/poweraid_raid_common_gf8_neon.c
 endif
 # 5f 薄壳
 C_SRCS += poweraid_raid5f/poweraid_raid5f.c
+# 1f 薄壳（镜像 + MWL 写意图日志，复用 common 层 sb/sm 骨架）
+C_SRCS += poweraid_raid1f/poweraid_raid1f.c
+# 6f 薄壳 (RAID6 P+Q)
+C_SRCS += poweraid_raid6f/poweraid_raid6f.c \
+          poweraid_raid6f/poweraid_raid6f_calc.c \
+          poweraid_raid6f/poweraid_raid6f_recovery.c
 endif
 
 LIBNAME = bdev_raid

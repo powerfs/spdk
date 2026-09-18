@@ -177,6 +177,12 @@ spdk_fio_schedule_thread(struct spdk_thread *thread)
 
 	fio_thread = spdk_thread_get_ctx(thread);
 
+	/* 框架内部创建的 spdk_thread（如 RAID rebuild 的 process 线程）也会走
+	 * 此调度回调，其 ctx 除嵌入字段外未由 spdk_fio_init_thread 初始化；
+	 * 必须在此回填 thread，否则 init 轮询循环解引用 NULL（fio 插件宿主内
+	 * 跑 rebuild 必崩，且重建线程永远得不到 poll）。worker 线程赋同值无副作用。*/
+	fio_thread->thread = thread;
+
 	pthread_mutex_lock(&g_init_mtx);
 	TAILQ_INSERT_TAIL(&g_threads, fio_thread, link);
 	pthread_mutex_unlock(&g_init_mtx);

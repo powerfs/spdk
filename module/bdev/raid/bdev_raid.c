@@ -143,6 +143,18 @@ raid_bdev_channel_get_base_channel(struct raid_bdev_io_channel *raid_ch, uint8_t
 	return raid_ch->base_channel[idx];
 }
 
+struct raid_bdev_io_channel *
+raid_bdev_channel_get_processed_channel(struct raid_bdev_io_channel *raid_ch)
+{
+	return raid_ch->process.ch_processed;
+}
+
+uint64_t
+raid_bdev_channel_get_process_offset(struct raid_bdev_io_channel *raid_ch)
+{
+	return raid_ch->process.offset;
+}
+
 void *
 raid_bdev_channel_get_module_ctx(struct raid_bdev_io_channel *raid_ch)
 {
@@ -1329,6 +1341,8 @@ static struct {
 	{ "5f", SPDK_BDEV_RAID_LEVEL_RAID5F },
 	{ "raid6f", SPDK_BDEV_RAID_LEVEL_RAID6F },
 	{ "6f", SPDK_BDEV_RAID_LEVEL_RAID6F },
+	{ "raid1f", SPDK_BDEV_RAID_LEVEL_RAID1F },
+	{ "1f", SPDK_BDEV_RAID_LEVEL_RAID1F },
 	{ "concat", SPDK_BDEV_RAID_LEVEL_CONCAT },
 	{ }
 };
@@ -1538,9 +1552,11 @@ _raid_bdev_create(const char *name, uint32_t strip_size, uint8_t num_base_bdevs,
 		return -EEXIST;
 	}
 
-	if (level == SPDK_BDEV_RAID_LEVEL_RAID1) {
+	if (level == SPDK_BDEV_RAID_LEVEL_RAID1 ||
+	    level == SPDK_BDEV_RAID_LEVEL_RAID1F) {
 		if (strip_size != 0) {
-			SPDK_ERRLOG("Strip size is not supported by raid1\n");
+			SPDK_ERRLOG("Strip size is not supported by %s\n",
+				    raid_bdev_level_to_str(level));
 			return -EINVAL;
 		}
 	} else if (spdk_u32_is_pow2(strip_size) == false) {
@@ -1955,7 +1971,8 @@ raid_bdev_configure(struct raid_bdev *raid_bdev, raid_bdev_action_cb cb, void *c
 	 * internal use.
 	 */
 	raid_bdev->strip_size = (raid_bdev->strip_size_kb * 1024) / data_block_size;
-	if (raid_bdev->strip_size == 0 && raid_bdev->level != SPDK_BDEV_RAID_LEVEL_RAID1) {
+	if (raid_bdev->strip_size == 0 && raid_bdev->level != SPDK_BDEV_RAID_LEVEL_RAID1 &&
+	    raid_bdev->level != SPDK_BDEV_RAID_LEVEL_RAID1F) {
 		SPDK_ERRLOG("Strip size cannot be smaller than the device block size\n");
 		return -EINVAL;
 	}
@@ -2074,6 +2091,10 @@ raid_bdev_remove_base_bdev_done(struct raid_base_bdev_info *base_info, int statu
 			raid_bdev_deconfigure(raid_bdev, base_info->remove_cb, base_info->remove_cb_ctx);
 			return;
 		}
+		if (raid_bdev->module->base_bdev_removed != NULL) {
+			raid_bdev->module->base_bdev_removed(raid_bdev,
+							     raid_bdev_base_bdev_slot(base_info));
+		}
 	}
 
 	if (base_info->remove_cb != NULL) {
@@ -2122,11 +2143,22 @@ raid_bdev_channels_remove_base_bdev_done(struct spdk_io_channel_iter *i, int sta
 {
 	struct raid_base_bdev_info *base_info = spdk_io_channel_iter_get_ctx(i);
 	struct raid_bdev *raid_bdev = base_info->raid_bdev;
+	int rc;
 
 	raid_bdev_free_base_bdev_resource(base_info);
 
-	spdk_bdev_unquiesce(&raid_bdev->bdev, &g_raid_if, raid_bdev_remove_base_bdev_on_unquiesced,
-			    base_info);
+	rc = spdk_bdev_unquiesce(&raid_bdev->bdev, &g_raid_if,
+				 raid_bdev_remove_base_bdev_on_unquiesced, base_info);
+	if (rc != 0) {
+		/* unquiesce 失败（如跳过了 quiesce 时找不到 range）。
+		 * spdk_bdev_unquiesce 失败时不调用 cb_fn，直接返回错误码。
+		 * 需手动调用回调以完成移除流程，否则 RPC 超时。
+		 * 传 status=0：移除本身成功，unquiesce 失败仅因跳过了 quiesce。*/
+		SPDK_NOTICELOG("raid_bdev %s: unquiesce rc=%d (expected when quiesce bypassed), "
+			       "calling on_unquiesced with status=0\n",
+			       raid_bdev->bdev.name, rc);
+		raid_bdev_remove_base_bdev_on_unquiesced(base_info, 0);
+	}
 }
 
 static void
@@ -2191,13 +2223,38 @@ raid_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
 	raid_bdev_remove_base_bdev_cont(base_info);
 }
 
+static void
+_raid_bdev_remove_on_quiesced_deferred(void *ctx)
+{
+	raid_bdev_remove_base_bdev_on_quiesced(ctx, 0);
+}
+
 static int
 raid_bdev_remove_base_bdev_quiesce(struct raid_base_bdev_info *base_info)
 {
+	struct raid_bdev *raid_bdev = base_info->raid_bdev;
+	uint8_t i;
+
 	assert(spdk_get_thread() == spdk_thread_get_app_thread());
 
-	return spdk_bdev_quiesce(&base_info->raid_bdev->bdev, &g_raid_if,
-				 raid_bdev_remove_base_bdev_on_quiesced, base_info);
+	/* 条件性跳过 full-bdev quiesce：
+	 * - 数组 ONLINE（所有成员 desc 非空）→ 原始 spdk_bdev_quiesce，正常排空 IO。
+	 * - 数组 DEGRADED（有成员 desc==NULL）→ 跳过 quiesce。poweraid gate 已对
+	 *   降级状态返回 NOMEM，NOMEM-retry IO 循环经过 io_submitted 使 quiesce
+	 *   永远无法排空。延迟一拍执行 quiesced 后续逻辑，保持异步语义。*/
+	for (i = 0; i < raid_bdev->num_base_bdevs; i++) {
+		if (raid_bdev->base_bdev_info[i].desc == NULL) {
+			SPDK_NOTICELOG("raid_bdev %s: degraded (slot %u missing), "
+				       "bypassing quiesce for removal\n",
+				       raid_bdev->bdev.name, i);
+			spdk_thread_send_msg(spdk_thread_get_app_thread(),
+					     _raid_bdev_remove_on_quiesced_deferred, base_info);
+			return 0;
+		}
+	}
+
+	return spdk_bdev_quiesce(&raid_bdev->bdev, &g_raid_if,
+				raid_bdev_remove_base_bdev_on_quiesced, base_info);
 }
 
 struct raid_bdev_process_base_bdev_remove_ctx {
@@ -2762,6 +2819,11 @@ raid_bdev_channel_process_finish(struct spdk_io_channel_iter *i)
 
 	raid_bdev_ch_process_cleanup(raid_ch);
 
+	if (process->raid_bdev->module->process_window_advanced != NULL) {
+		process->raid_bdev->module->process_window_advanced(process->raid_bdev, raid_ch,
+								    true, process->status);
+	}
+
 	spdk_for_each_channel_continue(i, 0);
 }
 
@@ -2779,6 +2841,11 @@ raid_bdev_process_finish_quiesced(void *ctx, int status)
 	raid_bdev->process = NULL;
 	process->target->is_process_target = false;
 
+	if (raid_bdev->module->process_complete != NULL) {
+		raid_bdev->module->process_complete(raid_bdev, process->target,
+						    process->status);
+	}
+
 	spdk_for_each_channel(process->raid_bdev, raid_bdev_channel_process_finish, process,
 			      __raid_bdev_process_finish);
 }
@@ -2786,14 +2853,9 @@ raid_bdev_process_finish_quiesced(void *ctx, int status)
 static void
 _raid_bdev_process_finish(void *ctx)
 {
-	struct raid_bdev_process *process = ctx;
-	int rc;
-
-	rc = spdk_bdev_quiesce(&process->raid_bdev->bdev, &g_raid_if,
-			       raid_bdev_process_finish_quiesced, process);
-	if (rc != 0) {
-		raid_bdev_process_finish_quiesced(ctx, rc);
-	}
+	/* poweraid 跳过 full-bdev quiesce（与窗口 quiesce 同理：gate 已保证同步）。
+	 * 直接调 finish_quiesced 清理 process 并通知模块。*/
+	raid_bdev_process_finish_quiesced(ctx, 0);
 }
 
 static void
@@ -2848,16 +2910,10 @@ raid_bdev_process_window_range_unlocked(void *ctx, int status)
 static void
 raid_bdev_process_unlock_window_range(struct raid_bdev_process *process)
 {
-	int rc;
-
 	assert(process->window_range_locked == true);
 
-	rc = spdk_bdev_unquiesce_range(&process->raid_bdev->bdev, &g_raid_if,
-				       process->window_offset, process->max_window_size,
-				       raid_bdev_process_window_range_unlocked, process);
-	if (rc != 0) {
-		raid_bdev_process_window_range_unlocked(process, rc);
-	}
+	/* poweraid 用模块级 gate 代替框架 quiesce 做窗口同步，跳过 unquiesce。*/
+	raid_bdev_process_window_range_unlocked(process, 0);
 }
 
 static void
@@ -2876,6 +2932,11 @@ raid_bdev_process_channel_update(struct spdk_io_channel_iter *i)
 	struct raid_bdev_io_channel *raid_ch = spdk_io_channel_get_ctx(ch);
 
 	raid_ch->process.offset = process->window_offset + process->window_size;
+
+	if (process->raid_bdev->module->process_window_advanced != NULL) {
+		process->raid_bdev->module->process_window_advanced(process->raid_bdev, raid_ch,
+								    false, 0);
+	}
 
 	spdk_for_each_channel_continue(i, 0);
 }
@@ -3008,9 +3069,6 @@ raid_bdev_process_consume_token(struct raid_bdev_process *process)
 static bool
 raid_bdev_process_lock_window_range(struct raid_bdev_process *process)
 {
-	struct raid_bdev *raid_bdev = process->raid_bdev;
-	int rc;
-
 	assert(process->window_range_locked == false);
 
 	if (process->qos.enable_qos) {
@@ -3022,12 +3080,11 @@ raid_bdev_process_lock_window_range(struct raid_bdev_process *process)
 		}
 	}
 
-	rc = spdk_bdev_quiesce_range(&raid_bdev->bdev, &g_raid_if,
-				     process->window_offset, process->max_window_size,
-				     raid_bdev_process_window_range_locked, process);
-	if (rc != 0) {
-		raid_bdev_process_window_range_locked(process, rc);
-	}
+	/* poweraid 用模块级 gate（rebuild_gate_classify）代替框架 quiesce 做窗口同步：
+	 * gate 在 shadow channel 就绪后按 process_offset 拦截未越过窗口的写 IO（NOMEM
+	 * 重试），读路径不受影响。quiesce 会与 gate 死锁：gate NOMEM 的 IO 留在
+	 * io_submitted → quiesce drain 永不完成。直接调回调跳过 quiesce。*/
+	raid_bdev_process_window_range_locked(process, 0);
 	return true;
 }
 
@@ -3373,6 +3430,9 @@ raid_bdev_configure_base_bdev_cont(struct raid_base_bdev_info *base_info)
 		return;
 	} else if (base_info->is_process_target) {
 		raid_bdev->num_base_bdevs_operational++;
+		if (raid_bdev->module->base_bdev_rebuild_starting != NULL) {
+			raid_bdev->module->base_bdev_rebuild_starting(raid_bdev, base_info);
+		}
 		rc = raid_bdev_start_rebuild(base_info);
 		if (rc != 0) {
 			SPDK_ERRLOG("Failed to start rebuild: %s\n", spdk_strerror(-rc));
@@ -3615,9 +3675,10 @@ out:
 	return rc;
 }
 
-int
-raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
-			raid_bdev_action_cb cb_fn, void *cb_ctx)
+static int
+raid_bdev_add_base_bdev_internal(struct raid_bdev *raid_bdev, uint8_t req_slot,
+				 const char *name,
+				 raid_bdev_action_cb cb_fn, void *cb_ctx)
 {
 	struct raid_base_bdev_info *base_info = NULL, *iter;
 	int rc;
@@ -3631,7 +3692,20 @@ raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
 		return -EPERM;
 	}
 
-	if (raid_bdev->state == SPDK_BDEV_RAID_STATE_CONFIGURING) {
+	if (req_slot != UINT8_MAX) {
+		if (req_slot >= raid_bdev->num_base_bdevs) {
+			SPDK_ERRLOG("requested slot %u is out of range for raid bdev '%s'\n",
+				    req_slot, raid_bdev->bdev.name);
+			return -EINVAL;
+		}
+		base_info = &raid_bdev->base_bdev_info[req_slot];
+		if (base_info->name != NULL || !spdk_uuid_is_null(&base_info->uuid) ||
+		    base_info->desc != NULL) {
+			SPDK_ERRLOG("slot %u of raid bdev '%s' is not empty\n",
+				    req_slot, raid_bdev->bdev.name);
+			return -EINVAL;
+		}
+	} else if (raid_bdev->state == SPDK_BDEV_RAID_STATE_CONFIGURING) {
 		struct spdk_bdev *bdev = spdk_bdev_get_by_name(name);
 
 		if (bdev != NULL) {
@@ -3643,9 +3717,16 @@ raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
 				}
 			}
 		}
-	}
 
-	if (base_info == NULL || raid_bdev->state == SPDK_BDEV_RAID_STATE_ONLINE) {
+		if (base_info == NULL || raid_bdev->state == SPDK_BDEV_RAID_STATE_ONLINE) {
+			RAID_FOR_EACH_BASE_BDEV(raid_bdev, iter) {
+				if (iter->name == NULL && spdk_uuid_is_null(&iter->uuid)) {
+					base_info = iter;
+					break;
+				}
+			}
+		}
+	} else {
 		RAID_FOR_EACH_BASE_BDEV(raid_bdev, iter) {
 			if (iter->name == NULL && spdk_uuid_is_null(&iter->uuid)) {
 				base_info = iter;
@@ -3680,6 +3761,21 @@ raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
 	}
 
 	return rc;
+}
+
+int
+raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
+			raid_bdev_action_cb cb_fn, void *cb_ctx)
+{
+	return raid_bdev_add_base_bdev_internal(raid_bdev, UINT8_MAX, name, cb_fn, cb_ctx);
+}
+
+int
+raid_bdev_add_base_bdev_at_slot(struct raid_bdev *raid_bdev, uint8_t slot,
+				const char *name,
+				raid_bdev_action_cb cb_fn, void *cb_ctx)
+{
+	return raid_bdev_add_base_bdev_internal(raid_bdev, slot, name, cb_fn, cb_ctx);
 }
 
 static int

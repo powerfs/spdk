@@ -9,6 +9,7 @@ include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 DIRS-y = bdev_raid.c bdev_raid_sb.c concat.c raid1.c raid0.c
 
 DIRS-$(CONFIG_RAID5F) += raid5f.c
+DIRS-$(CONFIG_POWERAID_RAID5F) += poweraid_raid_common_mwl.c
 
 .PHONY: all clean $(DIRS-y)
 

@@ -57,6 +57,17 @@ int poweraid_raid_common_gf8_encode(uint32_t data_chunks,
 			       void *q_buf,
 			       uint64_t len);
 
+/* 常量乘（覆盖写）：dst[i] = constant × src[i]（GF(2^8)）
+ * 用于降级读 Q 单盘重建的末步（乘 α⁻ᵗ）。要求 gf8_init 已调用；
+ * 未初始化时回退标量实现。dst 与 src 可为不同缓冲。*/
+void poweraid_raid_common_gf8_mul_const(const void *src, uint8_t constant,
+				       void *dst, uint64_t len);
+
+/* 累加式常量乘：dst[i] ^= constant × src[i]（GF(2^8)）
+ * 用于 RMW 增量更新 Q。要求 gf8_init 已调用。*/
+void poweraid_raid_common_gf8_mul_const_xor(const void *src, uint8_t constant,
+					    void *dst, uint64_t len);
+
 /* 同步双盘解码：从 P + Q 恢复 2 个缺失的 data chunk
  *
  * 给定 data_chunks 个 data 位置（其中 2 个缺失），以及 P 和 Q，

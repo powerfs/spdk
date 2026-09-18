@@ -17,6 +17,8 @@
 #include "poweraid_raid5f.h"
 #include "../poweraid_raid_common/poweraid_raid_common_rmw.h"
 #include "../poweraid_raid_common/poweraid_raid_common_merge.h"
+#include "../poweraid_raid_common/poweraid_raid_common_rebuild.h"
+#include "../poweraid_raid_common/poweraid_raid_common_gf8.h"
 
 SPDK_LOG_REGISTER_COMPONENT(poweraid_raid5f)
 
@@ -105,6 +107,14 @@ poweraid_raid5f_calc_parity(struct poweraid_raid_common_req *req,
 	req->xor.cb = NULL;
 	cb(req, 0);
 }
+
+/* 前向声明 */
+static void
+poweraid_raid5f_read_strip(struct poweraid_raid_common_raid *raid,
+			   uint64_t stripe_id, uint32_t chunk_idx,
+			   uint32_t chunk_len_blocks,
+			   void (*cb)(int status, const void *buf, size_t len, void *cb_arg),
+			   void *cb_arg);
 
 /* ===== per-thread IO channel（参考 raid5f_ioch_create/destroy L997-1049）===== */
 
@@ -219,6 +229,13 @@ poweraid_raid_common_ioch_destroy(void *io_device, void *ctx_buf)
  * 5. 触发 RAID FSM EV_CREATE_DSC（→ sb_alloc → sb_init → OPEN_BDEVS → ... → ONLINE）。
  * 参考：raid5f.c raid5f_start（L1051-1101）。
  */
+
+static int poweraid_raid5f_recover_missing(struct poweraid_raid_common_raid *raid,
+		struct raid_bdev_io_channel *raid_ch,
+		uint64_t stripe_index, uint8_t target_phys,
+		void *out_buf, uint32_t strip_len,
+		void (*cb)(int status, void *cb_arg), void *cb_arg);
+
 int
 poweraid_raid5f_start(struct raid_bdev *raid_bdev)
 {
@@ -249,8 +266,11 @@ poweraid_raid5f_start(struct raid_bdev *raid_bdev)
 	raid->block_size = raid_bdev->bdev.blocklen;
 	raid->num_base_bdevs = raid_bdev->num_base_bdevs;
 	raid->delay_us = MERGE_DELAY_US_DEFAULT;  /* Stage 3c：默认 1ms，RPC 可改 */
-	/* 注册 5f 模块差异回调（CALC = XOR P-only）*/
+	raid->num_parity = 1;
+	/* 注册 5f 模块差异回调（CALC = XOR P-only，READ_STRIP = RAID5 布局）*/
 	raid->ops.calc_parity = poweraid_raid5f_calc_parity;
+	raid->ops.read_strip = poweraid_raid5f_read_strip;
+	raid->ops.recover_missing = poweraid_raid5f_recover_missing;
 	spdk_uuid_copy(&raid->uuid, &raid_bdev->bdev.uuid);
 	snprintf(raid->name, sizeof(raid->name), "%s", raid_bdev->bdev.name);
 
@@ -458,12 +478,12 @@ recovery_strip_read_io_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_a
 	free(rctx);
 }
 
-void
-poweraid_raid_common_recovery_read_strip(struct poweraid_raid_common_raid *raid,
-				    uint64_t stripe_id, uint32_t chunk_idx,
-				    uint32_t chunk_len_blocks,
-				    poweraid_raid_common_recovery_read_data_cb cb,
-				    void *cb_arg)
+static void
+poweraid_raid5f_read_strip(struct poweraid_raid_common_raid *raid,
+			   uint64_t stripe_id, uint32_t chunk_idx,
+			   uint32_t chunk_len_blocks,
+			   void (*cb)(int status, const void *buf, size_t len, void *cb_arg),
+			   void *cb_arg)
 {
 	struct poweraid_raid_common_bdev *bdev;
 	struct recovery_read_ctx *rctx;
@@ -551,6 +571,269 @@ poweraid_raid_common_submit_read_request(struct raid_bdev_io *raid_io)
 					 &io_opts);
 }
 
+/* ===== 重建引擎：RAID5 单缺 strip 恢复（目标槽可为 data 或 P）===== */
+
+struct poweraid_raid5f_recover_ctx {
+	struct poweraid_raid_common_raid		*raid;
+	struct raid_bdev_io_channel		*raid_ch;
+	uint64_t				stripe_index;
+	uint8_t					n;
+	uint8_t					p_idx;
+	uint8_t					q_idx;		/* RAID5: n（无效值，无 Q）*/
+	uint8_t					target_phys;
+	bool					target_is_parity;
+	uint8_t					target_data;
+	uint32_t				strip_bytes;
+	void					*out_buf;
+	void					**bufs;			/* phys 索引 */
+	uint32_t				remaining;
+	int					status;
+	void					(*cb)(int status, void *cb_arg);
+	void					*cb_arg;
+};
+
+struct poweraid_raid5f_recover_subio {
+	struct poweraid_raid5f_recover_ctx	*rctx;
+	uint8_t					phys;
+	struct spdk_bdev_io_wait_entry		wait_entry;
+};
+
+static void poweraid_raid5f_recover_finish(void *arg);
+
+static void
+poweraid_raid5f_recover_read_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct poweraid_raid5f_recover_subio *subio = cb_arg;
+	struct poweraid_raid5f_recover_ctx *rctx = subio->rctx;
+
+	spdk_bdev_free_io(bdev_io);
+	if (!success) {
+		SPDK_ERRLOG("poweraid_raid5f: rebuild strip read failed phys=%u "
+			    "stripe=%"PRIu64"\n", subio->phys, rctx->stripe_index);
+		rctx->status = -EIO;
+	}
+	free(subio);
+
+	assert(rctx->remaining > 0);
+	if (--rctx->remaining == 0) {
+		poweraid_raid5f_recover_finish(rctx);
+	}
+}
+
+static void
+poweraid_raid5f_recover_wait_cb(void *arg);
+
+static int
+poweraid_raid5f_recover_issue_strip(struct poweraid_raid5f_recover_ctx *rctx,
+				    uint8_t phys)
+{
+	struct poweraid_raid_common_raid *raid = rctx->raid;
+	struct raid_base_bdev_info *base_info = &raid->raid_bdev->base_bdev_info[phys];
+	struct spdk_io_channel *base_ch;
+	struct poweraid_raid5f_recover_subio *subio;
+	uint64_t offset;
+	int rc;
+
+	base_ch = raid_bdev_channel_get_base_channel(rctx->raid_ch, phys);
+	if (base_ch == NULL || base_info->desc == NULL) {
+		return -ENODEV;
+	}
+
+	rctx->bufs[phys] = spdk_dma_malloc(rctx->strip_bytes, 0x1000, NULL);
+	if (rctx->bufs[phys] == NULL) {
+		return -ENOMEM;
+	}
+
+	subio = calloc(1, sizeof(*subio));
+	if (subio == NULL) {
+		spdk_dma_free(rctx->bufs[phys]);
+		rctx->bufs[phys] = NULL;
+		return -ENOMEM;
+	}
+	subio->rctx = rctx;
+	subio->phys = phys;
+
+	offset = raid->data_offset_blocks + rctx->stripe_index * raid->strip_size;
+	rc = spdk_bdev_read_blocks(base_info->desc, base_ch, rctx->bufs[phys],
+				  offset, raid->strip_size,
+				  poweraid_raid5f_recover_read_cb, subio);
+	if (rc == -ENOMEM) {
+		subio->wait_entry.bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+		subio->wait_entry.cb_fn = (spdk_bdev_io_wait_cb)poweraid_raid5f_recover_wait_cb;
+		subio->wait_entry.cb_arg = subio;
+		spdk_bdev_queue_io_wait(subio->wait_entry.bdev, base_ch,
+					&subio->wait_entry);
+		return 0;
+	}
+	if (rc != 0) {
+		spdk_dma_free(rctx->bufs[phys]);
+		rctx->bufs[phys] = NULL;
+		free(subio);
+	}
+	return rc;
+}
+
+static void
+poweraid_raid5f_recover_wait_cb(void *arg)
+{
+	struct poweraid_raid5f_recover_subio *subio = arg;
+	struct poweraid_raid5f_recover_ctx *rctx = subio->rctx;
+	struct poweraid_raid_common_raid *raid = rctx->raid;
+	struct raid_base_bdev_info *base_info =
+		&raid->raid_bdev->base_bdev_info[subio->phys];
+	struct spdk_io_channel *base_ch;
+	int rc;
+
+	base_ch = raid_bdev_channel_get_base_channel(rctx->raid_ch, subio->phys);
+	rc = spdk_bdev_read_blocks(base_info->desc, base_ch, rctx->bufs[subio->phys],
+				   raid->data_offset_blocks +
+				   rctx->stripe_index * raid->strip_size,
+				   raid->strip_size,
+				   poweraid_raid5f_recover_read_cb, subio);
+	if (rc == -ENOMEM) {
+		subio->wait_entry.bdev = spdk_bdev_desc_get_bdev(base_info->desc);
+		subio->wait_entry.cb_fn = (spdk_bdev_io_wait_cb)poweraid_raid5f_recover_wait_cb;
+		subio->wait_entry.cb_arg = subio;
+		spdk_bdev_queue_io_wait(subio->wait_entry.bdev, base_ch,
+					&subio->wait_entry);
+		return;
+	}
+	if (rc != 0) {
+		spdk_dma_free(rctx->bufs[subio->phys]);
+		rctx->bufs[subio->phys] = NULL;
+		free(subio);
+		rctx->status = rc;
+		assert(rctx->remaining > 0);
+		if (--rctx->remaining == 0) {
+			poweraid_raid5f_recover_finish(rctx);
+		}
+	}
+}
+
+static void
+poweraid_raid5f_recover_finish(void *arg)
+{
+	struct poweraid_raid5f_recover_ctx *rctx = arg;
+	struct poweraid_raid_common_raid *raid = rctx->raid;
+	uint32_t data_chunks = raid->num_base_bdevs - raid->num_parity;
+	uint32_t len = rctx->strip_bytes;
+	uint8_t i;
+	int rc = rctx->status;
+	void (*cb)(int, void *) = rctx->cb;
+	void *cb_arg = rctx->cb_arg;
+
+	if (rc == 0) {
+		/* data 目标：D_t = P XOR 其他 data；P 目标：P = XOR 全部 data。
+		 * 统一从 0 缓冲开始 XOR，data 目标先并入 P。*/
+		memset(rctx->out_buf, 0, len);
+		if (!rctx->target_is_parity) {
+			poweraid_raid_common_gf8_mul_const_xor(
+				rctx->bufs[rctx->p_idx], 1, rctx->out_buf, len);
+		}
+		for (i = 0; i < data_chunks; i++) {
+			uint8_t phys;
+			if (!rctx->target_is_parity && i == rctx->target_data) {
+				continue;
+			}
+			phys = poweraid_raid_common_data_to_phys(i, rctx->p_idx,
+				      rctx->q_idx, rctx->n);
+			poweraid_raid_common_gf8_mul_const_xor(
+				rctx->bufs[phys], 1, rctx->out_buf, len);
+		}
+	}
+
+	for (i = 0; i < rctx->n; i++) {
+		if (rctx->bufs[i] != NULL) {
+			spdk_dma_free(rctx->bufs[i]);
+		}
+	}
+	free(rctx->bufs);
+	free(rctx);
+
+	cb(rc, cb_arg);
+}
+
+static int
+poweraid_raid5f_recover_missing(struct poweraid_raid_common_raid *raid,
+				struct raid_bdev_io_channel *raid_ch,
+				uint64_t stripe_index, uint8_t target_phys,
+				void *out_buf, uint32_t strip_len,
+				void (*cb)(int status, void *cb_arg),
+				void *cb_arg)
+{
+	struct poweraid_raid5f_recover_ctx *rctx;
+	uint32_t data_chunks = raid->num_base_bdevs - raid->num_parity;
+	uint8_t q_idx;
+	uint8_t d;
+	int rc;
+
+	if (target_phys >= raid->num_base_bdevs ||
+	    strip_len != raid->strip_size * raid->block_size) {
+		return -EINVAL;
+	}
+
+	rctx = calloc(1, sizeof(*rctx));
+	if (rctx == NULL) {
+		return -ENOMEM;
+	}
+	rctx->raid = raid;
+	rctx->raid_ch = raid_ch;
+	rctx->stripe_index = stripe_index;
+	rctx->n = raid->num_base_bdevs;
+	rctx->target_phys = target_phys;
+	rctx->strip_bytes = strip_len;
+	rctx->out_buf = out_buf;
+	rctx->cb = cb;
+	rctx->cb_arg = cb_arg;
+
+	poweraid_raid_common_get_parity_idx(raid, stripe_index, &rctx->p_idx, &q_idx);
+	rctx->q_idx = q_idx;
+	rctx->target_is_parity = (target_phys == rctx->p_idx);
+	if (!rctx->target_is_parity) {
+		rctx->target_data = poweraid_raid_common_phys_to_data(target_phys,
+					rctx->p_idx, q_idx);
+	}
+
+	rctx->bufs = calloc(rctx->n, sizeof(*rctx->bufs));
+	if (rctx->bufs == NULL) {
+		free(rctx);
+		return -ENOMEM;
+	}
+
+	SPDK_DEBUGLOG(poweraid_raid5f,
+		      "rebuild stripe=%"PRIu64" target=phys%u faults=1 method=%u\n",
+		      stripe_index, target_phys,
+		      rctx->target_is_parity ? 3 : 0);
+
+	if (!rctx->target_is_parity) {
+		rc = poweraid_raid5f_recover_issue_strip(rctx, rctx->p_idx);
+		if (rc == 0) {
+			rctx->remaining++;
+		} else {
+			rctx->status = rc;
+		}
+	}
+	for (d = 0; d < data_chunks; d++) {
+		uint8_t phys;
+		if (!rctx->target_is_parity && d == rctx->target_data) {
+			continue;
+		}
+		phys = poweraid_raid_common_data_to_phys(d, rctx->p_idx, rctx->q_idx,
+				      rctx->n);
+		rc = poweraid_raid5f_recover_issue_strip(rctx, phys);
+		if (rc == 0) {
+			rctx->remaining++;
+		} else {
+			rctx->status = rc;
+		}
+	}
+
+	if (rctx->remaining == 0) {
+		poweraid_raid5f_recover_finish(rctx);
+	}
+	return 0;
+}
+
 void
 poweraid_raid5f_submit_rw_request(struct raid_bdev_io *raid_io)
 {
@@ -611,29 +894,43 @@ poweraid_raid5f_submit_rw_request(struct raid_bdev_io *raid_io)
 		return;
 	}
 
-	ch = raid_bdev_channel_get_module_ctx(raid_io->raid_ch);
-	if (ch == NULL) {
-		SPDK_ERRLOG("poweraid_raid5f: no module channel\n");
-		raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
-		return;
-	}
+	/* 重建窗口门控：未越过窗口的全 stripe 写必须延迟到该 stripe 重构完成 */
+	{
+		struct raid_bdev_io_channel *eff_ch;
+		enum poweraid_raid_common_gate gate;
 
-	/* 从 free 池取一个 write stripe_request */
-	req = TAILQ_FIRST(&ch->free_write_stripe_requests);
-	if (req == NULL) {
-		SPDK_ERRLOG("poweraid_raid5f: no free stripe_request\n");
-		raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_NOMEM);
-		return;
-	}
-	TAILQ_REMOVE(&ch->free_write_stripe_requests, req, link);
+		gate = poweraid_raid_common_rebuild_gate_classify(raid,
+				raid_io->raid_ch, stripe_index, &eff_ch);
+		if (gate == POWERAID_RAID_COMMON_GATE_WAIT) {
+			raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_NOMEM);
+			return;
+		}
 
-	/* 填充 req */
-	req->type = POWERAID_RAID_COMMON_STRIPE_REQ_WRITE;
-	req->raid_io = raid_io;
-	req->stripe_index = stripe_index;
-	req->raid = raid;
-	/* req->io 用于 IO_COMPLETE 调 raid_bdev_io_complete */
-	req->io = raid_io;
+		ch = raid_bdev_channel_get_module_ctx(raid_io->raid_ch);
+		if (ch == NULL) {
+			SPDK_ERRLOG("poweraid_raid5f: no module channel\n");
+			raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
+
+		/* 从 free 池取一个 write stripe_request */
+		req = TAILQ_FIRST(&ch->free_write_stripe_requests);
+		if (req == NULL) {
+			SPDK_ERRLOG("poweraid_raid5f: no free stripe_request\n");
+			raid_bdev_io_complete(raid_io, SPDK_BDEV_IO_STATUS_NOMEM);
+			return;
+		}
+		TAILQ_REMOVE(&ch->free_write_stripe_requests, req, link);
+
+		/* 填充 req */
+		req->type = POWERAID_RAID_COMMON_STRIPE_REQ_WRITE;
+		req->raid_io = raid_io;
+		req->eff_raid_ch = eff_ch;
+		req->stripe_index = stripe_index;
+		req->raid = raid;
+		/* req->io 用于 IO_COMPLETE 调 raid_bdev_io_complete */
+		req->io = raid_io;
+	}
 
 	strip_size_bytes = raid->strip_size * blocklen;
 
@@ -709,8 +1006,7 @@ int
 poweraid_raid5f_submit_process_request(struct raid_bdev_process_request *process_req,
 				       struct raid_bdev_io_channel *raid_ch)
 {
-	/* TODO 阶段 3：rebuild/scrub process */
-	return 0;
+	return poweraid_raid_common_submit_process_request(process_req, raid_ch);
 }
 
 /* ===== FLUSH / UNMAP 处理（阶段 3b）=====
@@ -751,5 +1047,9 @@ struct raid_bdev_module g_poweraid_raid5f_module = {
 	.get_io_channel = poweraid_raid5f_get_io_channel,
 	.submit_process_request = poweraid_raid5f_submit_process_request,
 	.submit_null_payload_request = poweraid_raid5f_submit_null_payload_request,
+	.base_bdev_removed = poweraid_raid_common_hook_base_bdev_removed,
+	.base_bdev_rebuild_starting = poweraid_raid_common_hook_rebuild_starting,
+	.process_complete = poweraid_raid_common_hook_process_complete,
+	.process_window_advanced = poweraid_raid_common_hook_window_advanced,
 };
 RAID_MODULE_REGISTER(&g_poweraid_raid5f_module)

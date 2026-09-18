@@ -48,7 +48,10 @@ struct merge_pending_io {
 /* Per-stripe 合并条目 */
 struct merge_entry {
 	struct poweraid_raid_common_raid     *raid;
-	struct raid_bdev_io_channel     *raid_ch;      /* 框架 IO channel */
+	struct raid_bdev_io_channel     *raid_ch;      /* 框架 IO channel（原始）*/
+	/* 重建窗口门控后实际使用的 raid channel（窗口越过时为框架 shadow channel，
+	 * 与 raid_ch 共享 module channel；无进程时==raid_ch）。*/
+	struct raid_bdev_io_channel     *eff_raid_ch;
 	struct poweraid_raid_common_io_channel *mod_ch;     /* 模块 IO channel（free 池用）*/
 	struct merge_ctx               *mctx;          /* 回指，drain 检查用 */
 	uint64_t                         stripe_index;
@@ -110,6 +113,12 @@ int poweraid_raid_common_merge_submit(struct raid_bdev_io *raid_io);
  * 若有 inflight flush 则排队 flush IO，等 drain 后完成。
  */
 void poweraid_raid_common_merge_flush_all(struct raid_bdev_io *raid_io);
+
+/**
+ * 重建窗口推进回调：重放本 channel merge 层被门控延迟的条目。
+ * 条目内部重新做窗口分类，仍未越过窗口的继续留 pending（poller 也会重试）。
+ */
+void poweraid_raid_common_merge_replay_gated(struct poweraid_raid_common_io_channel *mod_ch);
 
 #ifdef __cplusplus
 }

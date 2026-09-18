@@ -18,6 +18,7 @@
 #include "poweraid_raid_common_sm.h"
 #include "poweraid_raid_common_sb.h"
 #include "poweraid_raid_common_ppl.h"
+#include "poweraid_raid_common_mwl.h"
 #include "poweraid_raid_common_recovery.h"
 
 #ifdef __cplusplus

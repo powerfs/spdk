@@ -181,12 +181,14 @@ gf8_mul_const_xor_ssse3(const uint8_t *src, uint8_t c, uint8_t *dst, uint64_t le
 		__m128i r_hi = _mm_shuffle_epi8(v_hi_lut, hi);
 		__m128i product = _mm_xor_si128(r_hi, r_lo);
 
-		/* 读取当前 dst 值，XOR 乘积，用 non-temporal store 写回 */
+		/* 读取当前 dst 值，XOR 乘积，用普通 store 写回
+		 * 注意：mul_const_xor 是 read-modify-write，不能用 non-temporal store，
+		 * 否则后续 load 可能读到 cache 中的过期数据。*/
 		__m128i d = _mm_loadu_si128((const __m128i *)(dst + i));
 		d = _mm_xor_si128(d, product);
-		_mm_stream_si128((__m128i *)(dst + i), d);
+		_mm_storeu_si128((__m128i *)(dst + i), d);
 	}
-	_mm_sfence();
+	/* scalar tail 不需要 sfence */
 
 	for (; i < len; i++) {
 		uint8_t byte = src[i];
@@ -298,17 +300,12 @@ gf8_mul_const_xor_avx2(const uint8_t *src, uint8_t c, uint8_t *dst, uint64_t len
 		__m256i r_hi = _mm256_shuffle_epi8(v_hi_lut, hi);
 		__m256i product = _mm256_xor_si256(r_hi, r_lo);
 
-		/* Non-temporal store: 256-bit stream 需要拆成两个 128-bit stream
-		 * （_mm256_stream_si256 对齐要求 32 字节，且不能保证所有 CPU 支持）。
-		 * 用 _mm_stream_si128 拆分写，确保 non-temporal 语义。*/
+		/* read-modify-write: 用普通 store，避免 non-temporal store
+		 * 导致后续 load 读到 cache 过期数据。*/
 		__m256i d = _mm256_loadu_si256((const __m256i *)(dst + i));
 		d = _mm256_xor_si256(d, product);
-		__m128i lo128 = _mm256_extracti128_si256(d, 0);
-		__m128i hi128 = _mm256_extracti128_si256(d, 1);
-		_mm_stream_si128((__m128i *)(dst + i), lo128);
-		_mm_stream_si128((__m128i *)(dst + i + 16), hi128);
+		_mm256_storeu_si256((__m256i *)(dst + i), d);
 	}
-	_mm_sfence();
 
 	/* 尾部 16 字节组 */
 	if (i + 16 <= len) {
@@ -319,10 +316,9 @@ gf8_mul_const_xor_avx2(const uint8_t *src, uint8_t c, uint8_t *dst, uint64_t len
 					  _mm_shuffle_epi8(v_lo_lut_128, lo));
 		__m128i d = _mm_loadu_si128((const __m128i *)(dst + i));
 		d = _mm_xor_si128(d, r);
-		_mm_stream_si128((__m128i *)(dst + i), d);
+		_mm_storeu_si128((__m128i *)(dst + i), d);
 		i += 16;
 	}
-	_mm_sfence();
 
 	for (; i < len; i++) {
 		uint8_t byte = src[i];

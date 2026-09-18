@@ -233,6 +233,30 @@ poweraid_raid_common_gf8_encode(uint32_t data_chunks,
 	return 0;
 }
 
+void
+poweraid_raid_common_gf8_mul_const(const void *src, uint8_t constant,
+				   void *dst, uint64_t len)
+{
+	if (g_mul_const == NULL) {
+		/* 未初始化：使用标量 fallback */
+		gf8_mul_const_scalar(src, constant, dst, len);
+		return;
+	}
+	g_mul_const(src, constant, dst, len);
+}
+
+void
+poweraid_raid_common_gf8_mul_const_xor(const void *src, uint8_t constant,
+				       void *dst, uint64_t len)
+{
+	if (g_mul_const_xor == NULL) {
+		/* 未初始化：使用标量 fallback（幂等）*/
+		gf8_mul_const_xor_scalar(src, constant, dst, len);
+		return;
+	}
+	g_mul_const_xor(src, constant, dst, len);
+}
+
 int
 poweraid_raid_common_gf8_decode_2(uint32_t data_chunks,
 			     const void * const *surviving_bufs,
@@ -248,7 +272,9 @@ poweraid_raid_common_gf8_decode_2(uint32_t data_chunks,
 	uint8_t *a_buf, *b_buf, *tmp;
 	uint8_t g_m0, g_m1, det, inv_det;
 
-	if (data_chunks < 3 || surviving_bufs == NULL || p_buf == NULL ||
+	/* 最少 2 个数据 chunk：当 k=2 且两块数据盘同时缺失时，
+	 * P、Q 恰好提供两个独立方程，2×2 方程组仍可解。*/
+	if (data_chunks < 2 || surviving_bufs == NULL || p_buf == NULL ||
 	    q_buf == NULL || out_buf0 == NULL || out_buf1 == NULL || len == 0) {
 		return -EINVAL;
 	}

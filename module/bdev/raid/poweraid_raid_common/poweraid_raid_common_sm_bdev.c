@@ -69,7 +69,9 @@ DEFINE_BDEV_HANDLER(check_dev_ready)
  * 阶段 2：sb_load 实际 IO 异步完成。
  *   - status==0 && loaded_ctx!=NULL：盘上有 RAID sb，存到 bdev->loaded_sb_ctx
  *     供 VALIDATE_MD 校验 ext_signature + ext_crc。
- *   - status!=0（-EINVAL 等）：盘上无 sb（新卷）或读失败 → 直接上线（新卷）。
+ *   - status==-ENODATA：空白/异族盘（无 SPDKRAID 签名）→ 新卷分支，直接上线。
+ *   - 其余负值（-EILSEQ 签名命中但 crc/版本损坏、-EIO 读失败）：元数据损坏，
+ *     置 FAULTED 拒绝装配——绝不能当成空白盘让全卷带残缺成员上线（TR-2.3）。
  *   loaded_ctx 仅在 status==0 时由调用方接管所有权（否则 sb_load 内部已 free）。
  */
 static void
@@ -96,11 +98,18 @@ bdev_try_read_md_sb_load_cb(int status,
 		bdev->loaded_sb_ctx = loaded_ctx;
 		poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_BDEV, bdev,
 					   POWERAID_BDEV_EV_VALIDATE_MD);
-	} else {
-		/* 无 MD（新卷）或加载失败 → 直接上线 */
+	} else if (status == -ENODATA) {
+		/* 空白/异族盘 → 新卷分支 */
 		assert(bdev->loaded_sb_ctx == NULL);
 		poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_BDEV, bdev,
 					   POWERAID_BDEV_EV_SET_ONLINE);
+	} else {
+		/* 元数据损坏/读失败：FAULTED，不触发 SET_ONLINE，RAID 汇聚门控
+		 * （set_online 全员 ONLINE 检查）保证卷不会上线。*/
+		assert(bdev->loaded_sb_ctx == NULL);
+		SPDK_ERRLOG("sb_load failed status=%d slot=%u: mark FAULTED\n",
+			    status, bdev->slot);
+		poweraid_raid_state_set(&bdev->state, POWERAID_BDEV_ST_FAULTED);
 	}
 }
 
@@ -125,7 +134,7 @@ poweraid_raid_common_sm_bdev_open(struct poweraid_raid_common_bdev *bdev,
 	 * 在 unregister_done 中释放）。spdk_bdev_read/write 不接受 NULL channel。*/
 	if (bdev->desc != NULL && bdev->ch == NULL) {
 		bdev->ch = spdk_bdev_get_io_channel(
-			spdk_bdev_desc_get_bdev((struct spdk_bdev_desc *)bdev->desc));
+			(struct spdk_bdev_desc *)bdev->desc);
 		if (bdev->ch == NULL) {
 			SPDK_ERRLOG("open: get_io_channel failed bdev=%p\n", bdev);
 			poweraid_raid_state_set(&bdev->state, POWERAID_BDEV_ST_FAULTED);
@@ -198,6 +207,20 @@ poweraid_raid_common_sm_bdev_validate_md(struct poweraid_raid_common_bdev *bdev,
 	if (memcmp(ext->ext_signature, POWERAID_RAID_COMMON_SB_V2_EXT_SIG,
 		   sizeof(ext->ext_signature)) != 0) {
 		SPDK_ERRLOG("validate_md: ext_signature mismatch bdev=%p\n", bdev);
+		poweraid_raid_common_sb_free_loaded(bdev->loaded_sb_ctx);
+		bdev->loaded_sb_ctx = NULL;
+		poweraid_raid_state_set(&bdev->state, POWERAID_BDEV_ST_FAULTED);
+		return;
+	}
+
+	/* MWL 卷（raid1f）：ext 必须携带合法日志区几何，否则拒绝装配而不是
+	 * 带着 0/残缺几何上线（MWL 层随后无法定位 ring）。*/
+	if ((ext->feature_flags & POWERAID_RAID_COMMON_SB_F_MWL) &&
+	    (ext->mwl_region_offset == 0 || ext->mwl_region_size == 0 ||
+	     ext->mwl_region_offset % v1->block_size != 0 ||
+	     ext->mwl_region_size % v1->block_size != 0)) {
+		SPDK_ERRLOG("validate_md: bad MWL geometry off=%"PRIu64" size=%"PRIu64
+			    " bdev=%p\n", ext->mwl_region_offset, ext->mwl_region_size, bdev);
 		poweraid_raid_common_sb_free_loaded(bdev->loaded_sb_ctx);
 		bdev->loaded_sb_ctx = NULL;
 		poweraid_raid_state_set(&bdev->state, POWERAID_BDEV_ST_FAULTED);

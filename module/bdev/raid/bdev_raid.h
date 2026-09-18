@@ -242,6 +242,14 @@ void raid_bdev_delete(struct raid_bdev *raid_bdev, bool clear_sb, raid_bdev_acti
 		      void *cb_ctx);
 int raid_bdev_add_base_bdev(struct raid_bdev *raid_bdev, const char *name,
 			    raid_bdev_action_cb cb_fn, void *cb_ctx);
+/*
+ * Add a base bdev into a specific empty slot. Used by modules that need to
+ * replace a named failed member when more than one slot is empty. The slot must
+ * currently be empty (no descriptor, no configured name/uuid).
+ */
+int raid_bdev_add_base_bdev_at_slot(struct raid_bdev *raid_bdev, uint8_t slot,
+				    const char *name,
+				    raid_bdev_action_cb cb_fn, void *cb_ctx);
 struct raid_bdev *raid_bdev_find_by_name(const char *name);
 enum spdk_bdev_raid_level raid_bdev_str_to_level(const char *str);
 const char *raid_bdev_level_to_str(enum spdk_bdev_raid_level level);
@@ -323,6 +331,38 @@ struct raid_bdev_module {
 	int (*submit_process_request)(struct raid_bdev_process_request *process_req,
 				      struct raid_bdev_io_channel *raid_ch);
 
+	/*
+	 * Optional. Called on the app thread after a base bdev has been removed while the
+	 * raid bdev stays online (within the redundancy constraint). Slot is the index of
+	 * the removed base bdev. Not called when the removal deconfigures the raid.
+	 */
+	void (*base_bdev_removed)(struct raid_bdev *raid_bdev, uint8_t slot);
+
+	/*
+	 * Optional. Called on the app thread when a newly configured base bdev is about to
+	 * become the target of a rebuild process.
+	 */
+	void (*base_bdev_rebuild_starting)(struct raid_bdev *raid_bdev,
+					   struct raid_base_bdev_info *target);
+
+	/*
+	 * Optional. Called on the app thread when a rebuild process has finished, after
+	 * raid_bdev->process has been cleared and IO channels adopted the target channel.
+	 * status 0 means the target is now a regular member; non-zero means it was removed.
+	 */
+	void (*process_complete)(struct raid_bdev *raid_bdev,
+				 struct raid_base_bdev_info *target, int status);
+
+	/*
+	 * Optional. Called on the raid IO channel's thread when a rebuild window has been
+	 * advanced past the channel (ended=false, status=0) or the process has finished
+	 * on this channel (ended=true). Used by modules whose IO path bypasses the framework
+	 * split logic to drain/retry private per-stripe queues gated on the rebuild window.
+	 */
+	void (*process_window_advanced)(struct raid_bdev *raid_bdev,
+					struct raid_bdev_io_channel *raid_ch,
+					bool ended, int status);
+
 	TAILQ_ENTRY(raid_bdev_module) link;
 };
 
@@ -346,6 +386,15 @@ void raid_bdev_io_complete(struct raid_bdev_io *raid_io, enum spdk_bdev_io_statu
 void raid_bdev_module_stop_done(struct raid_bdev *raid_bdev);
 struct spdk_io_channel *raid_bdev_channel_get_base_channel(struct raid_bdev_io_channel *raid_ch,
 		uint8_t idx);
+/*
+ * Background process accessors for modules whose IO path bypasses the framework
+ * split logic. Returns the shadow channel routing the process target slot to the
+ * target IO channel (NULL when no process is active on this channel), and the
+ * processed window boundary in RAID bdev blocks (UINT64_MAX when not valid).
+ */
+struct raid_bdev_io_channel *raid_bdev_channel_get_processed_channel(
+		struct raid_bdev_io_channel *raid_ch);
+uint64_t raid_bdev_channel_get_process_offset(struct raid_bdev_io_channel *raid_ch);
 void *raid_bdev_channel_get_module_ctx(struct raid_bdev_io_channel *raid_ch);
 struct raid_base_bdev_info *raid_bdev_channel_get_base_info(struct raid_bdev_io_channel *raid_ch,
 		struct spdk_bdev *base_bdev);

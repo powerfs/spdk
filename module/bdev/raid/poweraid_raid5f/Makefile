@@ -27,6 +27,7 @@ C_SRCS = $(COMMON_DIR)/poweraid_raid_common_sm_dispatch.c \
 	 $(COMMON_DIR)/poweraid_raid_common_recovery.c \
 	 $(COMMON_DIR)/poweraid_raid_common_rmw.c \
 	 $(COMMON_DIR)/poweraid_raid_common_merge.c \
+	 $(COMMON_DIR)/poweraid_raid_common_rebuild.c \
 	 $(COMMON_DIR)/poweraid_raid_common_rpc.c \
 	 $(COMMON_DIR)/poweraid_raid_common_gf8.c
 

@@ -209,6 +209,24 @@ typedef void (*poweraid_raid_calc_cb_t)(struct poweraid_raid_common_req *req, in
 struct poweraid_raid_common_ops {
 	void (*calc_parity)(struct poweraid_raid_common_req *req,
 			    poweraid_raid_calc_cb_t cb);
+	/* 按模块布局读指定 stripe 的某个 data chunk（整 strip）。
+	 * 5f/6f 各自注册，供 recovery / parity_fixup 使用。
+	 * data_cb 签名与 poweraid_raid_common_recovery_read_data_cb 一致。*/
+	void (*read_strip)(struct poweraid_raid_common_raid *raid,
+			   uint64_t stripe_id, uint32_t chunk_idx,
+			   uint32_t chunk_len_blocks,
+			   void (*data_cb)(int status, const void *buf, size_t len, void *cb_arg),
+			   void *cb_arg);
+
+	/* 重建引擎：重构 stripe 中 target_phys 槽位的整条 strip 到 out_buf
+	 * （DMA、长度 strip_size*block_size）。RAID6 允许另一成员盘同时故障。
+	 * 异步 cb(status)；返回 0 已接受，<0 立即失败。*/
+	int (*recover_missing)(struct poweraid_raid_common_raid *raid,
+			       struct raid_bdev_io_channel *raid_ch,
+			       uint64_t stripe_index, uint8_t target_phys,
+			       void *out_buf, uint32_t strip_len,
+			       void (*cb)(int status, void *cb_arg),
+			       void *cb_arg);
 };
 
 /* ===== FSM 对象（最小骨架）===== */
@@ -223,6 +241,7 @@ struct poweraid_raid_common_raid {
 	/* 数据区起始块（跳过 LBA0 sb 与 PPL 区，按 strip 对齐）*/
 	uint64_t data_offset_blocks;
 	uint8_t num_base_bdevs;
+	uint8_t num_parity;          /* 1=RAID5, 2=RAID6 */
 	struct poweraid_raid_common_bdev **base_bdevs;  /* num_base_bdevs 个 */
 	/* superblock v2 上下文，由 poweraid_raid_common_sb.c 内部管理，
 	 * 对外 opaque；NULL 表示尚未分配。 */
@@ -247,7 +266,9 @@ struct poweraid_raid_common_bdev {
 	void *ch;               /* struct spdk_io_channel*；OPEN 阶段填充，sb_write/sb_load 用 */
 	void *loaded_sb_ctx;    /* struct poweraid_raid_common_sb_ctx*；sb_load 回调持有至 VALIDATE_MD 完成，SET_ONLINE 释放 */
 	void *ppl_ctx;          /* struct poweraid_raid_common_ppl_ctx*；VALIDATE_MD/建卷初始化分配，OFFLINE 释放 */
+	void *mwl_ctx;          /* struct poweraid_raid_common_mwl_ctx*；raid1f VALIDATE_MD/建卷初始化分配，OFFLINE 释放 */
 	bool md_present;        /* sb_load 是否在盘上读到有效 sb（区分新卷/既有卷）*/
+	bool format_done;       /* 换盘：新盘 sb+PPL 异步格式化完成（重建完成状态收敛条件）*/
 };
 
 /* stripe_request 类型（req 同时充当 stripe_request，复用池化管理）*/
@@ -266,6 +287,10 @@ struct poweraid_raid_common_req {
 	enum poweraid_raid_common_stripe_type type;
 	struct poweraid_raid_common_io_channel *ch;  /* 所属 io channel 回指 */
 	struct raid_bdev_io *raid_io;           /* 关联的 raid_bdev_io */
+	/* 成员盘 channel 查询使用的 raid channel。重建窗口已越过本 stripe 时
+	 * 指向框架 shadow channel（目标槽位路由到 target_ch）；否则==raid_io->raid_ch。
+	 * 由提交点（shell 直写 / merge 全 stripe）在门控分类后填充。*/
+	struct raid_bdev_io_channel *eff_raid_ch;
 	uint64_t stripe_index;                  /* stripe 序号 */
 	/* XOR 计算参数（CALC 用），由写路径填充；src_bufs 不由 req 拥有。
 	 * parity_buf 为目标 parity 缓冲；src_bufs 为数据 chunk 缓冲指针数组。
@@ -285,7 +310,9 @@ struct poweraid_raid_common_req {
 	uint32_t base_bdev_io_remaining; /* 未完成 base bdev IO 计数 */
 	int      base_bdev_io_status;    /* 聚合状态（0 成功，<0 失败）*/
 	void    *data_buf;               /* owned 全 stripe 数据缓冲（spdk_dma_malloc）*/
-	void    *parity_buf_alloc;       /* owned parity 缓冲（区别于 xor 期借用 parity_buf）*/
+	void    *parity_buf_alloc;       /* owned P parity 缓冲（区别于 xor 期借用 parity_buf）*/
+	void    *q_buf;                  /* Q parity 目标缓冲（RAID6 用，RAID5 为 NULL）*/
+	void    *q_buf_alloc;            /* owned Q parity 缓冲（RAID6 用）*/
 	TAILQ_ENTRY(poweraid_raid_common_req) link;  /* free 池 / xor_retry_queue 链接 */
 };
 
@@ -318,10 +345,13 @@ struct poweraid_raid_common_io_channel {
 	/* data_buf / parity_buf 预分配池（性能优化：避免 per-IO malloc）*/
 	TAILQ_HEAD(, poweraid_raid_common_buf) free_data_bufs;
 	TAILQ_HEAD(, poweraid_raid_common_buf) free_parity_bufs;
+	TAILQ_HEAD(, poweraid_raid_common_buf) free_q_bufs;   /* RAID6 Q 缓冲池 */
 	uint32_t data_buf_size;    /* 完整 stripe 字节数 = strip_size * (n-1) * block_size */
 	uint32_t parity_buf_size;  /* strip 字节数 = strip_size * block_size */
+	uint32_t q_buf_size;       /* Q 缓冲字节数 = strip_size * block_size（RAID6）*/
 	uint32_t n_data_bufs;      /* 当前池中 data_buf 数量 */
 	uint32_t n_parity_bufs;    /* 当前池中 parity_buf 数量 */
+	uint32_t n_q_bufs;         /* 当前池中 q_buf 数量 */
 
 	/* 合并层上下文（阶段 3b）*/
 	struct merge_ctx merge_ctx;
@@ -343,14 +373,30 @@ extern poweraid_raid_common_req_handler_t poweraid_raid_common_req_fsm[];
 /* ===== 缓冲池 API（data_buf / parity_buf 预分配，per-channel 无锁）===== */
 void *poweraid_raid_common_get_data_buf(struct poweraid_raid_common_io_channel *ch);
 void *poweraid_raid_common_get_parity_buf(struct poweraid_raid_common_io_channel *ch);
+void *poweraid_raid_common_get_q_buf(struct poweraid_raid_common_io_channel *ch);
 void  poweraid_raid_common_put_data_buf(struct poweraid_raid_common_io_channel *ch, void *buf);
 void  poweraid_raid_common_put_parity_buf(struct poweraid_raid_common_io_channel *ch, void *buf);
+void  poweraid_raid_common_put_q_buf(struct poweraid_raid_common_io_channel *ch, void *buf);
 int   poweraid_raid_common_buf_pool_init(struct poweraid_raid_common_io_channel *ch,
 				    struct poweraid_raid_common_raid *raid);
 void  poweraid_raid_common_buf_pool_destroy(struct poweraid_raid_common_io_channel *ch);
 
 /* 同步 XOR fallback（供 5f/6f calc_parity 实现调用）*/
 void poweraid_raid_common_req_xor_sync(struct poweraid_raid_common_req *req);
+
+/* ===== 布局 helper（left-symmetric，5f/6f 通用）=====
+ * get_parity_idx: 计算 stripe 的 P/Q 物理位置。
+ *   RAID5(num_parity=1): q_idx 设为 num_base_bdevs（无效值）。
+ *   RAID6(num_parity=2): q_idx 有效。
+ * data_to_phys: data chunk index → physical bdev index。
+ * phys_to_data: physical bdev index → data chunk index（非 parity 位置）。
+ */
+void poweraid_raid_common_get_parity_idx(struct poweraid_raid_common_raid *raid,
+					  uint64_t stripe_index,
+					  uint8_t *p_idx, uint8_t *q_idx);
+uint8_t poweraid_raid_common_data_to_phys(uint8_t data_idx, uint8_t p_idx,
+					   uint8_t q_idx, uint8_t num_base_bdevs);
+uint8_t poweraid_raid_common_phys_to_data(uint8_t phys, uint8_t p_idx, uint8_t q_idx);
 
 /* ===== 状态位原子操作 ===== */
 static inline bool
