@@ -87,16 +87,17 @@ DEFINE_RAID_HANDLER(unregister_bdev)
  * 状态转换 + 调用 sb_ctx API；异步操作通过回调触发下一个 event。
  */
 
-/* CREATE_DSC：创建描述符，分配并初始化 superblock v2 上下文。
- * 流程：sb_alloc → sb_init → 置 CONFIG_DIRTY → 触发 OPEN_BDEVS。
- * 参考：XISRC xnr_create_dsc + raid5f_start 的 r5f_info 分配（L1061-1095）。
+/* CREATE_DSC：建立 sb 生命周期上下文。
+ * 方向 B（issue #11）：公共 sb（256B 头 + N*64B 成员表）唯一由框架持有；
+ * poweraid 只在重装配分支建立组合镜像（[公共段][256B ext]）。
+ *   - raid_bdev->sb != NULL：框架已从盘上回放（create_from_sb，含保留的 ext），
+ *     调用 sb_priv_adopt 接管 ext；
+ *   - 否则为新卷：ext 在框架首次委托写时惰性组合（见 sb_hook_write）。
  */
 void
 poweraid_raid_common_sm_raid_create_dsc(struct poweraid_raid_common_raid *raid,
 				   enum poweraid_raid_common_raid_event event)
 {
-	int rc;
-
 	SPDK_DEBUGLOG(raid5f_sm_raid, "create_dsc: raid=%p state=0x%" PRIx64
 		      " event=%u\n", raid, raid ? raid->state : 0ULL, (uint32_t)event);
 	(void)event;
@@ -106,29 +107,18 @@ poweraid_raid_common_sm_raid_create_dsc(struct poweraid_raid_common_raid *raid,
 		return;
 	}
 
-	/* 分配 superblock v2 上下文（v1 + base_bdevs + ext 区）*/
-	rc = poweraid_raid_common_sb_alloc(raid, raid->block_size, raid->num_base_bdevs);
-	if (rc != 0) {
-		SPDK_ERRLOG("create_dsc: sb_alloc failed rc=%d (raid=%p)\n", rc, raid);
-		return;
-	}
+	if (raid->raid_bdev != NULL && raid->raid_bdev->sb != NULL) {
+		int rc = poweraid_raid_common_sb_priv_adopt(raid);
 
-	/* 初始化 superblock 字段（v2 版本号、ext_signature、CRC 双区）。
-	 * 特性位按级别选择：raid1f 写 MWL 意图日志，5f/6f 写 PPL。*/
-	{
-		uint32_t feature_flags;
-
-		if (raid->level == SPDK_BDEV_RAID_LEVEL_RAID1F) {
-			feature_flags = POWERAID_RAID_COMMON_SB_F_MWL;
-		} else {
-			feature_flags = POWERAID_RAID_COMMON_SB_F_PPL;
+		if (rc != 0) {
+			SPDK_ERRLOG("create_dsc: sb_priv_adopt failed rc=%d (raid=%p)\n",
+				    rc, raid);
+			return;
 		}
-		poweraid_raid_common_sb_init(raid, raid->level, raid->strip_size,
-					    feature_flags);
+	} else {
+		/* 新卷：标记配置待持久化；ext 在框架 configure 写 sb 时惰性建立。 */
+		poweraid_raid_state_set(&raid->state, POWERAID_RAID_ST_CONFIG_DIRTY);
 	}
-
-	/* 标记配置待持久化（阶段 2 由 EV_SAVE_CONFIG 落盘）*/
-	poweraid_raid_state_set(&raid->state, POWERAID_RAID_ST_CONFIG_DIRTY);
 
 	/* 触发下一事件：打开所有 base bdev */
 	poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_RAID, raid,
@@ -604,15 +594,16 @@ fresh_ppl_init_cb(int status, void *cb_arg)
 	fresh_ppl_step(op);
 }
 
-/* sb_write 完成回调：开始逐盘 PPL 初始化。*/
+/* 框架委托 sb 写盘完成回调（一次性，由 sb_hook_write 的 trampoline 派发）：
+ * 新卷公共段 + ext 已随框架唯一写者落盘，开始逐盘 PPL 初始化。*/
 static void
-fresh_sb_write_cb(int status, void *cb_arg)
+fresh_persist_done(int status, void *cb_arg)
 {
 	struct poweraid_raid_common_raid *raid = cb_arg;
 	struct fresh_ppl_op *op;
 
 	if (status != 0) {
-		SPDK_ERRLOG("fresh_init: sb_write failed (%d) raid=%s\n",
+		SPDK_ERRLOG("fresh_init: sb persist failed (%d) raid=%s\n",
 			    status, raid->name);
 		/* 仍继续上线（无 PPL 保护降级），避免卷悬挂 */
 	}
@@ -637,7 +628,9 @@ fresh_sb_write_cb(int status, void *cb_arg)
 }
 
 /* ONLINE：所有 base bdev 就绪后的汇聚点。
- * - 全部盘无 sb（新卷）：sb_write 落盘 → 逐盘 ppl_init → 置 ONLINE → recovery。
+ * 方向 B（issue #11）：框架是唯一 sb 写者——其 configure 流程在 start()
+ * 返回后委托 sb_hook_write 落盘。
+ * - 新卷：注册一次性持久化回调，等框架写盘完成回调再逐盘 ppl_init；
  * - 既有卷（VALIDATE_MD 已按 ext 分配 ppl_ctx）：直接置 ONLINE → recovery。
  */
 void
@@ -666,10 +659,13 @@ poweraid_raid_common_sm_raid_online(struct poweraid_raid_common_raid *raid,
 	}
 
 	if (all_fresh) {
-		SPDK_NOTICELOG("online: fresh volume, writing sb + init PPL raid=%s\n",
+		SPDK_NOTICELOG("online: fresh volume, awaiting framework sb persist raid=%s\n",
 			       raid->name);
-		poweraid_raid_common_sb_write(raid, fresh_sb_write_cb, raid);
-		return;  /* raid_enter_online 由异步回调触发 */
+		/* 框架 configure 的委托写在 start() 返回后发起；此处注册的回调由
+		 * sb_hook_write 完成路径派发一次。 */
+		raid->sb_persist_done_cb = fresh_persist_done;
+		raid->sb_persist_done_arg = raid;
+		return;  /* raid_enter_online 由持久化回调触发 */
 	}
 
 	raid_enter_online(raid);

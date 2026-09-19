@@ -29,6 +29,9 @@ struct raid_bdev_read_sb_ctx {
 	void *cb_ctx;
 	void *buf;
 	uint32_t buf_size;
+	/* Target read size requested by a module-private superblock hook
+	 * (common length + private tail). 0 means use sb->length. */
+	uint32_t needed_size;
 };
 
 int
@@ -127,7 +130,7 @@ raid_bdev_alloc_sb_io_buf(struct raid_bdev *raid_bdev)
 	return 0;
 }
 
-static void
+void
 raid_bdev_sb_update_crc(struct raid_bdev_superblock *sb)
 {
 	sb->crc = 0;
@@ -156,7 +159,9 @@ raid_bdev_parse_superblock(struct raid_bdev_read_sb_ctx *ctx)
 
 	if (memcmp(sb->signature, RAID_BDEV_SB_SIG, sizeof(sb->signature))) {
 		SPDK_DEBUGLOG(bdev_raid_sb, "invalid signature\n");
-		return -EINVAL;
+		/* No SPDKRAID signature: blank or foreign disk. Distinguished from
+		 * -EINVAL/-EILSEQ so callers may treat it as a safe fresh claim. */
+		return -ENODATA;
 	}
 
 	if (spdk_divide_round_up(sb->length, spdk_bdev_get_data_block_size(bdev)) >
@@ -176,6 +181,30 @@ raid_bdev_parse_superblock(struct raid_bdev_read_sb_ctx *ctx)
 	}
 
 	if (sb->version.major != RAID_BDEV_SB_VERSION_MAJOR) {
+		struct raid_bdev_module *module = raid_bdev_module_find(sb->level);
+		int hook_rc;
+
+		if (module != NULL && module->sb_private &&
+		    module->sb_validate_disk != NULL && module->sb_total_size != NULL) {
+			hook_rc = module->sb_validate_disk(ctx->buf, ctx->buf_size);
+			if (hook_rc == 0) {
+				uint32_t total = module->sb_total_size(sb);
+
+				if (total > RAID_BDEV_SB_MAX_LENGTH) {
+					SPDK_ERRLOG("Module superblock size %u on bdev %s exceeds max %lu\n",
+					    total, spdk_bdev_get_name(bdev),
+					    (unsigned long)RAID_BDEV_SB_MAX_LENGTH);
+					return -EINVAL;
+				}
+				if (ctx->buf_size < total) {
+					ctx->needed_size = total;
+					return -EAGAIN;
+				}
+				return 0;
+			}
+			return hook_rc;
+		}
+
 		SPDK_ERRLOG("Not supported superblock major version %d on bdev %s\n",
 			    sb->version.major, spdk_bdev_get_name(bdev));
 		return -EINVAL;
@@ -214,11 +243,14 @@ raid_bdev_read_sb_remainder(struct raid_bdev_read_sb_ctx *ctx)
 	struct raid_bdev_superblock *sb = ctx->buf;
 	struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(ctx->desc);
 	uint32_t buf_size_prev;
+	uint32_t target_size;
 	void *buf;
 	int rc;
 
 	buf_size_prev = ctx->buf_size;
-	ctx->buf_size = spdk_divide_round_up(spdk_min(sb->length, RAID_BDEV_SB_MAX_LENGTH),
+	target_size = ctx->needed_size != 0 ? ctx->needed_size :
+		      spdk_min(sb->length, RAID_BDEV_SB_MAX_LENGTH);
+	ctx->buf_size = spdk_divide_round_up(target_size,
 					     spdk_bdev_get_data_block_size(bdev)) * bdev->blocklen;
 	buf = spdk_dma_realloc(ctx->buf, ctx->buf_size, spdk_bdev_get_buf_align(bdev), NULL);
 	if (buf == NULL) {

@@ -580,7 +580,6 @@ poweraid_raid1f_start(struct raid_bdev *raid_bdev)
 	struct poweraid_raid_common_raid *raid;
 	struct raid_base_bdev_info *base_info;
 	uint64_t min_blockcnt = UINT64_MAX;
-	uint64_t reserve;
 	int rc;
 
 	SPDK_NOTICELOG("raid1f: start raid=%s num_base_bdevs=%u\n",
@@ -598,29 +597,29 @@ poweraid_raid1f_start(struct raid_bdev *raid_bdev)
 		return -ENOMEM;
 	}
 
-	/* 元数据保留区：LBA0 sb + [1MiB,5MiB) MWL 区，数据区从 5MiB 起
-	 * （4K 块下 = 1280 块），与 5f/6f 的 PPL 几何同构。superblock=false
-	 * 路径下框架不管理 data_offset，由模块在 base_info 上设置，
-	 * raid_bdev_{read,write}v_blocks_ext 会自动叠加该偏移。*/
-	reserve = (POWERAID_RAID_COMMON_MWL_REGION_OFFSET +
-		   POWERAID_RAID_COMMON_MWL_REGION_SIZE) / raid->block_size;
-	raid->data_offset_blocks = reserve;
+	/* C7：data_offset 单轨。元数据保留区为 LBA0 sb + [1MiB,5MiB) MWL 区
+	 * （4K 块下 = 1280 块），与 5f/6f 的 PPL 几何同构。新卷框架按 1MiB
+	 * 预填，此处统一为 5MiB 口径后再由框架写入成员表；重装配卷
+	 * （raid_bdev->sb != NULL）保留盘上成员表回放值。 */
+	poweraid_raid_common_sb_unify_data_offset(raid_bdev);
 
 	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
 		struct spdk_bdev *base_bdev = spdk_bdev_desc_get_bdev(base_info->desc);
-		uint64_t data_size;
 
-		if (base_bdev->blockcnt <= reserve) {
-			SPDK_ERRLOG("raid1f: base bdev %s too small (%"PRIu64
-				    " <= reserve %"PRIu64")\n",
-				    base_bdev->name, base_bdev->blockcnt, reserve);
+		if (base_info->data_offset == 0 || base_info->data_size == 0 ||
+		    base_bdev->blockcnt <= base_info->data_offset) {
+			SPDK_ERRLOG("raid1f: base bdev %s invalid geometry "
+				    "(offset=%"PRIu64" size=%"PRIu64
+				    " blockcnt=%"PRIu64")\n",
+				    base_bdev->name, base_info->data_offset,
+				    base_info->data_size, base_bdev->blockcnt);
 			rc = -EINVAL;
 			goto err_free;
 		}
-		data_size = base_bdev->blockcnt - reserve;
-		base_info->data_offset = reserve;
-		base_info->data_size = data_size;
-		min_blockcnt = spdk_min(min_blockcnt, data_size);
+		if (raid->data_offset_blocks == 0) {
+			raid->data_offset_blocks = base_info->data_offset;
+		}
+		min_blockcnt = spdk_min(min_blockcnt, base_info->data_size);
 	}
 
 	raid->raid_size = min_blockcnt;
@@ -796,6 +795,11 @@ static struct raid_bdev_module g_poweraid_raid1f_module = {
 	.get_io_channel = poweraid_raid1f_get_io_channel,
 	.submit_process_request = poweraid_raid1f_submit_process_request,
 	.resize = poweraid_raid1f_resize,
+	.sb_private = true,
+	.sb_validate_disk = poweraid_raid_common_sb_hook_validate,
+	.sb_total_size = poweraid_raid_common_sb_hook_total_size,
+	.sb_write = poweraid_raid_common_sb_hook_write,
+	.sb_clear = poweraid_raid_common_sb_hook_clear,
 };
 RAID_MODULE_REGISTER(&g_poweraid_raid1f_module)
 

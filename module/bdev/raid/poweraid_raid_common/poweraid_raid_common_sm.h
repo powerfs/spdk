@@ -15,6 +15,7 @@
 #include "spdk/uuid.h"
 
 #include "poweraid_raid_common_merge.h"
+#include "poweraid_raid_common_sb.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -246,6 +247,10 @@ struct poweraid_raid_common_raid {
 	/* superblock v2 上下文，由 poweraid_raid_common_sb.c 内部管理，
 	 * 对外 opaque；NULL 表示尚未分配。 */
 	void *sb_ctx;
+	/* 框架委托 sb 写盘完成后的一次性 FSM 回调（新卷 ONLINE 等待持久化时注册，
+	 * 触发 PPL/MWL 初始化；方向 B 修复后框架是唯一写盘者）。*/
+	poweraid_raid_common_sb_write_cb sb_persist_done_cb;
+	void *sb_persist_done_arg;
 	/* 合并层延迟（Stage 3c 可配置；0 = merge OFF，submit 即 flush）。
 	 * start() 置默认值 MERGE_DELAY_US_DEFAULT，RPC bdev_poweraid_raid_common_set_merge_delay
 	 * 运行时修改，ioch_create 时复制到各 channel 的 merge_ctx。 */

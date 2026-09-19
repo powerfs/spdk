@@ -260,6 +260,13 @@ int raid_bdev_remove_base_bdev(struct spdk_bdev *base_bdev, raid_bdev_action_cb 
 			       void *cb_ctx);
 
 /*
+ * Callback of the module-private superblock write/clear operations.
+ * Same contract as raid_bdev_write_superblock()/raid_bdev_clear_superblock().
+ */
+struct raid_bdev_superblock;
+typedef void (*raid_bdev_write_sb_cb)(int status, struct raid_bdev *raid_bdev, void *ctx);
+
+/*
  * RAID module descriptor
  */
 struct raid_bdev_module {
@@ -363,10 +370,46 @@ struct raid_bdev_module {
 					struct raid_bdev_io_channel *raid_ch,
 					bool ended, int status);
 
+	/*
+	 * Module-private superblock ownership. When sb_private is false (the
+	 * default) the framework handles the superblock bytes as before and all
+	 * the hooks below are ignored. When true, the framework delegates sb
+	 * validation, disk sizing, serialization and clearing to the module.
+	 */
+	bool sb_private;
+
+	/*
+	 * Called during disk examination when the common superblock signature
+	 * and CRC are valid but the major version is not recognized by the
+	 * framework. buf/buf_size contain the raw bytes read from LBA 0 (the
+	 * common part is guaranteed to be fully present, the private tail may
+	 * not be yet).
+	 *
+	 * Returns:
+	 *    0        the module recognizes and validates the disk image;
+	 *  -ENODATA   not a disk owned by this module (framework may claim it
+	 *             as a fresh/blank disk);
+	 *  -EILSEQ    disk belongs to this module but is corrupted/unsupported
+	 *             (framework must fail, never overwrite it as fresh).
+	 */
+	int (*sb_validate_disk)(const void *buf, uint32_t buf_size);
+
+	/*
+	 * Total on-disk superblock size in bytes (common length + module
+	 * private tail). Drives the framework's -EAGAIN remainder read.
+	 */
+	uint32_t (*sb_total_size)(const struct raid_bdev_superblock *sb);
+
+	/* Serialize/clear the superblock; same callback contract as the
+	 * framework raid_bdev_write_superblock()/raid_bdev_clear_superblock(). */
+	void (*sb_write)(struct raid_bdev *raid_bdev, raid_bdev_write_sb_cb cb, void *cb_ctx);
+	void (*sb_clear)(struct raid_bdev *raid_bdev, raid_bdev_write_sb_cb cb, void *cb_ctx);
+
 	TAILQ_ENTRY(raid_bdev_module) link;
 };
 
 void raid_bdev_module_list_add(struct raid_bdev_module *raid_module);
+struct raid_bdev_module *raid_bdev_module_find(enum spdk_bdev_raid_level level);
 
 #define __RAID_MODULE_REGISTER(line) __RAID_MODULE_REGISTER_(line)
 #define __RAID_MODULE_REGISTER_(line) raid_module_register_##line
@@ -568,12 +611,12 @@ SPDK_STATIC_ASSERT(sizeof(struct raid_bdev_superblock) == 256, "incorrect size")
 SPDK_STATIC_ASSERT(RAID_BDEV_SB_MAX_LENGTH < RAID_BDEV_MIN_DATA_OFFSET_SIZE,
 		   "Incorrect min data offset");
 
-typedef void (*raid_bdev_write_sb_cb)(int status, struct raid_bdev *raid_bdev, void *ctx);
 typedef void (*raid_bdev_load_sb_cb)(const struct raid_bdev_superblock *sb, int status, void *ctx);
 
 int raid_bdev_alloc_superblock(struct raid_bdev *raid_bdev, uint32_t block_size);
 void raid_bdev_free_superblock(struct raid_bdev *raid_bdev);
 void raid_bdev_init_superblock(struct raid_bdev *raid_bdev);
+void raid_bdev_sb_update_crc(struct raid_bdev_superblock *sb);
 void raid_bdev_write_superblock(struct raid_bdev *raid_bdev, raid_bdev_write_sb_cb cb,
 				void *cb_ctx);
 void raid_bdev_clear_superblock(struct raid_bdev *raid_bdev, raid_bdev_write_sb_cb cb,

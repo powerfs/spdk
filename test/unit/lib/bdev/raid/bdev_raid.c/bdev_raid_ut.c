@@ -227,6 +227,12 @@ raid_bdev_clear_superblock(struct raid_bdev *raid_bdev, raid_bdev_write_sb_cb cb
 	cb(0, raid_bdev, cb_ctx);
 }
 
+/* C3：sb_write 委托路径在框架侧推进公共 CRC；UT 不含 sb.c，空实现即可 */
+void
+raid_bdev_sb_update_crc(struct raid_bdev_superblock *sb)
+{
+}
+
 const struct spdk_uuid *
 spdk_bdev_get_uuid(const struct spdk_bdev *bdev)
 {

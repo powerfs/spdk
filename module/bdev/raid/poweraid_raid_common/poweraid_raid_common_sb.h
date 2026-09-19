@@ -11,6 +11,8 @@
 #include "spdk/stdinc.h"
 #include "spdk/uuid.h"
 
+#include "../bdev_raid.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -62,17 +64,20 @@ enum poweraid_raid_common_dif_mode {
 };
 
 /**
- * v2 扩展区结构（追加在 v1 superblock 之后）。
+ * v2 扩展区结构（追加在框架公共 superblock 成员表之后）。
  *
- * v1 superblock 末尾是 base_bdevs[]（变长）。为了向后兼容：
- * - v1 加载时：sb->length = 256 + N * 64（v1 不读取 ext）
- * - v2 加载时：sb->length = 512 + N * 64（ext 紧跟 v1 头部 256B 之后）
+ * v2 盘上布局（写盘 4096B）：
+ *   [256B 框架公共头][N × 64B 成员表 base_bdevs[]][256B 本 ext 区]
+ * - 公共 sb->length = 256 + N * 64（不含 ext）
+ * - ext 偏移 = 256 + N * 64（3 盘 = 448）
+ * - 公共 crc 覆盖 sb->length；ext_crc 仅覆盖 ext 256B（ext_crc 字段
+ *   本身先清零再对完整 256B 连算，不可跳过该字段分段拼接）
  *
- * 注意：v1 中 base_bdevs[] 紧跟 v1 末尾，v2 把 base_bdevs[] 移到 ext 之后。
- * 加载策略：
- *   1. 先读 v1 256B，判断 version.major
- *   2. v1：用 v1 路径，base_bdevs[] 紧跟 256B
- *   3. v2：再读 256B ext，base_bdevs[] 紧跟 512B 之后
+ * 加载策略（框架钩子）：
+ *   1. 先读公共头 + 成员表（首次按 RAID_BDEV_SB_MAX_LENGTH 读取）
+ *   2. major != 2 由 sb_validate_disk 返回 -ENODATA（非本族，可 fresh）
+ *   3. major == 2 且 buf 不足 total（sb->length + 256）时返回 0 触发续读
+ *   4. ext 签名/CRC 校验失败返回 -EILSEQ（本族损坏，禁止覆写）
  */
 struct poweraid_raid_common_sb_v2_ext {
 	/* v2 魔数，校验 ext 区完整性（避免误读 v1 数据）*/
@@ -234,6 +239,33 @@ const struct raid_bdev_superblock *poweraid_raid_common_sb_loaded_get_v1(
  */
 const struct poweraid_raid_common_sb_v2_ext *poweraid_raid_common_sb_loaded_get_ext(
 	struct poweraid_raid_common_sb_ctx *ctx);
+
+/* ===== 方向 B：框架 sb 生命周期组合器（issue #11）===== */
+
+/**
+ * 重装配分支：module->start() 发现框架已从盘上回放 raid_bdev->sb
+ * （含保留的 v2 ext 尾）时调用，建立 poweraid 组合镜像，供 PPL/MWL 等
+ * ext 几何查询与后续委托写使用。返回 0 成功，负数失败。
+ */
+int poweraid_raid_common_sb_priv_adopt(struct poweraid_raid_common_raid *raid);
+
+/**
+ * C7：data_offset 单轨。新卷 shell start() 早期调用，把框架预填的 1MiB
+ * 成员保留统一为 5MiB（PPL/MWL 区）口径；重装配卷（rb->sb != NULL）为空操作。
+ */
+void poweraid_raid_common_sb_unify_data_offset(struct raid_bdev *rb);
+
+/*
+ * struct raid_bdev_module 的 sb 钩子实现，由 5f/6f/1f 薄壳注册。
+ * 签名/契约与 bdev_raid.h 中对应字段一致。
+ */
+struct raid_bdev;
+int poweraid_raid_common_sb_hook_validate(const void *buf, uint32_t buf_size);
+uint32_t poweraid_raid_common_sb_hook_total_size(const struct raid_bdev_superblock *sb);
+void poweraid_raid_common_sb_hook_write(struct raid_bdev *raid_bdev,
+				       raid_bdev_write_sb_cb cb, void *cb_ctx);
+void poweraid_raid_common_sb_hook_clear(struct raid_bdev *raid_bdev,
+				       raid_bdev_write_sb_cb cb, void *cb_ctx);
 
 #ifdef __cplusplus
 }

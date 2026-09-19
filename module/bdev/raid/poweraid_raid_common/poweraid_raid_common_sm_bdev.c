@@ -62,58 +62,11 @@ DEFINE_BDEV_HANDLER(check_dev_ready)
 #undef DEFINE_BDEV_HANDLER
 
 /* ===== 阶段 1.3 关键 handler 实现（BDEV 层 4 个）=====
- * 借鉴 XISRC xnr_dev_* 函数族 + raid_base_bdev_info.desc 框架协作。
+ * 方向 B（issue #11）：单盘 sb 探测由框架 examine 完成；poweraid 不再自行
+ * sb_load。OPEN 直接进入 VALIDATE_MD，校验对象是框架回放的 raid_bdev->sb。
  */
 
-/* TRY_READ_MD 的 sb_load 回调：根据加载结果触发 VALIDATE_MD 或 SET_ONLINE。
- * 阶段 2：sb_load 实际 IO 异步完成。
- *   - status==0 && loaded_ctx!=NULL：盘上有 RAID sb，存到 bdev->loaded_sb_ctx
- *     供 VALIDATE_MD 校验 ext_signature + ext_crc。
- *   - status==-ENODATA：空白/异族盘（无 SPDKRAID 签名）→ 新卷分支，直接上线。
- *   - 其余负值（-EILSEQ 签名命中但 crc/版本损坏、-EIO 读失败）：元数据损坏，
- *     置 FAULTED 拒绝装配——绝不能当成空白盘让全卷带残缺成员上线（TR-2.3）。
- *   loaded_ctx 仅在 status==0 时由调用方接管所有权（否则 sb_load 内部已 free）。
- */
-static void
-bdev_try_read_md_sb_load_cb(int status,
-			     struct poweraid_raid_common_sb_ctx *loaded_ctx,
-			     void *cb_arg)
-{
-	struct poweraid_raid_common_bdev *bdev = cb_arg;
-
-	if (bdev == NULL) {
-		/* 异常：cb_arg 无 bdev，释放 ctx 后返回 */
-		if (loaded_ctx) {
-			poweraid_raid_common_sb_free_loaded(loaded_ctx);
-		}
-		return;
-	}
-
-	SPDK_DEBUGLOG(raid5f_sm_bdev, "sb_load cb: bdev=%p status=%d loaded_ctx=%p\n",
-		      bdev, status, loaded_ctx);
-
-	if (status == 0 && loaded_ctx != NULL) {
-		/* 盘上有 RAID sb → 持有 ctx，进入 VALIDATE_MD 校验 ext_signature */
-		bdev->md_present = true;
-		bdev->loaded_sb_ctx = loaded_ctx;
-		poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_BDEV, bdev,
-					   POWERAID_BDEV_EV_VALIDATE_MD);
-	} else if (status == -ENODATA) {
-		/* 空白/异族盘 → 新卷分支 */
-		assert(bdev->loaded_sb_ctx == NULL);
-		poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_BDEV, bdev,
-					   POWERAID_BDEV_EV_SET_ONLINE);
-	} else {
-		/* 元数据损坏/读失败：FAULTED，不触发 SET_ONLINE，RAID 汇聚门控
-		 * （set_online 全员 ONLINE 检查）保证卷不会上线。*/
-		assert(bdev->loaded_sb_ctx == NULL);
-		SPDK_ERRLOG("sb_load failed status=%d slot=%u: mark FAULTED\n",
-			    status, bdev->slot);
-		poweraid_raid_state_set(&bdev->state, POWERAID_BDEV_ST_FAULTED);
-	}
-}
-
-/* OPEN：base bdev 已由框架打开（desc 已就位），置 BDEV_ST_OPEN，触发 TRY_READ_MD。
+/* OPEN：base bdev 已由框架打开（desc 已就位），置 BDEV_ST_OPEN，触发 VALIDATE_MD。
  * 参考：raid_base_bdev_info.desc 由 raid_bdev 框架在 raid_bdev_add_base_bdev 分配。
  */
 void
@@ -130,7 +83,7 @@ poweraid_raid_common_sm_bdev_open(struct poweraid_raid_common_bdev *bdev,
 
 	poweraid_raid_state_set(&bdev->state, POWERAID_BDEV_ST_OPEN);
 
-	/* 为 sb_load / PPL / recovery 生命周期准备 bdev IO channel（与 FSM 同线程，
+	/* 为 PPL / recovery 生命周期准备 bdev IO channel（与 FSM 同线程，
 	 * 在 unregister_done 中释放）。spdk_bdev_read/write 不接受 NULL channel。*/
 	if (bdev->desc != NULL && bdev->ch == NULL) {
 		bdev->ch = spdk_bdev_get_io_channel(
@@ -142,73 +95,96 @@ poweraid_raid_common_sm_bdev_open(struct poweraid_raid_common_bdev *bdev,
 		}
 	}
 
-	/* 触发元数据加载 */
+	/* sb 探测由框架 examine 完成（raid_bdev->sb 已在 start() 前就位或为 NULL）。 */
 	poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_BDEV, bdev,
-				   POWERAID_BDEV_EV_TRY_READ_MD);
+				   POWERAID_BDEV_EV_VALIDATE_MD);
 }
 
-/* TRY_READ_MD：触发 superblock 异步加载（阶段 2 接入 spdk_bdev_read）。
- * 单盘探测，不污染 raid->sb_ctx；loaded_ctx 由回调持有到 VALIDATE_MD 完成。
- * 注：bdev->ch 由 OPEN 在子任务 D 设置（NULL 时 sb_load 仍可读，spdk_bdev_read 用全局 ch）。
- */
+/* TRY_READ_MD：方向 B 后不再有独立单盘探测；事件保留，直接转发 VALIDATE_MD。 */
 void
 poweraid_raid_common_sm_bdev_try_read_md(struct poweraid_raid_common_bdev *bdev,
 				    enum poweraid_raid_common_bdev_event event)
 {
-	SPDK_DEBUGLOG(raid5f_sm_bdev, "try_read_md: bdev=%p desc=%p ch=%p event=%u\n",
-		      bdev, bdev ? bdev->desc : NULL,
-		      bdev ? bdev->ch : NULL, (uint32_t)event);
 	(void)event;
 
 	if (bdev == NULL) {
 		return;
 	}
 
-	poweraid_raid_common_sb_load(bdev->desc, (struct spdk_io_channel *)bdev->ch,
-				bdev_try_read_md_sb_load_cb, bdev);
+	poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_BDEV, bdev,
+				   POWERAID_BDEV_EV_VALIDATE_MD);
 }
 
-/* VALIDATE_MD：校验 ext_signature（v1 crc + ext_crc 已由 sb_load 内部校验通过）。
- * 从 bdev->loaded_sb_ctx 查 ext（不读 raid->sb_ctx，避免单盘探测污染 raid 级状态）。
- * 参考：XISRC xnr_dev_verify_md 检查 magic + ext_signature。
+/* VALIDATE_MD：以框架回放的 raid_bdev->sb 为唯一权威做身份/成员一致性校验。
+ *   - raid_bdev->sb == NULL：新卷，成员直接上线；
+ *   - 否则逐盘校验：卷级 uuid/name/level/strip/成员数一致；成员槽 uuid 与盘匹配；
+ *     成员状态合法；v2 ext 存在且几何合法，并按 feature_flags 分配 PPL/MWL ctx。
+ * 任一不符：置 FAULTED 拒绝装配（绝不当空白盘覆写）。
  */
 void
 poweraid_raid_common_sm_bdev_validate_md(struct poweraid_raid_common_bdev *bdev,
 				    enum poweraid_raid_common_bdev_event event)
 {
+	struct poweraid_raid_common_raid *raid;
+	struct raid_bdev *rb;
+	const struct raid_bdev_superblock *sb;
+	const struct raid_bdev_sb_base_bdev *sbm = NULL;
 	const struct poweraid_raid_common_sb_v2_ext *ext;
-	const struct raid_bdev_superblock *v1;
+	uint8_t i;
 
 	SPDK_DEBUGLOG(raid5f_sm_bdev, "validate_md: bdev=%p event=%u\n", bdev,
 		      (uint32_t)event);
 	(void)event;
 
-	if (bdev == NULL) {
+	if (bdev == NULL || bdev->raid == NULL) {
 		return;
 	}
+	raid = bdev->raid;
+	rb = raid->raid_bdev;
 
-	v1 = poweraid_raid_common_sb_loaded_get_v1(bdev->loaded_sb_ctx);
-	if (v1 == NULL) {
-		SPDK_ERRLOG("validate_md: no loaded_ctx bdev=%p\n", bdev);
-		poweraid_raid_state_set(&bdev->state, POWERAID_BDEV_ST_FAULTED);
-		return;
-	}
-
-	ext = poweraid_raid_common_sb_loaded_get_ext(bdev->loaded_sb_ctx);
-	if (ext == NULL) {
-		/* v1 兼容加载（无 ext 区）：跳过 ext 校验，直接上线 */
-		SPDK_DEBUGLOG(raid5f_sm_bdev, "validate_md: v1 disk (no ext) bdev=%p\n", bdev);
+	if (rb == NULL || rb->sb == NULL) {
+		/* 新卷：盘上无本族 sb，直接上线（公共 sb 由框架首次 configure 写入）。 */
+		bdev->md_present = false;
 		poweraid_raid_state_set(&bdev->state, POWERAID_BDEV_ST_MD_VALID);
 		poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_BDEV, bdev,
 					   POWERAID_BDEV_EV_SET_ONLINE);
 		return;
 	}
 
-	if (memcmp(ext->ext_signature, POWERAID_RAID_COMMON_SB_V2_EXT_SIG,
-		   sizeof(ext->ext_signature)) != 0) {
-		SPDK_ERRLOG("validate_md: ext_signature mismatch bdev=%p\n", bdev);
-		poweraid_raid_common_sb_free_loaded(bdev->loaded_sb_ctx);
-		bdev->loaded_sb_ctx = NULL;
+	sb = rb->sb;
+
+	/* 卷级身份一致性 */
+	if (sb->level != raid->level ||
+	    sb->strip_size != raid->strip_size ||
+	    sb->num_base_bdevs != raid->num_base_bdevs ||
+	    spdk_uuid_compare(&sb->uuid, &raid->uuid) != 0 ||
+	    strncmp((const char *)sb->name, raid->name, RAID_BDEV_SB_NAME_SIZE) != 0) {
+		SPDK_ERRLOG("validate_md: sb identity mismatch bdev=%p slot=%u\n",
+			    bdev, bdev->slot);
+		poweraid_raid_state_set(&bdev->state, POWERAID_BDEV_ST_FAULTED);
+		return;
+	}
+
+	/* 成员槽：按本盘 uuid 在成员表中定位（槽位也应一致），并校验状态。 */
+	for (i = 0; i < sb->base_bdevs_size; i++) {
+		if (spdk_uuid_compare(&sb->base_bdevs[i].uuid, &bdev->uuid) == 0) {
+			sbm = &sb->base_bdevs[i];
+			break;
+		}
+	}
+	if (sbm == NULL || sbm->slot != bdev->slot ||
+	    (sbm->state != RAID_SB_BASE_BDEV_CONFIGURED &&
+	     sbm->state != RAID_SB_BASE_BDEV_FAILED)) {
+		SPDK_ERRLOG("validate_md: member uuid/state mismatch bdev=%p slot=%u\n",
+			    bdev, bdev->slot);
+		poweraid_raid_state_set(&bdev->state, POWERAID_BDEV_ST_FAULTED);
+		return;
+	}
+
+	ext = poweraid_raid_common_sb_get_ext(raid);
+	if (ext == NULL) {
+		SPDK_ERRLOG("validate_md: v2 ext missing on reassembled raid %s\n",
+			    raid->name);
 		poweraid_raid_state_set(&bdev->state, POWERAID_BDEV_ST_FAULTED);
 		return;
 	}
@@ -217,25 +193,22 @@ poweraid_raid_common_sm_bdev_validate_md(struct poweraid_raid_common_bdev *bdev,
 	 * 带着 0/残缺几何上线（MWL 层随后无法定位 ring）。*/
 	if ((ext->feature_flags & POWERAID_RAID_COMMON_SB_F_MWL) &&
 	    (ext->mwl_region_offset == 0 || ext->mwl_region_size == 0 ||
-	     ext->mwl_region_offset % v1->block_size != 0 ||
-	     ext->mwl_region_size % v1->block_size != 0)) {
+	     ext->mwl_region_offset % sb->block_size != 0 ||
+	     ext->mwl_region_size % sb->block_size != 0)) {
 		SPDK_ERRLOG("validate_md: bad MWL geometry off=%"PRIu64" size=%"PRIu64
 			    " bdev=%p\n", ext->mwl_region_offset, ext->mwl_region_size, bdev);
-		poweraid_raid_common_sb_free_loaded(bdev->loaded_sb_ctx);
-		bdev->loaded_sb_ctx = NULL;
 		poweraid_raid_state_set(&bdev->state, POWERAID_BDEV_ST_FAULTED);
 		return;
 	}
 
-	/* 阶段 2 子任务 C：若启用 PPL 特性，在此为该盘分配 PPL 上下文（仅内存，
-	 * 不做 IO）。实际的 ppl_load_replay / recovery_run 由 RAID ONLINE（子任务 D）
-	 * 在所有盘就绪 + read_fn 就绪后触发。bdev->ch 由 OPEN 阶段（子任务 D）设置。*/
+	/* 若启用 PPL 特性，在此为该盘分配 PPL 上下文（仅内存，不做 IO）。
+	 * 实际 replay/recovery 由 RAID ONLINE 在所有盘就绪后触发。*/
 	if ((ext->feature_flags & POWERAID_RAID_COMMON_SB_F_PPL) &&
 	    bdev->ppl_ctx == NULL && bdev->desc != NULL &&
-	    v1->block_size != 0 && ext->ppl_region_size != 0) {
+	    sb->block_size != 0 && ext->ppl_region_size != 0) {
 		bdev->ppl_ctx = poweraid_raid_common_ppl_alloc(
 			bdev->desc, (struct spdk_io_channel *)bdev->ch,
-			v1->block_size,
+			sb->block_size,
 			ext->ppl_region_offset, ext->ppl_region_size);
 		if (bdev->ppl_ctx == NULL) {
 			SPDK_WARNLOG("validate_md: ppl_alloc failed bdev=%p (PPL disabled)\n", bdev);
@@ -247,13 +220,14 @@ poweraid_raid_common_sm_bdev_validate_md(struct poweraid_raid_common_bdev *bdev,
 		}
 	}
 
+	bdev->md_present = true;
 	poweraid_raid_state_set(&bdev->state, POWERAID_BDEV_ST_MD_VALID);
 	poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_BDEV, bdev,
 				   POWERAID_BDEV_EV_SET_ONLINE);
 }
 
 /* SET_ONLINE：置 BDEV_ST_ONLINE，检查所有 base bdev 是否均 online，
- * 若是则触发 RAID EV_ONLINE。释放 bdev->loaded_sb_ctx（校验已用完）。
+ * 若是则触发 RAID EV_ONLINE。
  * 参考：XISRC xnr_dev_online + raid5f 全盘就绪后框架注册 bdev。
  */
 void
@@ -273,12 +247,6 @@ poweraid_raid_common_sm_bdev_set_online(struct poweraid_raid_common_bdev *bdev,
 	}
 
 	poweraid_raid_state_set(&bdev->state, POWERAID_BDEV_ST_ONLINE);
-
-	/* 释放 loaded_sb_ctx（VALIDATE_MD 已用完） */
-	if (bdev->loaded_sb_ctx != NULL) {
-		poweraid_raid_common_sb_free_loaded(bdev->loaded_sb_ctx);
-		bdev->loaded_sb_ctx = NULL;
-	}
 
 	raid = bdev->raid;
 	if (raid == NULL) {

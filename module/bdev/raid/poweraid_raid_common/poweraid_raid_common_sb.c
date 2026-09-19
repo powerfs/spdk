@@ -56,9 +56,16 @@ struct poweraid_raid_common_sb_ctx {
 /* ===== sb_write 异步 IO 上下文 ===== */
 struct poweraid_raid_common_sb_write_ctx {
 	struct poweraid_raid_common_raid	*raid;
+	/* 待写缓冲（v2 组合镜像 或 clear 用零缓冲），自 LBA0 起 buf_size 字节 */
+	const void			*buf;
+	uint32_t			buf_size;
 	int				status;
 	uint8_t				submitted;
 	uint8_t				remaining;
+	/* clear 路径：未就绪成员只跳过不扣减 remaining */
+	uint8_t				skip_ready_only;
+	/* wctx 自有的 dma 缓冲（clear 零缓冲），完成时释放；常规组合写为 NULL */
+	void				*owned_buf;
 	poweraid_raid_common_sb_write_cb	cb;
 	void				*cb_arg;
 	struct spdk_bdev_io_wait_entry	wait_entry;
@@ -158,40 +165,12 @@ poweraid_raid_common_sb_alloc(struct poweraid_raid_common_raid *raid,
 	return 0;
 }
 
-void
-poweraid_raid_common_sb_init(struct poweraid_raid_common_raid *raid,
-			uint32_t level, uint32_t strip_size,
-			uint32_t feature_flags)
+/* 初始化 ext 区（建卷 / 组合器首次组合共用）。 */
+static void
+sb_ext_init(struct poweraid_raid_common_sb_ctx *ctx, uint32_t level,
+	    uint32_t strip_size, uint32_t feature_flags)
 {
-	struct poweraid_raid_common_sb_ctx *ctx;
-	uint8_t i;
-
-	if (raid == NULL || raid->sb_ctx == NULL) {
-		return;
-	}
-	ctx = raid->sb_ctx;
-
-	/* === v1 header === */
-	memcpy(ctx->v1->signature, RAID_BDEV_SB_SIG, sizeof(ctx->v1->signature));
-	ctx->v1->version.major = POWERAID_RAID_COMMON_SB_VERSION_V2_MAJOR;  /* v2 */
-	ctx->v1->version.minor = 0;
-	spdk_uuid_copy(&ctx->v1->uuid, &raid->uuid);
-	snprintf((char *)ctx->v1->name, RAID_BDEV_SB_NAME_SIZE, "%s", raid->name);
-	ctx->v1->raid_size = raid->raid_size;
-	ctx->v1->block_size = ctx->block_size;
-	ctx->v1->level = level;
-	ctx->v1->strip_size = strip_size;
-	ctx->v1->state = 0;  /* TODO 阶段 2：从 raid->state 同步 */
-	ctx->v1->seq_number = 1;
-	ctx->v1->num_base_bdevs = ctx->num_base_bdevs;
-	ctx->v1->base_bdevs_size = ctx->num_base_bdevs;
-	ctx->v1->length = sb_v1_length(ctx->num_base_bdevs);
-	for (i = 0; i < ctx->num_base_bdevs; i++) {
-		struct raid_bdev_sb_base_bdev *sb_b = &ctx->v1->base_bdevs[i];
-		sb_b->slot = i;
-		sb_b->state = RAID_SB_BASE_BDEV_CONFIGURED;
-		/* uuid/data_offset/data_size 由上层阶段 2 填 */
-	}
+	(void)strip_size;
 
 	/* === ext 区 === */
 	memset(ctx->ext, 0, POWERAID_RAID_COMMON_SB_V2_EXT_LENGTH);
@@ -229,6 +208,44 @@ poweraid_raid_common_sb_init(struct poweraid_raid_common_raid *raid,
 	ctx->ext->restripe_target_stripes = 0;
 	ctx->ext->create_ts = (uint64_t)time(NULL);
 	ctx->ext->last_modified_ts = ctx->ext->create_ts;
+}
+
+void
+poweraid_raid_common_sb_init(struct poweraid_raid_common_raid *raid,
+			uint32_t level, uint32_t strip_size,
+			uint32_t feature_flags)
+{
+	struct poweraid_raid_common_sb_ctx *ctx;
+	uint8_t i;
+
+	if (raid == NULL || raid->sb_ctx == NULL) {
+		return;
+	}
+	ctx = raid->sb_ctx;
+
+	/* === v1 header === */
+	memcpy(ctx->v1->signature, RAID_BDEV_SB_SIG, sizeof(ctx->v1->signature));
+	ctx->v1->version.major = POWERAID_RAID_COMMON_SB_VERSION_V2_MAJOR;  /* v2 */
+	ctx->v1->version.minor = 0;
+	spdk_uuid_copy(&ctx->v1->uuid, &raid->uuid);
+	snprintf((char *)ctx->v1->name, RAID_BDEV_SB_NAME_SIZE, "%s", raid->name);
+	ctx->v1->raid_size = raid->raid_size;
+	ctx->v1->block_size = ctx->block_size;
+	ctx->v1->level = level;
+	ctx->v1->strip_size = strip_size;
+	ctx->v1->state = 0;  /* TODO 阶段 2：从 raid->state 同步 */
+	ctx->v1->seq_number = 1;
+	ctx->v1->num_base_bdevs = ctx->num_base_bdevs;
+	ctx->v1->base_bdevs_size = ctx->num_base_bdevs;
+	ctx->v1->length = sb_v1_length(ctx->num_base_bdevs);
+	for (i = 0; i < ctx->num_base_bdevs; i++) {
+		struct raid_bdev_sb_base_bdev *sb_b = &ctx->v1->base_bdevs[i];
+		sb_b->slot = i;
+		sb_b->state = RAID_SB_BASE_BDEV_CONFIGURED;
+		/* uuid/data_offset/data_size 由上层阶段 2 填 */
+	}
+
+	sb_ext_init(ctx, level, strip_size, feature_flags);
 
 	/* === CRC === */
 	sb_update_v1_crc(ctx);
@@ -250,6 +267,9 @@ sb_write_one_done(int status, struct poweraid_raid_common_sb_write_ctx *wctx)
 
 	if (--wctx->remaining == 0) {
 		wctx->cb(wctx->status, wctx->cb_arg);
+		if (wctx->owned_buf != NULL) {
+			spdk_dma_free(wctx->owned_buf);
+		}
 		free(wctx);
 	}
 }
@@ -276,7 +296,6 @@ sb_write_loop(void *_wctx)
 {
 	struct poweraid_raid_common_sb_write_ctx *wctx = _wctx;
 	struct poweraid_raid_common_raid *raid = wctx->raid;
-	struct poweraid_raid_common_sb_ctx *ctx;
 	const void *buf;
 	uint32_t buf_size;
 	uint8_t i;
@@ -286,9 +305,8 @@ sb_write_loop(void *_wctx)
 		sb_write_one_done(-EINVAL, wctx);
 		return;
 	}
-	ctx = raid->sb_ctx;
-	buf = ctx->raw;
-	buf_size = ctx->raw_size;
+	buf = wctx->buf;
+	buf_size = wctx->buf_size;
 
 	for (i = wctx->submitted; i < raid->num_base_bdevs; i++) {
 		struct poweraid_raid_common_bdev *bdev = raid->base_bdevs[i];
@@ -298,7 +316,11 @@ sb_write_loop(void *_wctx)
 		uint32_t blocklen, num_blocks;
 
 		if (bdev == NULL || bdev->desc == NULL || bdev->ch == NULL) {
-			/* 盘未就绪：跳过，等同完成 */
+			/* 盘未就绪：clear 路径只跳过；常规写跳过等同完成。 */
+			if (wctx->skip_ready_only) {
+				wctx->submitted++;
+				continue;
+			}
 			assert(wctx->remaining > 1);
 			sb_write_one_done(0, wctx);
 			wctx->submitted++;
@@ -337,7 +359,7 @@ sb_write_loop(void *_wctx)
 
 void
 poweraid_raid_common_sb_write(struct poweraid_raid_common_raid *raid,
-			 poweraid_raid_common_sb_write_cb cb, void *cb_arg)
+		 poweraid_raid_common_sb_write_cb cb, void *cb_arg)
 {
 	struct poweraid_raid_common_sb_ctx *ctx;
 	struct poweraid_raid_common_sb_write_ctx *wctx;
@@ -354,16 +376,11 @@ poweraid_raid_common_sb_write(struct poweraid_raid_common_raid *raid,
 		return;
 	}
 	wctx->raid = raid;
+	wctx->buf = ctx->raw;
+	wctx->buf_size = ctx->raw_size;
 	wctx->remaining = raid->num_base_bdevs + 1;  /* +1 for final completion */
 	wctx->cb = cb;
 	wctx->cb_arg = cb_arg;
-
-	/* 更新 seq + CRC，准备 buffer */
-	ctx->v1->seq_number++;
-	sb_update_v1_crc(ctx);
-	if (ctx->is_v2) {
-		sb_update_ext_crc(ctx);
-	}
 
 	sb_write_loop(wctx);
 }
@@ -682,4 +699,310 @@ const struct poweraid_raid_common_sb_v2_ext *
 poweraid_raid_common_sb_loaded_get_ext(struct poweraid_raid_common_sb_ctx *ctx)
 {
 	return (ctx && ctx->is_v2) ? ctx->ext : NULL;
+}
+
+/* ===== 方向 B：框架 sb 生命周期组合器（issue #11）=====
+ *
+ * 所有权模型：raid_bdev->sb（框架 dma 缓冲）唯一持有公共段
+ * [256B 公共头][N*64B 成员表]，poweraid 仅持有一个 4096B 组合镜像
+ * [公共段][256B ext]。每次框架委托写盘前从 raid_bdev->sb 重新组合，
+ * 打 major=2、追加 ext、重算两段 CRC；poweraid 不再独立决定写盘时机。
+ */
+
+/* 校验 ext 区 CRC。约定与 sb_update_ext_crc 一致：ext_crc 字段视为零后
+ * 对完整 256B 连算（与公共段 raid_bdev_sb_update_crc 的口径相同）。
+ * 不能跳过 crc 字段分两段拼接——CRC 流中"4 字节零"与"不喂这 4 字节"不等价。 */
+static bool
+sb_priv_ext_crc_valid(const struct poweraid_raid_common_sb_v2_ext *ext)
+{
+	static const uint8_t zero_field[sizeof(ext->ext_crc)] = { 0 };
+	uint32_t crc;
+
+	crc = spdk_crc32c_update(ext, offsetof(struct poweraid_raid_common_sb_v2_ext,
+					       ext_crc), 0);
+	crc = spdk_crc32c_update(zero_field, sizeof(ext->ext_crc), crc);
+	crc = spdk_crc32c_update((const uint8_t *)ext +
+				 offsetof(struct poweraid_raid_common_sb_v2_ext, ext_crc) +
+				 sizeof(ext->ext_crc),
+				 POWERAID_RAID_COMMON_SB_V2_EXT_LENGTH -
+				 offsetof(struct poweraid_raid_common_sb_v2_ext, ext_crc) -
+				 sizeof(ext->ext_crc), crc);
+	return crc == ext->ext_crc;
+}
+
+int
+poweraid_raid_common_sb_hook_validate(const void *buf, uint32_t buf_size)
+{
+	const struct raid_bdev_superblock *sb = buf;
+	const struct poweraid_raid_common_sb_v2_ext *ext;
+	uint32_t total;
+
+	if (buf == NULL) {
+		return -EINVAL;
+	}
+
+	if (sb->version.major != POWERAID_RAID_COMMON_SB_VERSION_V2_MAJOR) {
+		return -ENODATA;
+	}
+
+	/* 本族镜像：公共长度必须与成员数自洽。签名/公共 CRC 已由框架校验。 */
+	if (sb->length != sb_v1_length(sb->num_base_bdevs)) {
+		SPDK_WARNLOG("poweraid sb: inconsistent common length %u for %u base bdevs\n",
+			     sb->length, sb->num_base_bdevs);
+		return -EILSEQ;
+	}
+
+	total = sb->length + POWERAID_RAID_COMMON_SB_V2_EXT_LENGTH;
+	if (buf_size < total) {
+		/* ext 尾尚未读全，认领后由框架 -EAGAIN 续读，再次进入本函数。 */
+		return 0;
+	}
+
+	ext = (const struct poweraid_raid_common_sb_v2_ext *)
+	      ((const uint8_t *)buf + sb->length);
+	if (memcmp(ext->ext_signature, POWERAID_RAID_COMMON_SB_V2_EXT_SIG,
+		   sizeof(ext->ext_signature)) != 0) {
+		SPDK_ERRLOG("poweraid sb: ext signature mismatch\n");
+		return -EILSEQ;
+	}
+	if (!sb_priv_ext_crc_valid(ext)) {
+		SPDK_WARNLOG("poweraid sb: ext crc mismatch\n");
+		return -EILSEQ;
+	}
+
+	return 0;
+}
+
+uint32_t
+poweraid_raid_common_sb_hook_total_size(const struct raid_bdev_superblock *sb)
+{
+	return sb->length + POWERAID_RAID_COMMON_SB_V2_EXT_LENGTH;
+}
+
+/* 每次委托写盘前：用框架最新 raid_bdev->sb 重组镜像公共段。
+ * 新卷首次调用时惰性建立镜像（框架 alloc/init 公共 sb 发生在 start() 之后）。 */
+static int
+sb_priv_compose(struct poweraid_raid_common_raid *raid)
+{
+	struct raid_bdev *rb = raid->raid_bdev;
+	struct raid_bdev_superblock *fsb = rb->sb;
+	struct poweraid_raid_common_sb_ctx *ctx;
+	uint32_t feature_flags;
+	int rc;
+
+	if (fsb == NULL) {
+		SPDK_ERRLOG("poweraid sb compose: framework sb missing on raid %s\n",
+			    raid->name);
+		return -EINVAL;
+	}
+
+	if (raid->sb_ctx == NULL) {
+		rc = poweraid_raid_common_sb_alloc(raid, rb->bdev.blocklen,
+						   rb->num_base_bdevs);
+		if (rc != 0) {
+			return rc;
+		}
+		ctx = raid->sb_ctx;
+		feature_flags = raid->level == SPDK_BDEV_RAID_LEVEL_RAID1F ?
+				POWERAID_RAID_COMMON_SB_F_MWL :
+				POWERAID_RAID_COMMON_SB_F_PPL;
+		sb_ext_init(ctx, raid->level, raid->strip_size, feature_flags);
+	} else {
+		ctx = raid->sb_ctx;
+	}
+
+	/* 公共段以框架为唯一权威（uuid/成员表/state/data_offset/seq 均在此）。 */
+	memcpy(ctx->raw, fsb, fsb->length);
+	ctx->num_base_bdevs = fsb->num_base_bdevs;
+	ctx->v1->version.major = POWERAID_RAID_COMMON_SB_VERSION_V2_MAJOR;
+	ctx->v1->length = fsb->length;
+	sb_update_v1_crc(ctx);
+	sb_update_ext_crc(ctx);
+
+	return 0;
+}
+
+/* C7：data_offset 单轨。
+ * 新卷在 shell start() 早期调用：把框架按 1MiB 预填的成员 data_offset/data_size
+ * 统一改为 PPL/MWL 区口径（[1MiB,5MiB)，4K 盘下 1280 块），随后框架
+ * init 公共头会把该值写入成员表，poweraid 不再二次扣除。
+ * 重装配卷（rb->sb != NULL）不动：成员表以盘上回放值为权威。 */
+void
+poweraid_raid_common_sb_unify_data_offset(struct raid_bdev *rb)
+{
+	struct raid_base_bdev_info *base_info;
+	uint64_t reserve_blocks;
+
+	if (rb == NULL || rb->sb != NULL) {
+		return;
+	}
+
+	reserve_blocks = (POWERAID_RAID_COMMON_PPL_REGION_OFFSET +
+			  POWERAID_RAID_COMMON_PPL_REGION_SIZE) /
+			 spdk_bdev_get_data_block_size(&rb->bdev);
+
+	RAID_FOR_EACH_BASE_BDEV(rb, base_info) {
+		uint64_t end_blocks;
+
+		if (base_info->desc == NULL || base_info->data_offset == 0) {
+			continue;
+		}
+		end_blocks = base_info->data_offset + base_info->data_size;
+		if (end_blocks <= reserve_blocks) {
+			continue;
+		}
+		base_info->data_size = end_blocks - reserve_blocks;
+		base_info->data_offset = reserve_blocks;
+	}
+}
+
+int
+poweraid_raid_common_sb_priv_adopt(struct poweraid_raid_common_raid *raid)
+{
+	struct raid_bdev *rb;
+	struct poweraid_raid_common_sb_ctx *ctx;
+	uint32_t total;
+	int rc;
+
+	if (raid == NULL || raid->raid_bdev == NULL || raid->raid_bdev->sb == NULL) {
+		return -EINVAL;
+	}
+	rb = raid->raid_bdev;
+
+	rc = poweraid_raid_common_sb_alloc(raid, rb->bdev.blocklen,
+					   rb->num_base_bdevs);
+	if (rc != 0) {
+		return rc;
+	}
+	ctx = raid->sb_ctx;
+	total = rb->sb->length + POWERAID_RAID_COMMON_SB_V2_EXT_LENGTH;
+	assert(total <= ctx->raw_size);
+	memcpy(ctx->raw, rb->sb, total);
+	ctx->num_base_bdevs = rb->sb->num_base_bdevs;
+
+	return 0;
+}
+
+/* 适配框架 raid_bdev_write_sb_cb ↔ poweraid sb_write_cb。 */
+struct sb_priv_trampoline {
+	raid_bdev_write_sb_cb		cb;
+	void				*cb_ctx;
+	struct raid_bdev		*rb;
+};
+
+static void
+sb_priv_trampoline(int status, void *cb_arg)
+{
+	struct sb_priv_trampoline *t = cb_arg;
+	struct poweraid_raid_common_raid *raid = t->rb->module_private;
+
+	/* 派发 FSM 注册的一次性持久化回调（如新卷 ONLINE 等待的落盘事件）。 */
+	if (raid != NULL && raid->sb_persist_done_cb != NULL) {
+		poweraid_raid_common_sb_write_cb fsm_cb = raid->sb_persist_done_cb;
+		void *fsm_arg = raid->sb_persist_done_arg;
+
+		raid->sb_persist_done_cb = NULL;
+		raid->sb_persist_done_arg = NULL;
+		fsm_cb(status, fsm_arg);
+	}
+
+	t->cb(status, t->rb, t->cb_ctx);
+	free(t);
+}
+
+void
+poweraid_raid_common_sb_hook_write(struct raid_bdev *rb, raid_bdev_write_sb_cb cb,
+				  void *cb_ctx)
+{
+	struct poweraid_raid_common_raid *raid;
+	struct sb_priv_trampoline *t;
+	int rc;
+
+	raid = rb->module_private;
+	rc = sb_priv_compose(raid);
+	if (rc != 0) {
+		cb(rc, rb, cb_ctx);
+		return;
+	}
+
+	t = calloc(1, sizeof(*t));
+	if (t == NULL) {
+		cb(-ENOMEM, rb, cb_ctx);
+		return;
+	}
+	t->cb = cb;
+	t->cb_ctx = cb_ctx;
+	t->rb = rb;
+
+	poweraid_raid_common_sb_write(raid, sb_priv_trampoline, t);
+}
+
+void
+poweraid_raid_common_sb_hook_clear(struct raid_bdev *rb, raid_bdev_write_sb_cb cb,
+				  void *cb_ctx)
+{
+	struct poweraid_raid_common_raid *raid;
+	struct poweraid_raid_common_sb_write_ctx *wctx;
+	struct poweraid_raid_common_bdev *bdev;
+	void *zero_buf;
+	uint8_t i, ready = 0;
+
+	if (cb == NULL) {
+		return;
+	}
+
+	raid = rb->module_private;
+	/* 早失败回滚（configure 从未执行、本族未落过盘）：无盘可擦，直接成功，
+	 * 绝不擦除属于其他阵列的外来 sb（如异 uuid create -EEXIST 回滚）。 */
+	if (raid == NULL || raid->sb_ctx == NULL) {
+		cb(0, rb, cb_ctx);
+		return;
+	}
+
+	for (i = 0; i < raid->num_base_bdevs; i++) {
+		bdev = raid->base_bdevs[i];
+		if (bdev != NULL && bdev->desc != NULL && bdev->ch != NULL) {
+			ready++;
+		}
+	}
+	if (ready == 0) {
+		cb(0, rb, cb_ctx);
+		return;
+	}
+
+	zero_buf = spdk_dma_zmalloc(4096, 0x1000, NULL);
+	if (zero_buf == NULL) {
+		cb(-ENOMEM, rb, cb_ctx);
+		return;
+	}
+
+	wctx = calloc(1, sizeof(*wctx));
+	if (wctx == NULL) {
+		spdk_dma_free(zero_buf);
+		cb(-ENOMEM, rb, cb_ctx);
+		return;
+	}
+	wctx->raid = raid;
+	wctx->buf = zero_buf;
+	wctx->buf_size = 4096;
+	wctx->remaining = ready + 1;
+	wctx->cb = sb_priv_trampoline;
+	wctx->owned_buf = zero_buf;
+	/* clear 只提交就绪成员；未就绪成员不扣减 remaining。 */
+	wctx->skip_ready_only = 1;
+	{
+		struct sb_priv_trampoline *t = calloc(1, sizeof(*t));
+		if (t == NULL) {
+			spdk_dma_free(zero_buf);
+			free(wctx);
+			cb(-ENOMEM, rb, cb_ctx);
+			return;
+		}
+		t->cb = cb;
+		t->cb_ctx = cb_ctx;
+		t->rb = rb;
+		wctx->cb_arg = t;
+	}
+
+	sb_write_loop(wctx);
 }

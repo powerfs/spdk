@@ -242,7 +242,7 @@ poweraid_raid5f_start(struct raid_bdev *raid_bdev)
 	struct poweraid_raid_common_raid *raid;
 	struct raid_base_bdev_info *base_info;
 	uint64_t min_blockcnt = UINT64_MAX;
-	uint64_t base_data_size, total_stripes, stripe_blocks;
+	uint64_t total_stripes, stripe_blocks;
 	uint32_t data_chunks;
 	uint8_t i;
 
@@ -282,60 +282,69 @@ poweraid_raid5f_start(struct raid_bdev *raid_bdev)
 		return -ENOMEM;
 	}
 
-	/* 桥接每个 base_bdev_info → poweraid_raid_common_bdev；求 min data_size */
-	i = 0;
-	RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
-		struct poweraid_raid_common_bdev *bdev = calloc(1, sizeof(*bdev));
-		if (!bdev) {
-			SPDK_ERRLOG("poweraid_raid5f: alloc bdev[%u] failed\n", i);
-			/* 回滚 */
-			while (i > 0) {
-				free(raid->base_bdevs[--i]);
+	/* C7：新卷成员 data_offset 由框架 1MiB 口径统一为 5MiB PPL 区口径；
+	 * 重装配卷保留盘上成员表值。须在几何计算之前。 */
+	poweraid_raid_common_sb_unify_data_offset(raid_bdev);
+
+	/* 桥接每个 base_bdev_info → poweraid_raid_common_bdev；求 min data 末端 */
+	{
+		struct raid_base_bdev_info *first_info = NULL;
+
+		i = 0;
+		RAID_FOR_EACH_BASE_BDEV(raid_bdev, base_info) {
+			struct poweraid_raid_common_bdev *bdev = calloc(1, sizeof(*bdev));
+			if (!bdev) {
+				SPDK_ERRLOG("poweraid_raid5f: alloc bdev[%u] failed\n", i);
+				/* 回滚 */
+				while (i > 0) {
+					free(raid->base_bdevs[--i]);
+				}
+				free(raid->base_bdevs);
+				free(raid);
+				return -ENOMEM;
 			}
-			free(raid->base_bdevs);
-			free(raid);
-			return -ENOMEM;
+			bdev->slot = i;
+			bdev->raid = raid;
+			bdev->desc = base_info->desc;
+			bdev->ch = NULL;  /* OPEN 阶段填充（子任务 D-4 IO channel 基础设施）*/
+			spdk_uuid_copy(&bdev->uuid, &base_info->uuid);
+			raid->base_bdevs[i] = bdev;
+			if (first_info == NULL) {
+				first_info = base_info;
+			}
+			if (base_info->desc) {
+				uint64_t end = base_info->data_offset + base_info->data_size;
+				min_blockcnt = spdk_min(min_blockcnt, end);
+			}
+			i++;
 		}
-		bdev->slot = i;
-		bdev->raid = raid;
-		bdev->desc = base_info->desc;
-		bdev->ch = NULL;  /* OPEN 阶段填充（子任务 D-4 IO channel 基础设施）*/
-		spdk_uuid_copy(&bdev->uuid, &base_info->uuid);
-		raid->base_bdevs[i] = bdev;
-		if (base_info->desc) {
-			uint64_t bs = base_info->data_size ? base_info->data_size :
-				    spdk_bdev_desc_get_bdev(base_info->desc)->blockcnt;
-			min_blockcnt = spdk_min(min_blockcnt, bs);
+		if (first_info != NULL) {
+			raid->data_offset_blocks = first_info->data_offset;
 		}
-		i++;
 	}
 
 	/* stripe 几何：RAID5 data_chunks = N-1 */
 	data_chunks = raid->num_base_bdevs - 1;
 
-	/* 数据区保留：LBA0 sb + PPL 区（固定 1MiB+4MiB）。
-	 * 4K 块下 = 1280 块；要求按 strip 对齐。*/
-	{
-		uint64_t reserve = (POWERAID_RAID_COMMON_PPL_REGION_OFFSET +
-				    POWERAID_RAID_COMMON_PPL_REGION_SIZE) /
-				   raid->block_size;
-		if (reserve % raid->strip_size != 0) {
-			SPDK_ERRLOG("poweraid_raid5f: PPL reserve %"PRIu64
-				    " not strip-aligned (strip=%u)\n",
-				    reserve, raid->strip_size);
-			return -EINVAL;
-		}
-		raid->data_offset_blocks = reserve;
-	}
-	if (min_blockcnt <= raid->data_offset_blocks) {
-		SPDK_ERRLOG("poweraid_raid5f: base bdev too small (%"PRIu64
-			    " <= reserve %"PRIu64")\n",
-			    min_blockcnt, raid->data_offset_blocks);
+	if (raid->data_offset_blocks % raid->strip_size != 0) {
+		SPDK_ERRLOG("poweraid_raid5f: data offset %"PRIu64
+			    " not strip-aligned (strip=%u)\n",
+			    raid->data_offset_blocks, raid->strip_size);
 		return -EINVAL;
 	}
-	base_data_size = ((min_blockcnt - raid->data_offset_blocks) /
-			  raid->strip_size) * raid->strip_size;
-	total_stripes = base_data_size / raid->strip_size;
+	{
+		uint64_t base_data_size;
+
+		if (min_blockcnt <= raid->data_offset_blocks) {
+			SPDK_ERRLOG("poweraid_raid5f: base bdev too small (%"PRIu64
+				    " <= reserve %"PRIu64")\n",
+				    min_blockcnt, raid->data_offset_blocks);
+			return -EINVAL;
+		}
+		base_data_size = ((min_blockcnt - raid->data_offset_blocks) /
+				  raid->strip_size) * raid->strip_size;
+		total_stripes = base_data_size / raid->strip_size;
+	}
 	stripe_blocks = raid->strip_size * data_chunks;
 
 	raid_bdev->bdev.blockcnt = stripe_blocks * total_stripes;
@@ -1051,5 +1060,10 @@ struct raid_bdev_module g_poweraid_raid5f_module = {
 	.base_bdev_rebuild_starting = poweraid_raid_common_hook_rebuild_starting,
 	.process_complete = poweraid_raid_common_hook_process_complete,
 	.process_window_advanced = poweraid_raid_common_hook_window_advanced,
+	.sb_private = true,
+	.sb_validate_disk = poweraid_raid_common_sb_hook_validate,
+	.sb_total_size = poweraid_raid_common_sb_hook_total_size,
+	.sb_write = poweraid_raid_common_sb_hook_write,
+	.sb_clear = poweraid_raid_common_sb_hook_clear,
 };
 RAID_MODULE_REGISTER(&g_poweraid_raid5f_module)

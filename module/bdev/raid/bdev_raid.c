@@ -111,7 +111,7 @@ raid_bdev_set_opts(const struct spdk_raid_bdev_opts *opts)
 	return 0;
 }
 
-static struct raid_bdev_module *
+struct raid_bdev_module *
 raid_bdev_module_find(enum spdk_bdev_raid_level level)
 {
 	struct raid_bdev_module *raid_module;
@@ -1947,6 +1947,37 @@ raid_bdev_configure_write_sb_cb(int status, struct raid_bdev *raid_bdev, void *c
 }
 
 /*
+ * Superblock write/clear dispatchers. Modules owning a private superblock
+ * format (sb_private == true) serialize/erase the disk image themselves;
+ * all other modules keep using the framework superblock implementation.
+ */
+static void
+raid_bdev_sb_write(struct raid_bdev *raid_bdev, raid_bdev_write_sb_cb cb, void *cb_ctx)
+{
+	if (raid_bdev->module->sb_private && raid_bdev->module->sb_write != NULL) {
+		/* 委托给私有 sb 模块前由框架统一推进 seq 并重算公共 CRC，
+		 * 保证框架是 sb 公共段的唯一维护者（组合器只序列化，不自增）。*/
+		if (raid_bdev->sb != NULL) {
+			raid_bdev->sb->seq_number++;
+			raid_bdev_sb_update_crc(raid_bdev->sb);
+		}
+		raid_bdev->module->sb_write(raid_bdev, cb, cb_ctx);
+	} else {
+		raid_bdev_write_superblock(raid_bdev, cb, cb_ctx);
+	}
+}
+
+static void
+raid_bdev_sb_clear(struct raid_bdev *raid_bdev, raid_bdev_write_sb_cb cb, void *cb_ctx)
+{
+	if (raid_bdev->module->sb_private && raid_bdev->module->sb_clear != NULL) {
+		raid_bdev->module->sb_clear(raid_bdev, cb, cb_ctx);
+	} else {
+		raid_bdev_clear_superblock(raid_bdev, cb, cb_ctx);
+	}
+}
+
+/*
  * brief:
  * If raid bdev config is complete, then only register the raid bdev to
  * bdev layer and remove this raid bdev from configuring list and
@@ -2014,7 +2045,7 @@ raid_bdev_configure(struct raid_bdev *raid_bdev, raid_bdev_action_cb cb, void *c
 			return rc;
 		}
 
-		raid_bdev_write_superblock(raid_bdev, raid_bdev_configure_write_sb_cb, NULL);
+		raid_bdev_sb_write(raid_bdev, raid_bdev_configure_write_sb_cb, NULL);
 	} else {
 		raid_bdev_configure_cont(raid_bdev);
 	}
@@ -2214,7 +2245,7 @@ raid_bdev_remove_base_bdev_on_quiesced(void *ctx, int status)
 					sb_base_bdev->state = RAID_SB_BASE_BDEV_MISSING;
 				}
 
-				raid_bdev_write_superblock(raid_bdev, raid_bdev_remove_base_bdev_write_sb_cb, base_info);
+				raid_bdev_sb_write(raid_bdev, raid_bdev_remove_base_bdev_write_sb_cb, base_info);
 				return;
 			}
 		}
@@ -2546,7 +2577,7 @@ raid_bdev_resize_base_bdev(struct spdk_bdev *base_bdev)
 			}
 		}
 		sb->raid_size = raid_bdev->bdev.blockcnt;
-		raid_bdev_write_superblock(raid_bdev, raid_bdev_resize_write_sb_cb, NULL);
+		raid_bdev_sb_write(raid_bdev, raid_bdev_resize_write_sb_cb, NULL);
 	}
 }
 
@@ -2653,8 +2684,11 @@ raid_bdev_delete(struct raid_bdev *raid_bdev, bool clear_sb, raid_bdev_action_cb
 	raid_bdev->destroy_cb = cb_fn;
 	raid_bdev->destroy_cb_ctx = cb_arg;
 
-	if (raid_bdev->sb != NULL && clear_sb) {
-		raid_bdev_clear_superblock(raid_bdev, raid_bdev_delete_clear_sb_cb, NULL);
+	/* Framework clear requires an allocated raid_bdev->sb; modules owning a
+	 * private superblock handle clearing themselves (also on early failure
+	 * rollback paths where configure() never ran). */
+	if (clear_sb && (raid_bdev->module->sb_private || raid_bdev->sb != NULL)) {
+		raid_bdev_sb_clear(raid_bdev, raid_bdev_delete_clear_sb_cb, NULL);
 		return;
 	}
 
@@ -2693,7 +2727,7 @@ raid_bdev_process_finish_write_sb(void *ctx)
 		}
 	}
 
-	raid_bdev_write_superblock(raid_bdev, raid_bdev_process_finish_write_sb_cb, NULL);
+	raid_bdev_sb_write(raid_bdev, raid_bdev_process_finish_write_sb_cb, NULL);
 }
 
 static void raid_bdev_process_free(struct raid_bdev_process *process);
@@ -3469,6 +3503,8 @@ raid_bdev_configure_base_bdev_check_sb_cb(const struct raid_bdev_superblock *sb,
 		SPDK_ERRLOG("Superblock of a different raid bdev found on bdev %s\n", base_info->name);
 		status = -EEXIST;
 		break;
+	case -ENODATA:
+		/* blank or foreign disk (no SPDKRAID signature) */
 	case -EINVAL:
 		/* no valid superblock */
 		raid_bdev_configure_base_bdev_cont(base_info);
@@ -3798,7 +3834,17 @@ raid_bdev_create_from_sb(const struct raid_bdev_superblock *sb, struct raid_bdev
 	}
 
 	assert(sb->length <= RAID_BDEV_SB_MAX_LENGTH);
-	memcpy(raid_bdev->sb, sb, sb->length);
+	{
+		uint32_t copy_len = sb->length;
+
+		/* Preserve the module-private superblock tail (e.g. poweraid v2
+		 * ext) so that module->start() can adopt it. */
+		if (raid_bdev->module->sb_private && raid_bdev->module->sb_total_size != NULL) {
+			copy_len = raid_bdev->module->sb_total_size(sb);
+		}
+		assert(copy_len <= RAID_BDEV_SB_MAX_LENGTH);
+		memcpy(raid_bdev->sb, sb, copy_len);
+	}
 
 	for (i = 0; i < sb->base_bdevs_size; i++) {
 		const struct raid_bdev_sb_base_bdev *sb_base_bdev = &sb->base_bdevs[i];
@@ -4173,6 +4219,8 @@ raid_bdev_examine_cont(struct spdk_bdev *bdev, const struct raid_bdev_superblock
 		SPDK_DEBUGLOG(bdev_raid, "raid superblock found on bdev %s\n", bdev->name);
 		raid_bdev_examine_sb(sb, bdev, raid_bdev_examine_done, bdev);
 		return;
+	case -ENODATA:
+		/* blank or foreign disk (no SPDKRAID signature) */
 	case -EINVAL:
 		/* no valid superblock, check if it can be claimed anyway */
 		raid_bdev_examine_no_sb(bdev);

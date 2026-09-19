@@ -17,6 +17,9 @@ DEFINE_STUB(spdk_bdev_queue_io_wait, int, (struct spdk_bdev *bdev, struct spdk_i
 		struct spdk_bdev_io_wait_entry *entry), 0);
 DEFINE_STUB(spdk_bdev_get_name, const char *, (const struct spdk_bdev *bdev), "test_bdev");
 DEFINE_STUB(spdk_bdev_get_buf_align, size_t, (const struct spdk_bdev *bdev), TEST_BUF_ALIGN);
+/* C1：major≠1 分派依赖模块表查找；UT 中无模块注册，返回 NULL 保持旧行为 */
+DEFINE_STUB(raid_bdev_module_find, struct raid_bdev_module *,
+	    (enum spdk_bdev_raid_level level), NULL);
 
 void *g_buf;
 TAILQ_HEAD(, spdk_bdev_io) g_bdev_io_queue = TAILQ_HEAD_INITIALIZER(g_bdev_io_queue);
@@ -305,7 +308,8 @@ test_raid_bdev_load_base_bdev_superblock(void)
 	status = INT_MAX;
 	rc = raid_bdev_load_base_bdev_superblock(NULL, NULL, load_sb_cb, &status);
 	CU_ASSERT(rc == 0);
-	CU_ASSERT(status == -EINVAL);
+	/* C1：签名不匹配表示空白/异族盘，返回 -ENODATA 供消费方当空白盘处理 */
+	CU_ASSERT(status == -ENODATA);
 	CU_ASSERT(g_read_counter == 1);
 
 	/* make the sb longer than 1 bdev block - expect 2 reads */
@@ -344,7 +348,7 @@ test_raid_bdev_load_base_bdev_superblock(void)
 	status = INT_MAX;
 	rc = raid_bdev_load_base_bdev_superblock(NULL, NULL, load_sb_cb, &status);
 	CU_ASSERT(rc == 0);
-	CU_ASSERT(status == -EINVAL);
+	CU_ASSERT(status == -ENODATA);
 	CU_ASSERT(g_read_counter == 1);
 }
 
@@ -361,11 +365,11 @@ test_raid_bdev_parse_superblock(void)
 	prepare_sb(sb);
 	CU_ASSERT(raid_bdev_parse_superblock(&ctx) == 0);
 
-	/* invalid signature */
+	/* invalid signature - C1: blank/foreign disk yields -ENODATA */
 	prepare_sb(sb);
 	sb->signature[3] = 'Z';
 	raid_bdev_sb_update_crc(sb);
-	CU_ASSERT(raid_bdev_parse_superblock(&ctx) == -EINVAL);
+	CU_ASSERT(raid_bdev_parse_superblock(&ctx) == -ENODATA);
 
 	/* invalid crc */
 	prepare_sb(sb);
