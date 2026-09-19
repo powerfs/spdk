@@ -23,6 +23,7 @@
 #include "spdk/bdev.h"
 #include "poweraid_raid_common.h"
 #include "poweraid_raid_common_merge.h"
+#include "poweraid_raid_common_sb.h"
 #include "poweraid_raid_common_sm.h"
 
 SPDK_LOG_REGISTER_COMPONENT(raid5f_rpc);
@@ -408,3 +409,69 @@ rpc_bdev_poweraid_raid_get_info(struct spdk_jsonrpc_request *request,
 }
 SPDK_RPC_REGISTER("bdev_poweraid_raid_get_info",
 		  rpc_bdev_poweraid_raid_get_info, SPDK_RPC_RUNTIME)
+
+/* ===== clear_disk（擦除已退役成员盘上的 RAID 超级块）=====
+ *
+ * 盘被 bdev_raid_remove_base_bdev 移除后仍保留旧阵列 sb（标记 MISSING），
+ * 不擦除则无法加入新阵列（examine -EEXIST）。本 RPC 显式擦除单个盘头。
+ * 安全门：盘必须当前未被任何阵列 claim（在阵列成员位上会打开失败）。
+ */
+
+struct rpc_clear_disk {
+	char		*bdev;
+	struct spdk_jsonrpc_request *request;
+};
+
+static const struct spdk_json_object_decoder rpc_clear_disk_decoders[] = {
+	{"bdev", offsetof(struct rpc_clear_disk, bdev), spdk_json_decode_string},
+};
+
+static void
+clear_disk_action_cb(int status, void *cb_arg)
+{
+	struct rpc_clear_disk *req = cb_arg;
+
+	if (status != 0) {
+		spdk_jsonrpc_send_error_response_fmt(req->request, status,
+						     "Failed to clear superblock on bdev %s: %s",
+						     req->bdev, spdk_strerror(-status));
+	} else {
+		SPDK_NOTICELOG("clear_disk: superblock erased on bdev %s\n", req->bdev);
+		spdk_jsonrpc_send_bool_response(req->request, true);
+	}
+	free(req->bdev);
+	free(req);
+}
+
+static void
+rpc_bdev_poweraid_raid_clear_disk(struct spdk_jsonrpc_request *request,
+				  const struct spdk_json_val *params)
+{
+	struct rpc_clear_disk *req;
+	int rc;
+
+	req = calloc(1, sizeof(*req));
+	if (req == NULL) {
+		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
+		return;
+	}
+	if (spdk_json_decode_object(params, rpc_clear_disk_decoders,
+				    SPDK_COUNTOF(rpc_clear_disk_decoders), req)) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_PARSE_ERROR,
+						 "spdk_json_decode_object failed");
+		free(req);
+		return;
+	}
+	req->request = request;
+
+	rc = poweraid_raid_common_clear_disk_sb(req->bdev, clear_disk_action_cb, req);
+	if (rc != 0) {
+		spdk_jsonrpc_send_error_response_fmt(request, rc,
+						     "Cannot clear superblock on bdev %s: %s",
+						     req->bdev, spdk_strerror(-rc));
+		free(req->bdev);
+		free(req);
+	}
+}
+SPDK_RPC_REGISTER("bdev_poweraid_raid_clear_disk",
+		  rpc_bdev_poweraid_raid_clear_disk, SPDK_RPC_RUNTIME)

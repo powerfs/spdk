@@ -263,6 +263,21 @@ int poweraid_raid_common_sb_priv_ensure_fresh(struct poweraid_raid_common_raid *
  */
 void poweraid_raid_common_sb_unify_data_offset(struct raid_bdev *rb);
 
+/**
+ * 擦除单个在线 bdev 盘头的 RAID 超级块（盘退役 / 移除后重新利用）。
+ *
+ * 仅处理当前不属于任何阵列的盘：以 write 独占方式打开，在线成员已被
+ * claim 会直接失败。盘头无本族 sb 签名时幂等成功、不写入。擦除完成
+ * （无论是否实际写零）后异步回调一次。
+ *
+ * 返回 0 表示异步流程已受理（cb 最终必被调用）；负数表示同步拒绝
+ * （cb 不会被调用）。
+ */
+typedef void (*poweraid_raid_common_clear_disk_cb)(int status, void *cb_arg);
+int poweraid_raid_common_clear_disk_sb(const char *bdev_name,
+				       poweraid_raid_common_clear_disk_cb cb,
+				       void *cb_arg);
+
 /*
  * struct raid_bdev_module 的 sb 钩子实现，由 5f/6f/1f 薄壳注册。
  * 签名/契约与 bdev_raid.h 中对应字段一致。

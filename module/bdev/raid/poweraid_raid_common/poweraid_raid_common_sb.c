@@ -1041,3 +1041,203 @@ poweraid_raid_common_sb_hook_clear(struct raid_bdev *rb, raid_bdev_write_sb_cb c
 
 	sb_write_loop(wctx);
 }
+
+/* ===== 单盘 sb 擦除（盘退役 / 重用）=====
+ *
+ * 被 bdev_raid_remove_base_bdev 移除但仍在线的盘，盘头保留旧阵列 sb
+ * （slot 标记 MISSING，供同阵列重插识别）。该盘要加入新阵列前必须清除
+ * 旧 sb，否则框架 examine 以 -EEXIST 拒绝。本函数供显式运维 RPC 使用。
+ *
+ * 安全约束：
+ *   - spdk_bdev_open_ext(write=true) 对已被阵列 claim 的在线成员必然失败，
+ *     因此不可能误擦在用盘；
+ *   - 仅在盘头读到 RAID_BDEV_SB_SIG 时才写零；空白盘/异族盘幂等成功、
+ *     绝不写入；
+ *   - 擦除窗口与 hook_clear 一致：LBA0 起 4KiB（v1 头 + v2 ext 均在内），
+ *     PPL/MWL 区由新阵列 fresh init 覆盖。
+ */
+
+#define POWERAID_CLEAR_DISK_WINDOW	4096u
+
+struct poweraid_raid_common_clear_disk_ctx {
+	struct spdk_bdev_desc			*desc;
+	struct spdk_io_channel			*ch;
+	void					*buf;
+	uint32_t				buf_size;
+	uint32_t				num_blocks;
+	struct spdk_bdev_io_wait_entry		wait_entry;
+	poweraid_raid_common_clear_disk_cb	cb;
+	void					*cb_arg;
+};
+
+static void clear_disk_finish(struct poweraid_raid_common_clear_disk_ctx *c, int status);
+static void clear_disk_submit_read(void *arg);
+static void clear_disk_submit_write(void *arg);
+
+/* 擦除是短生命周期操作：期间不期待热移除事件，收到仅记录（描述符随后关闭）。 */
+static void
+clear_disk_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *event_ctx)
+{
+	SPDK_WARNLOG("clear_disk: bdev %s event %d during clear\n",
+		     spdk_bdev_get_name(bdev), type);
+}
+
+static void
+clear_disk_finish(struct poweraid_raid_common_clear_disk_ctx *c, int status)
+{
+	if (c->ch != NULL) {
+		spdk_put_io_channel(c->ch);
+	}
+	if (c->desc != NULL) {
+		spdk_bdev_close(c->desc);
+	}
+	if (c->buf != NULL) {
+		spdk_dma_free(c->buf);
+	}
+	c->cb(status, c->cb_arg);
+	free(c);
+}
+
+static void
+clear_disk_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct poweraid_raid_common_clear_disk_ctx *c = cb_arg;
+	int status = success ? 0 : -EIO;
+
+	if (!success) {
+		SPDK_ERRLOG("clear_disk: sb zero write failed on bdev %s\n",
+			    bdev_io->bdev ? bdev_io->bdev->name : "(unknown)");
+	}
+	spdk_bdev_free_io(bdev_io);
+	clear_disk_finish(c, status);
+}
+
+static void
+clear_disk_submit_write(void *arg)
+{
+	struct poweraid_raid_common_clear_disk_ctx *c = arg;
+	struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(c->desc);
+	int rc;
+
+	rc = spdk_bdev_write_blocks(c->desc, c->ch, c->buf, 0,
+				    c->num_blocks, clear_disk_write_cb, c);
+	if (rc == -ENOMEM) {
+		c->wait_entry.bdev = bdev;
+		c->wait_entry.cb_fn = clear_disk_submit_write;
+		c->wait_entry.cb_arg = c;
+		spdk_bdev_queue_io_wait(bdev, c->ch, &c->wait_entry);
+		return;
+	}
+	if (rc != 0) {
+		SPDK_ERRLOG("clear_disk: write_blocks rc=%d on bdev %s\n",
+			    rc, bdev->name);
+		clear_disk_finish(c, rc);
+	}
+}
+
+static void
+clear_disk_read_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct poweraid_raid_common_clear_disk_ctx *c = cb_arg;
+	struct raid_bdev_superblock *sb = c->buf;
+	struct spdk_bdev *bdev;
+
+	spdk_bdev_free_io(bdev_io);
+	if (!success) {
+		SPDK_ERRLOG("clear_disk: sb probe read failed\n");
+		clear_disk_finish(c, -EIO);
+		return;
+	}
+
+	/* 无本族 sb 签名：空白盘或异族盘，幂等成功且绝不写入。 */
+	if (memcmp(sb->signature, RAID_BDEV_SB_SIG, sizeof(sb->signature)) != 0) {
+		bdev = spdk_bdev_desc_get_bdev(c->desc);
+		SPDK_NOTICELOG("clear_disk: no raid superblock on bdev %s, nothing to clear\n",
+			       bdev->name);
+		clear_disk_finish(c, 0);
+		return;
+	}
+
+	memset(c->buf, 0, c->buf_size);
+	clear_disk_submit_write(c);
+}
+
+static void
+clear_disk_submit_read(void *arg)
+{
+	struct poweraid_raid_common_clear_disk_ctx *c = arg;
+	struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(c->desc);
+	int rc;
+
+	rc = spdk_bdev_read_blocks(c->desc, c->ch, c->buf, 0,
+				   c->num_blocks, clear_disk_read_cb, c);
+	if (rc == -ENOMEM) {
+		c->wait_entry.bdev = bdev;
+		c->wait_entry.cb_fn = clear_disk_submit_read;
+		c->wait_entry.cb_arg = c;
+		spdk_bdev_queue_io_wait(bdev, c->ch, &c->wait_entry);
+		return;
+	}
+	if (rc != 0) {
+		SPDK_ERRLOG("clear_disk: read_blocks rc=%d on bdev %s\n",
+			    rc, bdev->name);
+		clear_disk_finish(c, rc);
+	}
+}
+
+int
+poweraid_raid_common_clear_disk_sb(const char *bdev_name,
+				   poweraid_raid_common_clear_disk_cb cb, void *cb_arg)
+{
+	struct poweraid_raid_common_clear_disk_ctx *c;
+	struct spdk_bdev *bdev;
+	uint32_t data_bs;
+	int rc;
+
+	if (bdev_name == NULL || cb == NULL) {
+		return -EINVAL;
+	}
+	bdev = spdk_bdev_get_by_name(bdev_name);
+	if (bdev == NULL) {
+		return -ENODEV;
+	}
+
+	c = calloc(1, sizeof(*c));
+	if (c == NULL) {
+		return -ENOMEM;
+	}
+	c->cb = cb;
+	c->cb_arg = cb_arg;
+
+	/* 安全门：write 独占打开。属于在线阵列的盘已被 claim，此处必然失败。 */
+	rc = spdk_bdev_open_ext(bdev_name, true, clear_disk_event_cb, NULL, &c->desc);
+	if (rc != 0) {
+		SPDK_ERRLOG("clear_disk: cannot open bdev %s for write: %s\n",
+			    bdev_name, spdk_strerror(-rc));
+		free(c);
+		return rc;
+	}
+
+	c->ch = spdk_bdev_get_io_channel(c->desc);
+	if (c->ch == NULL) {
+		spdk_bdev_close(c->desc);
+		free(c);
+		return -ENOMEM;
+	}
+
+	data_bs = spdk_bdev_get_data_block_size(bdev);
+	c->num_blocks = spdk_divide_round_up(POWERAID_CLEAR_DISK_WINDOW, data_bs);
+	c->buf_size = c->num_blocks * data_bs;
+	c->buf = spdk_dma_zmalloc(c->buf_size, spdk_bdev_get_buf_align(bdev), NULL);
+	if (c->buf == NULL) {
+		spdk_put_io_channel(c->ch);
+		spdk_bdev_close(c->desc);
+		free(c);
+		return -ENOMEM;
+	}
+
+	SPDK_NOTICELOG("clear_disk: clearing superblock window on bdev %s (%u blocks)\n",
+		       bdev_name, c->num_blocks);
+	clear_disk_submit_read(c);
+	return 0;
+}
