@@ -2788,13 +2788,17 @@ static void
 raid_bdev_process_finish_unquiesce(void *ctx)
 {
 	struct raid_bdev_process *process = ctx;
-	int rc;
 
-	rc = spdk_bdev_unquiesce(&process->raid_bdev->bdev, &g_raid_if,
-				 raid_bdev_process_finish_unquiesced, process);
-	if (rc != 0) {
-		raid_bdev_process_finish_unquiesced(process, rc);
-	}
+	/* 必须与 _raid_bdev_process_finish 跳过 full-bdev quiesce 严格配对：
+	 * poweraid 用模块级 gate（rebuild_gate_classify）做窗口同步，process 生命周期
+	 * 内从未通过 spdk_bdev_quiesce 注册 full-bdev range。此处若仍调用
+	 * spdk_bdev_unquiesce，bdev 层在 quiesced_ranges 中找不到精确匹配的
+	 * [0, blockcnt)，必然返回 -EINVAL（"The range to unquiesce was not found"），
+	 * 每次 rebuild 完成都误报两条 ERROR；理论上还可能在与 remove 路径重叠时
+	 * 错误释放对方持有的同名 range。gate 模式下无锁可放，直接按成功完成。
+	 * 失败 rebuild 的目标盘移除由 raid_bdev_process_finish_unquiesced 依据
+	 * process->status 处理，不受影响。 */
+	raid_bdev_process_finish_unquiesced(process, 0);
 }
 
 static void
