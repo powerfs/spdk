@@ -250,6 +250,14 @@ const struct poweraid_raid_common_sb_v2_ext *poweraid_raid_common_sb_loaded_get_
 int poweraid_raid_common_sb_priv_adopt(struct poweraid_raid_common_raid *raid);
 
 /**
+ * superblock=false 的新卷：框架不持久化 sb（configure 直接 cont、不走委托写，
+ * rb->sb 恒空），私有 ctx 无入口建立。按新卷语义惰性建 ctx 并填 ext 默认
+ * region 布局，仅供 PPL/MWL fresh init 查询几何；不落盘，重启不重装配。
+ * 已有 ctx 时为空操作。返回 0 成功，负数失败。
+ */
+int poweraid_raid_common_sb_priv_ensure_fresh(struct poweraid_raid_common_raid *raid);
+
+/**
  * C7：data_offset 单轨。新卷 shell start() 早期调用，把框架预填的 1MiB
  * 成员保留统一为 5MiB（PPL/MWL 区）口径；重装配卷（rb->sb != NULL）为空操作。
  */

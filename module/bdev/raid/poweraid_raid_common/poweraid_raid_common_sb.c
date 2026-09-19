@@ -823,10 +823,15 @@ sb_priv_compose(struct poweraid_raid_common_raid *raid)
 }
 
 /* C7：data_offset 单轨。
- * 新卷在 shell start() 早期调用：把框架按 1MiB 预填的成员 data_offset/data_size
+ * 新卷在 shell start() 早期调用：把框架预填的成员 data_offset/data_size
  * 统一改为 PPL/MWL 区口径（[1MiB,5MiB)，4K 盘下 1280 块），随后框架
  * init 公共头会把该值写入成员表，poweraid 不再二次扣除。
- * 重装配卷（rb->sb != NULL）不动：成员表以盘上回放值为权威。 */
+ * 重装配卷（rb->sb != NULL）不动：成员表以盘上回放值为权威。
+ * superblock=false 的新卷框架不设 1MiB 预留（data_offset=0、data_size=全盘，
+ * bdev_raid_configure_base_bdev_cont 仅在 superblock_enabled 时预留），若照旧
+ * 跳过，卷数据区将从 LBA0 起与 sb/PPL/MWL 区重叠（RMW 的 PPL 记录写会覆写
+ * 用户数据，verify 读到 PPL 签名；1f 还会因 offset=0 被 start 几何校验拒绝），
+ * 故 offset=0 的已配置成员同样纳入统一。 */
 void
 poweraid_raid_common_sb_unify_data_offset(struct raid_bdev *rb)
 {
@@ -844,7 +849,7 @@ poweraid_raid_common_sb_unify_data_offset(struct raid_bdev *rb)
 	RAID_FOR_EACH_BASE_BDEV(rb, base_info) {
 		uint64_t end_blocks;
 
-		if (base_info->desc == NULL || base_info->data_offset == 0) {
+		if (base_info->desc == NULL) {
 			continue;
 		}
 		end_blocks = base_info->data_offset + base_info->data_size;
@@ -879,6 +884,36 @@ poweraid_raid_common_sb_priv_adopt(struct poweraid_raid_common_raid *raid)
 	assert(total <= ctx->raw_size);
 	memcpy(ctx->raw, rb->sb, total);
 	ctx->num_base_bdevs = rb->sb->num_base_bdevs;
+
+	return 0;
+}
+
+/* superblock=false 的新卷：无框架公共段可 adopt，按新卷语义惰性建立私有
+ * ctx（仅 ext region 布局供 PPL/MWL fresh init 查询；不落盘）。 */
+int
+poweraid_raid_common_sb_priv_ensure_fresh(struct poweraid_raid_common_raid *raid)
+{
+	struct poweraid_raid_common_sb_ctx *ctx;
+	uint32_t feature_flags;
+	int rc;
+
+	if (raid == NULL || raid->raid_bdev == NULL) {
+		return -EINVAL;
+	}
+	if (raid->sb_ctx != NULL) {
+		return 0;
+	}
+
+	rc = poweraid_raid_common_sb_alloc(raid, raid->raid_bdev->bdev.blocklen,
+					   raid->raid_bdev->num_base_bdevs);
+	if (rc != 0) {
+		return rc;
+	}
+	ctx = raid->sb_ctx;
+	feature_flags = raid->level == SPDK_BDEV_RAID_LEVEL_RAID1F ?
+			POWERAID_RAID_COMMON_SB_F_MWL :
+			POWERAID_RAID_COMMON_SB_F_PPL;
+	sb_ext_init(ctx, raid->level, raid->strip_size, feature_flags);
 
 	return 0;
 }

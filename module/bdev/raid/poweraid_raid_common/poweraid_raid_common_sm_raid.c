@@ -659,13 +659,29 @@ poweraid_raid_common_sm_raid_online(struct poweraid_raid_common_raid *raid,
 	}
 
 	if (all_fresh) {
-		SPDK_NOTICELOG("online: fresh volume, awaiting framework sb persist raid=%s\n",
+		if (raid->raid_bdev != NULL && raid->raid_bdev->superblock_enabled) {
+			SPDK_NOTICELOG("online: fresh volume, awaiting framework sb persist raid=%s\n",
+				       raid->name);
+			/* 框架 configure 的委托写在 start() 返回后发起；此处注册的回调由
+			 * sb_hook_write 完成路径派发一次。 */
+			raid->sb_persist_done_cb = fresh_persist_done;
+			raid->sb_persist_done_arg = raid;
+			return;  /* raid_enter_online 由持久化回调触发 */
+		}
+
+		/* superblock=false：框架 configure 对 sb 关闭的卷直接 cont、永不走
+		 * 委托写（bdev_raid_configure），上面的持久化回调不会派发——照旧
+		 * 等待将永不上线（回归：fio 停在 Starting 无 IO 下发）。
+		 * 非持久卷按 create 语义不落盘 sb（重启不重装配），本地建 ctx 取
+		 * PPL/MWL region 布局后直接 fresh init 上线。 */
+		SPDK_NOTICELOG("online: fresh volume, superblock disabled, direct init raid=%s\n",
 			       raid->name);
-		/* 框架 configure 的委托写在 start() 返回后发起；此处注册的回调由
-		 * sb_hook_write 完成路径派发一次。 */
-		raid->sb_persist_done_cb = fresh_persist_done;
-		raid->sb_persist_done_arg = raid;
-		return;  /* raid_enter_online 由持久化回调触发 */
+		if (poweraid_raid_common_sb_priv_ensure_fresh(raid) != 0) {
+			SPDK_ERRLOG("online: fresh sb ctx alloc failed raid=%s, "
+				    "online without PPL/MWL init\n", raid->name);
+		}
+		fresh_persist_done(0, raid);
+		return;
 	}
 
 	raid_enter_online(raid);
