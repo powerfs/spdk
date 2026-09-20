@@ -556,8 +556,8 @@ poweraid_raid_common_submit_read_request(struct raid_bdev_io *raid_io)
 	struct raid_base_bdev_info *base_info = &raid_bdev->base_bdev_info[chunk_idx];
 	struct spdk_io_channel *base_ch;
 	uint64_t chunk_offset = stripe_offset - (chunk_data_idx << raid_bdev->strip_size_shift);
-	uint64_t base_offset = raid->data_offset_blocks +
-			       (stripe_index << raid_bdev->strip_size_shift) + chunk_offset;
+	/* helper 内部已加 base_info->data_offset，此处传 stripe 相对偏移 */
+	uint64_t base_offset = (stripe_index << raid_bdev->strip_size_shift) + chunk_offset;
 	struct spdk_bdev_ext_io_opts io_opts = {0};
 
 	io_opts.size = sizeof(io_opts);

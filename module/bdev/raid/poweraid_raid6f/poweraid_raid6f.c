@@ -506,8 +506,8 @@ poweraid_raid6f_submit_read_request(struct raid_bdev_io *raid_io)
 	poweraid_raid_common_get_parity_idx(raid, stripe_index, &p_idx, &q_idx);
 	chunk_idx = poweraid_raid_common_data_to_phys(chunk_data_idx, p_idx, q_idx, raid->num_base_bdevs);
 	base_info = &raid_bdev->base_bdev_info[chunk_idx];
-	base_offset = raid->data_offset_blocks +
-		      (stripe_index << raid_bdev->strip_size_shift) + chunk_offset;
+	/* helper 内部已加 base_info->data_offset，此处传 stripe 相对偏移 */
+	base_offset = (stripe_index << raid_bdev->strip_size_shift) + chunk_offset;
 
 	/* 目标盘故障（热拔/通道释放/IO error 标记）→ 从 P/Q 降级重建 */
 	if (poweraid_raid6f_slot_faulted(raid, raid_io->raid_ch, chunk_idx)) {

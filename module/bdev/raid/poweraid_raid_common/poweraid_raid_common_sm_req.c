@@ -241,8 +241,8 @@ poweraid_raid_common_req_ppl_append_done(int status, uint64_t seq, void *cb_arg)
 
 		iov.iov_base = buf;
 		iov.iov_len = strip_size_bytes;
-		base_offset = raid->data_offset_blocks +
-			       req->stripe_index * raid->strip_size;
+		/* helper 内部已加 base_info->data_offset，此处传 stripe 相对偏移 */
+		base_offset = req->stripe_index * raid->strip_size;
 
 		/* 回调：decrement remaining，全部完成后 → flush */
 		rc = raid_bdev_writev_blocks_ext(base_info, base_ch, &iov, 1,
@@ -331,8 +331,8 @@ poweraid_raid_common_req_start_flushes(struct poweraid_raid_common_req *req)
 			continue;
 		}
 
-		base_offset = raid->data_offset_blocks +
-			       req->stripe_index * raid->strip_size;
+		/* helper 内部已加 base_info->data_offset，此处传 stripe 相对偏移 */
+		base_offset = req->stripe_index * raid->strip_size;
 		rc = raid_bdev_flush_blocks(base_info, base_ch, base_offset,
 					    raid->strip_size,
 					    poweraid_raid_common_req_chunk_io_cb, req);

@@ -181,8 +181,8 @@ rmw_start_reads(struct rmw_op *op)
 {
 	struct raid_bdev *raid_bdev = op->raid_bdev;
 	struct poweraid_raid_common_raid *raid = op->raid;
-	uint64_t base_offset = raid->data_offset_blocks +
-			       op->stripe_index * raid->strip_size;
+	/* helper 内部已加 base_info->data_offset，此处传 stripe 相对偏移 */
+	uint64_t base_offset = op->stripe_index * raid->strip_size;
 	uint64_t bits = op->chunk_bitmap;
 	uint32_t buf_idx = 0;
 	int rc;
@@ -438,8 +438,8 @@ rmw_start_writes(struct rmw_op *op)
 {
 	struct raid_bdev *raid_bdev = op->raid_bdev;
 	struct poweraid_raid_common_raid *raid = op->raid;
-	uint64_t base_offset = raid->data_offset_blocks +
-			       op->stripe_index * raid->strip_size;
+	/* helper 内部已加 base_info->data_offset，此处传 stripe 相对偏移 */
+	uint64_t base_offset = op->stripe_index * raid->strip_size;
 	uint64_t bits = op->chunk_bitmap;
 	uint32_t buf_idx = 0;
 	int rc;
@@ -578,8 +578,8 @@ rmw_start_flushes(struct rmw_op *op)
 {
 	struct raid_bdev *raid_bdev = op->raid_bdev;
 	struct poweraid_raid_common_raid *raid = op->raid;
-	uint64_t base_offset = raid->data_offset_blocks +
-			       op->stripe_index * raid->strip_size;
+	/* helper 内部已加 base_info->data_offset，此处传 stripe 相对偏移 */
+	uint64_t base_offset = op->stripe_index * raid->strip_size;
 	uint64_t bits = op->chunk_bitmap;
 	int rc;
 
