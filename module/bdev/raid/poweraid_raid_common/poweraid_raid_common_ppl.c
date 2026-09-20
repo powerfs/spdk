@@ -6,12 +6,13 @@
  *   详见 poweraid_raid_common_ppl.h 与 raid5f-enhanced-design.md 第 3.1 / 3.7 节。
  *
  *   阶段 2 策略（正确性优先）：
- *     - 线性日志，无回卷/回收（满则 -ENOSPC；测试场景容量足够）。
+ *     - 线性日志，满则 backpressure（issue #14）：append 请求入队等待 commit 释放 slot。
  *     - 每 record 占一个 block_size slot（record 64B 置于 slot 起始，余清零），
  *       单 record 独立 FUA，无需读改写。
  *     - FUA = spdk_bdev_write_blocks + spdk_bdev_flush_blocks（bdev 无关）。
  *     - per-op DMA scratch buffer（spdk_dma_malloc），cb 中释放，避免并发冲突。
  *     - super 与 record 共享同一 PPL 区：slot 0 = super，slot 1..N = records。
+ *     - slot / seq 在 append_record 入口同步预占（并发安全），异步写完成时仅插 inflight。
  *
  *   TODO（后续阶段）：64B 紧凑打包 + 批量 FUA + 环形回卷回收，降低写放大。
  */
@@ -41,11 +42,28 @@ struct poweraid_raid_common_ppl_ctx {
 	/* 内存 super 镜像（append/commit 时更新并写盘；load_replay 时从盘加载）*/
 	struct poweraid_raid_common_ppl_super	super;
 
-	/* 线性日志写指针：下一条 record 写入的 slot 下标（1..max_slots-1；0=super）*/
+	/* 线性日志写指针：下一条 record 写入的 slot 下标（1..max_slots-1；0=super）。
+	 * 同步预占：在 append_record 入口即递增，避免并发 append 拿到相同 slot。*/
 	uint32_t			tail_slot;
 
 	/* in-flight（已 append 待 commit）记录链表，保证 commit 顺序 */
 	TAILQ_HEAD(, poweraid_raid_common_ppl_inflight)	inflight;
+
+	/* backpressure 等待队列：PPL 满时挂起 append 请求，commit 释放 slot 后唤醒。
+	 * 解决 issue #14：高并发写时 PPL 满（-ENOSPC）降级无 PPL 保护的问题。*/
+	TAILQ_HEAD(, poweraid_raid_common_ppl_waiter)	waiters;
+};
+
+/* backpressure 等待者：PPL 满时暂存 append 参数，commit 唤醒后重发 append */
+struct poweraid_raid_common_ppl_waiter {
+	struct spdk_io_channel		*ch;
+	uint64_t			stripe_id;
+	uint64_t			chunk_bitmap;
+	uint64_t			old_data_hash;
+	uint64_t			new_data_hash;
+	poweraid_raid_common_ppl_append_cb	cb;
+	void				*cb_arg;
+	TAILQ_ENTRY(poweraid_raid_common_ppl_waiter)	link;
 };
 
 /* ===== append 异步操作 ===== */
@@ -259,6 +277,7 @@ poweraid_raid_common_ppl_alloc(void *bdev_desc, struct spdk_io_channel *ch,
 	ctx->max_slots = region_size / block_size;
 	ctx->tail_slot = 1;  /* slot 0 = super，record 从 slot 1 起 */
 	TAILQ_INIT(&ctx->inflight);
+	TAILQ_INIT(&ctx->waiters);
 
 	/* 内存 super 初始（写盘由 ppl_init 触发；加载由 ppl_load_replay 触发）*/
 	memset(&ctx->super, 0, sizeof(ctx->super));
@@ -277,6 +296,7 @@ void
 poweraid_raid_common_ppl_free(struct poweraid_raid_common_ppl_ctx *ctx)
 {
 	struct poweraid_raid_common_ppl_inflight *inf;
+	struct poweraid_raid_common_ppl_waiter *w;
 
 	if (ctx == NULL) {
 		return;
@@ -284,6 +304,12 @@ poweraid_raid_common_ppl_free(struct poweraid_raid_common_ppl_ctx *ctx)
 	while ((inf = TAILQ_FIRST(&ctx->inflight)) != NULL) {
 		TAILQ_REMOVE(&ctx->inflight, inf, link);
 		free(inf);
+	}
+	/* 唤醒所有等待者并报错（ctx 即将销毁，不能再 append）*/
+	while ((w = TAILQ_FIRST(&ctx->waiters)) != NULL) {
+		TAILQ_REMOVE(&ctx->waiters, w, link);
+		w->cb(-ECANCELED, 0, w->cb_arg);
+		free(w);
 	}
 	free(ctx);
 }
@@ -478,10 +504,7 @@ ppl_append_loop(struct ppl_append_op *op)
 	/* DONE */
 	if (op->status == 0) {
 		struct poweraid_raid_common_ppl_inflight *inf;
-		ctx->super.tail_seq = op->seq + 1;
-		ctx->super.next_seq = op->seq + 1;
-		ctx->super.num_records++;
-		ctx->tail_slot++;
+		/* tail_slot / next_seq 已在 append_record 入口同步预占，此处仅插 inflight */
 		inf = calloc(1, sizeof(*inf));
 		if (inf) {
 			inf->seq = op->seq;
@@ -490,6 +513,7 @@ ppl_append_loop(struct ppl_append_op *op)
 		}
 		op->cb(0, op->seq, op->cb_arg);
 	} else {
+		/* 写失败：slot/seq 已预占，留洞（replay 时 magic+crc 过滤），不影响正确性 */
 		op->cb(op->status, 0, op->cb_arg);
 	}
 	spdk_free(op->buf);
@@ -504,6 +528,7 @@ poweraid_raid_common_ppl_append_record(struct poweraid_raid_common_ppl_ctx *ctx,
 				  poweraid_raid_common_ppl_append_cb cb, void *cb_arg)
 {
 	struct ppl_append_op *op;
+	struct poweraid_raid_common_ppl_waiter *w;
 	uint64_t seq;
 	uint32_t slot;
 
@@ -516,9 +541,25 @@ poweraid_raid_common_ppl_append_record(struct poweraid_raid_common_ppl_ctx *ctx,
 		 * slot 回卷到 1。seq 仍由 super.next_seq 单调分配，与 slot 解耦；
 		 * 盘上未及覆盖的陈旧 record 在 replay 时按 seq <= commit_seq 过滤。*/
 		if (!TAILQ_EMPTY(&ctx->inflight)) {
-			SPDK_ERRLOG("ppl_append: log full with inflight (ctx=%p tail=%u max=%u)\n",
-				    ctx, ctx->tail_slot, ctx->max_slots);
-			cb(-ENOSPC, 0, cb_arg);
+			/* backpressure：PPL 满且有 in-flight 未 commit。
+			 * 不再降级写无 PPL 保护（issue #14），而是挂起请求，
+			 * 等 commit 释放 slot 后由 ppl_wake_waiters 唤醒重发。*/
+			w = calloc(1, sizeof(*w));
+			if (!w) {
+				cb(-ENOMEM, 0, cb_arg);
+				return;
+			}
+			w->ch = ch;
+			w->stripe_id = stripe_id;
+			w->chunk_bitmap = chunk_bitmap;
+			w->old_data_hash = old_data_hash;
+			w->new_data_hash = new_data_hash;
+			w->cb = cb;
+			w->cb_arg = cb_arg;
+			TAILQ_INSERT_TAIL(&ctx->waiters, w, link);
+			SPDK_NOTICELOG("ppl_append: log full, backpressure queueing "
+				       "(ctx=%p tail=%u max=%u waiters++\n",
+				       ctx, ctx->tail_slot, ctx->max_slots);
 			return;
 		}
 		SPDK_NOTICELOG("poweraid_raid_common_ppl: ring recycle (next_seq=%"PRIu64")\n",
@@ -526,8 +567,14 @@ poweraid_raid_common_ppl_append_record(struct poweraid_raid_common_ppl_ctx *ctx,
 		ctx->tail_slot = 1;
 	}
 
+	/* 同步预占 slot + seq：避免并发 append 在异步写完成前拿到相同 slot/seq。
+	 * 此处递增后即使写失败也只留洞，不影响正确性（replay magic+crc 过滤）。*/
 	seq = ctx->super.next_seq;
 	slot = ctx->tail_slot;
+	ctx->tail_slot++;
+	ctx->super.next_seq = seq + 1;
+	ctx->super.tail_seq = seq + 1;
+	ctx->super.num_records++;
 
 	op = calloc(1, sizeof(*op));
 	if (!op) {
@@ -571,6 +618,38 @@ poweraid_raid_common_ppl_append_record(struct poweraid_raid_common_ppl_ctx *ctx,
 
 static void ppl_commit_io_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
 static void ppl_commit_loop(struct ppl_commit_op *op);
+
+/*
+ * backpressure 唤醒：commit 释放 in-flight slot 后，检查等待队列。
+ * 若有空闲 slot（tail_slot < max_slots）或可回卷（inflight 空 → tail_slot=1），
+ * 逐个唤醒等待者重发 append。append_record 同步预占 slot，确保不会过度唤醒。
+ */
+static void
+ppl_wake_waiters(struct poweraid_raid_common_ppl_ctx *ctx)
+{
+	struct poweraid_raid_common_ppl_waiter *w;
+
+	while ((w = TAILQ_FIRST(&ctx->waiters)) != NULL) {
+		if (ctx->tail_slot >= ctx->max_slots) {
+			if (TAILQ_EMPTY(&ctx->inflight)) {
+				SPDK_NOTICELOG("ppl_wake: ring recycle (next_seq=%"PRIu64")\n",
+					       ctx->super.next_seq);
+				ctx->tail_slot = 1;
+			} else {
+				break;  /* 仍然满，等待下次 commit */
+			}
+		}
+		TAILQ_REMOVE(&ctx->waiters, w, link);
+		SPDK_DEBUGLOG(raid5f_ppl, "ppl_wake: re-issue append stripe=%"PRIu64
+			      " bitmap=0x%"PRIx64"\n", w->stripe_id, w->chunk_bitmap);
+		/* 重发 append：同步预占 slot，若再次满则重新入队（尾部）*/
+		poweraid_raid_common_ppl_append_record(ctx, w->ch,
+						       w->stripe_id, w->chunk_bitmap,
+						       w->old_data_hash, w->new_data_hash,
+						       w->cb, w->cb_arg);
+		free(w);
+	}
+}
 
 static void
 ppl_commit_io_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
@@ -635,12 +714,22 @@ ppl_commit_loop(struct ppl_commit_op *op)
 	/* DONE */
 	if (op->status == 0) {
 		struct poweraid_raid_common_ppl_inflight *inf, *tmp;
+		uint32_t removed = 0;
 		TAILQ_FOREACH_SAFE(inf, &ctx->inflight, link, tmp) {
 			if (inf->seq <= op->commit_seq) {
 				TAILQ_REMOVE(&ctx->inflight, inf, link);
 				free(inf);
+				removed++;
 			}
 		}
+		/* 更新 num_records / head_seq 以反映已 commit 的回收量 */
+		if (removed > 0) {
+			ctx->super.num_records = (ctx->super.num_records > removed)
+				? (ctx->super.num_records - removed) : 0;
+			ctx->super.head_seq = op->commit_seq + 1;
+		}
+		/* backpressure 唤醒：释放 slot 后通知等待者 */
+		ppl_wake_waiters(ctx);
 	}
 	op->cb(op->status, op->cb_arg);
 	spdk_free(op->buf);

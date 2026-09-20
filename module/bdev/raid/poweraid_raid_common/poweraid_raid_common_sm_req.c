@@ -200,7 +200,9 @@ poweraid_raid_common_req_ppl_append_done(int status, uint64_t seq, void *cb_arg)
 		      req, status, seq);
 
 	if (status != 0) {
-		SPDK_ERRLOG("ppl append failed (%d), continue write without PPL\n", status);
+		/* PPL append 失败仅由真实 IO 错误或 ctx 销毁（-ECANCELED）引起；
+		 * -ENOSPC 由 backpressure 队列吸收，不会到达此处。降级写无 PPL 保护。*/
+		SPDK_ERRLOG("ppl append failed (%d), degrade write without PPL\n", status);
 	}
 	req->ppl_seq = (status == 0) ? seq : 0;
 

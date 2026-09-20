@@ -16,6 +16,9 @@
  *     - 日志槽位按 block_size 步进，最大 record 数 = region_size / block_size。
  *       4 MiB / 512B = 8192；4 MiB / 4096B = 1024（阶段 2 测试足够）。
  *     - 满一轮后回收已 commit 的 slot（head 前进）。
+ *     - backpressure（issue #14）：日志满且有 in-flight 未 commit 时，append 请求入队等待，
+ *       commit 释放 slot 后自动唤醒重发，不再降级写无 PPL 保护。
+ *     - 并发安全：slot / seq 在 append_record 入口同步预占，避免异步写完成前并发 append 拿到相同 slot。
  *   TODO（后续阶段）：按 64B 紧凑打包 record + 整块缓存批量 FUA，降低写放大。
  */
 
