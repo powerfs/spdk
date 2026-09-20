@@ -81,6 +81,12 @@ struct rmw_op {
 	/* 完成回调（合并层路径用；直接路径为 NULL → raid_bdev_io_complete）*/
 	void					(*complete_cb)(int status, void *cb_arg);
 	void					*complete_cb_arg;
+
+	/* sub-strip 写支持（issue #14）：raid_io 数据只覆盖 strip 一部分，
+	 * 需在读旧 data 后用旧 data 填充 new_data_buf 再覆盖 sub-strip 新数据。*/
+	bool					is_sub_strip;
+	uint32_t				sub_strip_offset_bytes;	/* strip 内偏移 */
+	uint32_t				sub_strip_len_bytes;	/* sub-strip 数据长度 */
 };
 
 /* 前向声明 */
@@ -332,6 +338,7 @@ rmw_calc_and_next(struct rmw_op *op)
 	uint64_t old_hash, new_hash;
 	uint64_t bits;
 	uint32_t buf_idx, j;
+	int rc;
 
 	if (!rmw_can_proceed(op)) {
 		SPDK_WARNLOG("rmw: raid offline during reads, abort op=%p\n", op);
@@ -346,6 +353,24 @@ rmw_calc_and_next(struct rmw_op *op)
 	}
 
 	op->state = RMW_S_CALC;
+
+	/* sub-strip 写：读旧 data 完成后，用旧 data 填充 new_data_buf，
+	 * 再用 raid_io 数据覆盖 sub-strip 区域，形成完整 strip 新数据。
+	 * 之后 XOR 计算 parity 与 strip 对齐路径完全一致。*/
+	if (op->is_sub_strip) {
+		memcpy(op->new_data_buf, op->old_data_buf, op->strip_bytes);
+		rc = (int)spdk_iovcpy(op->raid_io->iovs, op->raid_io->iovcnt,
+			&(struct iovec){
+				.iov_base = (char *)op->new_data_buf + op->sub_strip_offset_bytes,
+				.iov_len = op->sub_strip_len_bytes,
+			}, 1);
+		if (rc != (int)op->sub_strip_len_bytes) {
+			SPDK_ERRLOG("rmw sub-strip iovcpy short copied=%d expect=%u\n",
+				    rc, op->sub_strip_len_bytes);
+			rmw_op_finish(op, SPDK_BDEV_IO_STATUS_FAILED);
+			return;
+		}
+	}
 
 	/* 新 parity = 旧 parity ^ (旧 data[i] ^ 新 data[i]) for each modified i
 	 * 原地更新 parity_buf：先已是旧 parity，XOR 进 (old ^ new) 即得新 parity。
@@ -809,7 +834,8 @@ poweraid_raid_common_rmw_submit(struct raid_bdev_io *raid_io)
 	uint64_t stripe_offset = raid_io->offset_blocks % stripe_blocks;
 	uint32_t strip_size_bytes = raid->strip_size * raid->block_size;
 	uint32_t start_chunk = stripe_offset / raid->strip_size;
-	uint32_t num_modified = raid_io->num_blocks / raid->strip_size;
+	uint32_t num_modified;
+	bool is_sub_strip;
 	uint8_t p_idx, q_idx;
 	poweraid_raid_common_get_parity_idx(raid, stripe_index, &p_idx, &q_idx);
 	uint64_t chunk_bitmap = 0;
@@ -817,17 +843,30 @@ poweraid_raid_common_rmw_submit(struct raid_bdev_io *raid_io)
 	uint32_t i;
 	int rc;
 
-	/* 校验几何（框架 split 保证，防御性断言）*/
-	if (stripe_offset % raid->strip_size != 0 ||
-	    raid_io->num_blocks % raid->strip_size != 0) {
-		SPDK_ERRLOG("rmw: not strip-aligned offset=%"PRIu64" num=%"PRIu64"\n",
-			    raid_io->offset_blocks, raid_io->num_blocks);
-		return -EINVAL;
+	/* sub-strip 写判断：非 strip 对齐时走 sub-strip 路径（issue #14）*/
+	is_sub_strip = (stripe_offset % raid->strip_size != 0 ||
+			raid_io->num_blocks % raid->strip_size != 0);
+	if (is_sub_strip) {
+		/* sub-strip 写只涉及 1 个 chunk（框架 split_on_optimal_io_boundary 保证不跨 strip）*/
+		num_modified = 1;
+	} else {
+		num_modified = raid_io->num_blocks / raid->strip_size;
 	}
-	if (num_modified == 0 || num_modified >= data_chunks) {
-		SPDK_ERRLOG("rmw: invalid num_modified=%u (data_chunks=%u)\n",
-			    num_modified, data_chunks);
-		return -EINVAL;
+
+	/* 校验几何 */
+	if (is_sub_strip) {
+		/* sub-strip：raid_io 必须在单个 strip 范围内 */
+		if (raid_io->num_blocks > raid->strip_size) {
+			SPDK_ERRLOG("rmw: sub-strip num_blocks too large=%"PRIu64"\n",
+				    raid_io->num_blocks);
+			return -EINVAL;
+		}
+	} else {
+		if (num_modified == 0 || num_modified >= data_chunks) {
+			SPDK_ERRLOG("rmw: invalid num_modified=%u (data_chunks=%u)\n",
+				    num_modified, data_chunks);
+			return -EINVAL;
+		}
 	}
 
 	/* 重建窗口门控：stripe 未被重构覆盖前禁止 RMW（读旧数据/写新校验都会
@@ -866,10 +905,16 @@ poweraid_raid_common_rmw_submit(struct raid_bdev_io *raid_io)
 	op->strip_bytes = strip_size_bytes;
 	op->complete_cb = NULL;
 	op->complete_cb_arg = NULL;
+	op->is_sub_strip = is_sub_strip;
+	if (is_sub_strip) {
+		op->sub_strip_offset_bytes =
+			(stripe_offset % raid->strip_size) * raid->block_size;
+		op->sub_strip_len_bytes = raid_io->num_blocks * raid->block_size;
+	}
 
 	SPDK_DEBUGLOG(raid5f_rmw, "rmw submit: op=%p stripe=%"PRIu64" p_idx=%u"
-		       " bitmap=0x%"PRIx64" num_modified=%u\n",
-		       op, stripe_index, p_idx, chunk_bitmap, num_modified);
+		       " bitmap=0x%"PRIx64" num_modified=%u sub_strip=%d\n",
+		       op, stripe_index, p_idx, chunk_bitmap, num_modified, is_sub_strip);
 
 	rc = rmw_op_alloc(op);
 	if (rc != 0) {
@@ -877,16 +922,22 @@ poweraid_raid_common_rmw_submit(struct raid_bdev_io *raid_io)
 		return rc;
 	}
 
-	/* 从 raid_io iovs 拷贝新数据到 new_data_buf */
-	rc = (int)spdk_iovcpy(raid_io->iovs, raid_io->iovcnt,
-		&(struct iovec){ .iov_base = op->new_data_buf,
-				 .iov_len = (size_t)num_modified * strip_size_bytes },
-		1);
-	if (rc != (int)((size_t)num_modified * strip_size_bytes)) {
-		SPDK_ERRLOG("rmw: iovcpy short copied=%d expect=%zu\n",
-			    rc, (size_t)num_modified * strip_size_bytes);
-		rmw_op_free(op);
-		return -EIO;
+	if (is_sub_strip) {
+		/* sub-strip 写：不在 submit 时拷贝 raid_io 数据（只有 sub-strip 部分），
+		 * 在读旧 data 完成后（rmw_calc_and_next）用旧 data 填充 new_data_buf
+		 * 再覆盖 sub-strip 新数据。*/
+	} else {
+		/* strip 对齐写：从 raid_io iovs 拷贝新数据到 new_data_buf */
+		rc = (int)spdk_iovcpy(raid_io->iovs, raid_io->iovcnt,
+			&(struct iovec){ .iov_base = op->new_data_buf,
+					 .iov_len = (size_t)num_modified * strip_size_bytes },
+			1);
+		if (rc != (int)((size_t)num_modified * strip_size_bytes)) {
+			SPDK_ERRLOG("rmw: iovcpy short copied=%d expect=%zu\n",
+				    rc, (size_t)num_modified * strip_size_bytes);
+			rmw_op_free(op);
+			return -EIO;
+		}
 	}
 
 	/* 启动状态机：Step 1 读旧 data + 旧 parity */

@@ -560,12 +560,13 @@ poweraid_raid_common_merge_submit(struct raid_bdev_io *raid_io)
 		}
 	}
 
-	/* 防御性校验：strip 对齐 */
+	/* strip 对齐校验：非 strip 对齐（sub-strip 写，如 4K）直接走 RMW，不合并 */
 	if (stripe_offset % raid->strip_size != 0 ||
 	    raid_io->num_blocks % raid->strip_size != 0) {
-		SPDK_ERRLOG("merge_submit: not strip-aligned offset=%"PRIu64
-			    " num=%"PRIu64"\n", raid_io->offset_blocks, raid_io->num_blocks);
-		return -EINVAL;
+		SPDK_DEBUGLOG(raid5f_merge, "merge_submit: sub-strip write, redirect to RMW "
+			      "offset=%"PRIu64" num=%"PRIu64"\n",
+			      raid_io->offset_blocks, raid_io->num_blocks);
+		return poweraid_raid_common_rmw_submit(raid_io);
 	}
 
 	/* 分配 pending_io */

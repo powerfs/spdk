@@ -275,7 +275,7 @@ poweraid_raid6f_start(struct raid_bdev *raid_bdev)
 	raid_bdev->bdev.optimal_io_boundary = raid->strip_size;
 	raid_bdev->bdev.split_on_optimal_io_boundary = true;
 	raid_bdev->bdev.write_unit_size = raid->strip_size;
-	raid_bdev->bdev.split_on_write_unit = true;
+	raid_bdev->bdev.split_on_write_unit = false;
 
 	raid->raid_size = raid_bdev->bdev.blockcnt;
 	raid_bdev->module_private = raid;

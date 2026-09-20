@@ -354,11 +354,12 @@ poweraid_raid5f_start(struct raid_bdev *raid_bdev)
 	 *   - 写：每个 IO ≤ strip_size，部分 stripe → RMW 路径。
 	 *     全 stripe 写也被拆成多个 strip 写走 RMW；阶段 3b Merge 优化合并。
 	 *   - 读：每个 IO ≤ strip_size，单 chunk 直读路径可处理。
-	 * write_unit_size=strip_size：要求写 strip 对齐，sub-strip 写被拒绝。*/
+	 * write_unit_size=strip_size + split_on_write_unit=false：放行 sub-strip 写
+	 * （< strip_size），由 RMW 路径处理（读旧 strip → 覆盖新数据 → 重算 parity）。*/
 	raid_bdev->bdev.optimal_io_boundary = raid->strip_size;
 	raid_bdev->bdev.split_on_optimal_io_boundary = true;
 	raid_bdev->bdev.write_unit_size = raid->strip_size;
-	raid_bdev->bdev.split_on_write_unit = true;
+	raid_bdev->bdev.split_on_write_unit = false;
 
 	raid->raid_size = raid_bdev->bdev.blockcnt;
 	raid_bdev->module_private = raid;
