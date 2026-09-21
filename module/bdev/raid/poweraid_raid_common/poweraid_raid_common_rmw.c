@@ -62,11 +62,13 @@ struct rmw_op {
 
 	uint32_t				strip_bytes;
 
-	/* 缓冲：old_data/new_data 按 chunk_bitmap set bit 升序排列（buf_idx 0..num_modified-1） */
-	void					*old_data_buf;	/* num_modified * strip_bytes */
-	void					*new_data_buf;	/* num_modified * strip_bytes */
-	void					*parity_buf;	/* strip_bytes：读旧 P → 原地 XOR 成新 P */
-	void					*q_buf;		/* strip_bytes：读旧 Q → 原地 XOR 成新 Q（num_parity=2 时）*/
+	/* 缓冲布局随策略不同（见 is_rcw 注释）：
+	 * RMW = 按 bitmap set bit 升序紧凑（num_modified×strip）；
+	 * RCW = 按 data_idx 全 stripe（D×strip）。*/
+	void					*old_data_buf;
+	void					*new_data_buf;
+	void					*parity_buf;	/* strip_bytes：RMW 读旧 P→原地 XOR；RCW 清零后整带 XOR */
+	void					*q_buf;		/* strip_bytes：RMW 读旧 Q→原地 XOR；RCW gf8 整带重算（num_parity=2）*/
 
 	/* PPL */
 	struct poweraid_raid_common_ppl_ctx		*ppl_ctx;
@@ -82,11 +84,22 @@ struct rmw_op {
 	void					(*complete_cb)(int status, void *cb_arg);
 	void					*complete_cb_arg;
 
-	/* sub-strip 写支持（issue #14）：raid_io 数据只覆盖 strip 一部分，
+	/* sub-strip 写支持（issue #15）：raid_io 数据只覆盖 strip 一部分，
 	 * 需在读旧 data 后用旧 data 填充 new_data_buf 再覆盖 sub-strip 新数据。*/
 	bool					is_sub_strip;
 	uint32_t				sub_strip_offset_bytes;	/* strip 内偏移 */
 	uint32_t				sub_strip_len_bytes;	/* sub-strip 数据长度 */
+
+	/* 部分 stripe 写策略（issue #16）：
+	 * - RMW（默认）：读 n_modified 旧 data + 全部旧 parity，delta XOR 更新。
+	 *   old/new data 缓冲按 chunk_bitmap set bit 升序紧凑排列（buf_idx 索引）。
+	 * - RCW（reconstruct-write，读块数严格更少时启用）：读全部 D 个旧 data，
+	 *   不读 parity，整带 XOR/GF 重算 P/Q。old/new data 缓冲按 data_idx 全 stripe
+	 *   排列（D×strip，未改 chunk 位置在 CALC 时用旧数据填充）。
+	 * 选择条件：D < n_modified + num_parity（持平保持 RMW）。
+	 * PPL old/new hash 语义两种策略一致（仅覆盖被改 chunk），recovery 零改动。*/
+	bool					is_rcw;
+	uint8_t					num_data;	/* D = data chunk 总数 */
 };
 
 /* 前向声明 */
@@ -162,6 +175,30 @@ rmw_can_proceed(struct rmw_op *op)
 	return !poweraid_raid_state_test(&op->raid->state, POWERAID_RAID_ST_OFFLINE);
 }
 
+/* 部分 stripe 写策略选择（issue #16）：
+ *   RMW 读块数 = n_modified + num_parity（旧被改 data + 全部旧 parity）
+ *   RCW 读块数 = D（全部旧 data，不读 parity；PPL old_data_hash 要求读取被改块
+ *                旧数据，RCW 全 stripe 读天然覆盖，恢复语义不变）
+ * 严格小于才选 RCW；持平保持 RMW（5f D=2 n=1: 2=2；6f D=3 n=1: 3=3）。
+ * 实际命中：6f n_modified=2（如 sw128k 跨条带 2/3 chunk 部分写）→ 3 < 4。*/
+static inline bool
+rmw_choose_rcw(struct poweraid_raid_common_raid *raid, uint32_t num_modified)
+{
+	uint32_t D = raid->num_base_bdevs - raid->num_parity;
+
+	return D < (num_modified + raid->num_parity);
+}
+
+/* new_data_buf 中某 data chunk 的缓冲位置：RCW 按 data_idx 全 stripe 索引，
+ * RMW 按 bitmap set bit 升序的 buf_idx 紧凑索引。*/
+static inline void *
+rmw_new_data_ptr(struct rmw_op *op, uint8_t data_idx, uint32_t buf_idx)
+{
+	uint32_t idx = op->is_rcw ? data_idx : buf_idx;
+
+	return (char *)op->new_data_buf + (size_t)idx * op->strip_bytes;
+}
+
 /* 查找首个带 ppl_ctx 的成员盘 + 对应 IO 线程 base channel（与 write_full 一致）*/
 static void
 rmw_find_ppl(struct rmw_op *op)
@@ -198,11 +235,57 @@ rmw_start_reads(struct rmw_op *op)
 	op->io_status = 0;
 
 	SPDK_DEBUGLOG(raid5f_rmw, "rmw reads: op=%p stripe=%"PRIu64" base_offset=%"PRIu64
-		      " p_idx=%u bitmap=0x%"PRIx64" num_modified=%u\n",
+		      " p_idx=%u bitmap=0x%"PRIx64" num_modified=%u rcw=%d\n",
 		      op, op->stripe_index, base_offset, op->p_idx,
-		      op->chunk_bitmap, op->num_modified);
+		      op->chunk_bitmap, op->num_modified, op->is_rcw);
 
-	/* 读旧 data chunks（按 chunk_bitmap set bit 升序）*/
+	if (op->is_rcw) {
+		/* RCW（issue #16）：读全部 D 个旧 data，不读旧 parity。
+		 * 缓冲按 data_idx 全 stripe 索引；被改块旧数据同时供 PPL old_hash。*/
+		uint8_t data_idx;
+
+		op->io_remaining = op->num_data;
+		for (data_idx = 0; data_idx < op->num_data; data_idx++) {
+			uint8_t phys = rmw_data_to_phys(data_idx, op->p_idx, op->q_idx,
+							op->raid_bdev->num_base_bdevs);
+			struct raid_base_bdev_info *base_info =
+				&raid_bdev->base_bdev_info[phys];
+			struct spdk_io_channel *base_ch;
+			struct spdk_bdev_ext_io_opts io_opts = {0};
+			struct iovec iov = {
+				.iov_base = (char *)op->old_data_buf +
+					    (size_t)data_idx * op->strip_bytes,
+				.iov_len = op->strip_bytes,
+			};
+
+			io_opts.size = sizeof(io_opts);
+			base_ch = raid_bdev_channel_get_base_channel(op->raid_ch, phys);
+			if (base_ch == NULL || base_info->desc == NULL) {
+				SPDK_ERRLOG("rcw read: no channel for data chunk %u (phys %u)\n",
+					    data_idx, phys);
+				op->io_status = -ENODEV;
+				if (--op->io_remaining == 0) {
+					rmw_calc_and_next(op);
+				}
+				continue;
+			}
+
+			rc = raid_bdev_readv_blocks_ext(base_info, base_ch, &iov, 1,
+							base_offset, raid->strip_size,
+							rmw_read_cb, op, &io_opts);
+			if (rc != 0) {
+				SPDK_ERRLOG("rcw read: data chunk %u failed rc=%d\n",
+					    data_idx, rc);
+				op->io_status = rc;
+				if (--op->io_remaining == 0) {
+					rmw_calc_and_next(op);
+				}
+			}
+		}
+		return;
+	}
+
+	/* RMW：读旧 data chunks（按 chunk_bitmap set bit 升序）*/
 	while (bits) {
 		uint8_t data_idx = __builtin_ctzll(bits);
 		bits &= bits - 1;
@@ -328,6 +411,23 @@ rmw_read_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 
 /* ===== Step 2：CALC（新 parity + old/new hash）→ Step 3 PPL_APPEND ===== */
 
+/* CALC 完成：提交 PPL append（无 ppl_ctx 时直接放行）*/
+static void
+rmw_submit_ppl_append(struct rmw_op *op, uint64_t old_hash, uint64_t new_hash)
+{
+	/* Step 3: PPL append（FUA intent）*/
+	op->state = RMW_S_PPL_APPEND;
+	if (op->ppl_ctx != NULL && op->ppl_ch != NULL) {
+		poweraid_raid_common_ppl_append_record(op->ppl_ctx, op->ppl_ch,
+						 op->stripe_index, op->chunk_bitmap,
+						 old_hash, new_hash,
+						 rmw_ppl_append_done, op);
+	} else {
+		SPDK_WARNLOG("rmw: no ppl_ctx, write without PPL protection op=%p\n", op);
+		rmw_ppl_append_done(0, 0, op);
+	}
+}
+
 static void
 rmw_calc_and_next(struct rmw_op *op)
 {
@@ -370,6 +470,70 @@ rmw_calc_and_next(struct rmw_op *op)
 			rmw_op_finish(op, SPDK_BDEV_IO_STATUS_FAILED);
 			return;
 		}
+	}
+
+	if (op->is_rcw) {
+		/* RCW（issue #16）：未改 chunk 用旧 data 填充 new 全 stripe；
+		 * 被改 chunk 的新数据已在 submit 时按 data_idx 填入。随后整带重算 P/Q，
+		 * 系数与 delta 路径一致（gf8_encode: Q = Σ α^i × D_i）。*/
+		const void *data_ptrs[64];	/* chunk_bitmap 为 uint64，D ≤ 64 */
+		uint8_t di;
+
+		for (di = 0; di < op->num_data; di++) {
+			data_ptrs[di] = (char *)op->new_data_buf +
+					(size_t)di * op->strip_bytes;
+			if (!(op->chunk_bitmap & (1ULL << di))) {
+				memcpy((char *)op->new_data_buf + (size_t)di * op->strip_bytes,
+				       (char *)op->old_data_buf + (size_t)di * op->strip_bytes,
+				       op->strip_bytes);
+			}
+		}
+
+		/* P = XOR 全部新 data（parity_buf 未读旧 P，先清零）*/
+		memset(parity, 0, op->strip_bytes);
+		for (di = 0; di < op->num_data; di++) {
+			const uint64_t *newp = (const uint64_t *)
+				((char *)op->new_data_buf + (size_t)di * op->strip_bytes);
+			for (j = 0; j < strip_u64; j++) {
+				parity[j] ^= newp[j];
+			}
+		}
+
+		/* Q = Σ α^i × 新 D_i（整带 GF 编码）*/
+		if (raid->num_parity > 1) {
+			rc = poweraid_raid_common_gf8_encode(op->num_data, data_ptrs,
+							     op->q_buf, op->strip_bytes);
+			if (rc != 0) {
+				SPDK_ERRLOG("rcw gf8 encode failed rc=%d\n", rc);
+				rmw_op_finish(op, SPDK_BDEV_IO_STATUS_FAILED);
+				return;
+			}
+		}
+
+		/* old/new hash：按 chunk_bitmap set bit 升序，data_idx 全 stripe 索引。
+		 * 与 RMW 覆盖同样的被改 chunk 集合，PPL record/recovery 语义不变。*/
+		poweraid_raid_common_ppl_hash_init(&old_h);
+		poweraid_raid_common_ppl_hash_init(&new_h);
+		bits = op->chunk_bitmap;
+		while (bits) {
+			uint8_t data_idx = __builtin_ctzll(bits);
+			poweraid_raid_common_ppl_hash_update(&old_h,
+				(char *)op->old_data_buf + (size_t)data_idx * op->strip_bytes,
+				op->strip_bytes);
+			poweraid_raid_common_ppl_hash_update(&new_h,
+				(char *)op->new_data_buf + (size_t)data_idx * op->strip_bytes,
+				op->strip_bytes);
+			bits &= bits - 1;
+		}
+		old_hash = poweraid_raid_common_ppl_hash_final(&old_h);
+		new_hash = poweraid_raid_common_ppl_hash_final(&new_h);
+
+		SPDK_DEBUGLOG(raid5f_rmw, "rcw calc: op=%p old_hash=0x%"PRIx64
+			      " new_hash=0x%"PRIx64" bitmap=0x%"PRIx64"\n",
+			      op, old_hash, new_hash, op->chunk_bitmap);
+
+		rmw_submit_ppl_append(op, old_hash, new_hash);
+		return;
 	}
 
 	/* 新 parity = 旧 parity ^ (旧 data[i] ^ 新 data[i]) for each modified i
@@ -421,17 +585,7 @@ rmw_calc_and_next(struct rmw_op *op)
 		      " new_hash=0x%"PRIx64" bitmap=0x%"PRIx64"\n",
 		      op, old_hash, new_hash, op->chunk_bitmap);
 
-	/* Step 3: PPL append（FUA intent）*/
-	op->state = RMW_S_PPL_APPEND;
-	if (op->ppl_ctx != NULL && op->ppl_ch != NULL) {
-		poweraid_raid_common_ppl_append_record(op->ppl_ctx, op->ppl_ch,
-						 op->stripe_index, op->chunk_bitmap,
-						 old_hash, new_hash,
-						 rmw_ppl_append_done, op);
-	} else {
-		SPDK_WARNLOG("rmw: no ppl_ctx, write without PPL protection op=%p\n", op);
-		rmw_ppl_append_done(0, 0, op);
-	}
+	rmw_submit_ppl_append(op, old_hash, new_hash);
 }
 
 static void
@@ -484,7 +638,7 @@ rmw_start_writes(struct rmw_op *op)
 		struct spdk_io_channel *base_ch;
 		struct spdk_bdev_ext_io_opts io_opts = {0};
 		struct iovec iov = {
-			.iov_base = (char *)op->new_data_buf + buf_idx * op->strip_bytes,
+			.iov_base = rmw_new_data_ptr(op, data_idx, buf_idx),
 			.iov_len = op->strip_bytes,
 		};
 
@@ -779,15 +933,16 @@ rmw_ppl_commit_done(int status, void *cb_arg)
 static int
 rmw_op_alloc(struct rmw_op *op)
 {
-	uint32_t num_modified = op->num_modified;
+	/* RCW 缓冲按全 stripe（D×strip），RMW 按被改 chunk 紧凑（n×strip）*/
+	uint32_t data_buf_chunks = op->is_rcw ? op->num_data : op->num_modified;
 	uint32_t strip_bytes = op->strip_bytes;
 
-	op->old_data_buf = spdk_dma_malloc((size_t)num_modified * strip_bytes,
+	op->old_data_buf = spdk_dma_malloc((size_t)data_buf_chunks * strip_bytes,
 					   0x1000, NULL);
 	if (op->old_data_buf == NULL) {
 		return -ENOMEM;
 	}
-	op->new_data_buf = spdk_dma_malloc((size_t)num_modified * strip_bytes,
+	op->new_data_buf = spdk_dma_malloc((size_t)data_buf_chunks * strip_bytes,
 					   0x1000, NULL);
 	if (op->new_data_buf == NULL) {
 		spdk_dma_free(op->old_data_buf);
@@ -905,6 +1060,7 @@ poweraid_raid_common_rmw_submit(struct raid_bdev_io *raid_io)
 	op->chunk_bitmap = chunk_bitmap;
 	op->num_modified = num_modified;
 	op->strip_bytes = strip_size_bytes;
+	op->num_data = (uint8_t)data_chunks;
 	op->complete_cb = NULL;
 	op->complete_cb_arg = NULL;
 	op->is_sub_strip = is_sub_strip;
@@ -913,10 +1069,13 @@ poweraid_raid_common_rmw_submit(struct raid_bdev_io *raid_io)
 			(stripe_offset % raid->strip_size) * raid->block_size;
 		op->sub_strip_len_bytes = raid_io->num_blocks * raid->block_size;
 	}
+	/* 策略选择（issue #16）：sub-strip 恒为 n=1，不会命中 RCW（读块数持平）*/
+	op->is_rcw = !is_sub_strip && rmw_choose_rcw(raid, num_modified);
 
 	SPDK_DEBUGLOG(raid5f_rmw, "rmw submit: op=%p stripe=%"PRIu64" p_idx=%u"
-		       " bitmap=0x%"PRIx64" num_modified=%u sub_strip=%d\n",
-		       op, stripe_index, p_idx, chunk_bitmap, num_modified, is_sub_strip);
+		       " bitmap=0x%"PRIx64" num_modified=%u sub_strip=%d rcw=%d\n",
+		       op, stripe_index, p_idx, chunk_bitmap, num_modified,
+		       is_sub_strip, op->is_rcw);
 
 	rc = rmw_op_alloc(op);
 	if (rc != 0) {
@@ -928,6 +1087,25 @@ poweraid_raid_common_rmw_submit(struct raid_bdev_io *raid_io)
 		/* sub-strip 写：不在 submit 时拷贝 raid_io 数据（只有 sub-strip 部分），
 		 * 在读旧 data 完成后（rmw_calc_and_next）用旧 data 填充 new_data_buf
 		 * 再覆盖 sub-strip 新数据。*/
+	} else if (op->is_rcw) {
+		/* RCW：raid_io 载荷为 start_chunk 起的连续 n 个 strip，
+		 * 顺序抽取到全 stripe new 缓冲的 data_idx 位置（未改位置待 CALC 填旧数据）。*/
+		struct spdk_iov_xfer ix;
+		uint32_t k;
+
+		spdk_iov_xfer_init(&ix, raid_io->iovs, (int)raid_io->iovcnt);
+		for (k = 0; k < num_modified; k++) {
+			size_t copied = spdk_iov_xfer_to_buf(&ix,
+				(char *)op->new_data_buf +
+				(size_t)(start_chunk + k) * strip_size_bytes,
+				strip_size_bytes);
+			if (copied != strip_size_bytes) {
+				SPDK_ERRLOG("rcw: iov_xfer short copied=%zu expect=%u\n",
+					    copied, strip_size_bytes);
+				rmw_op_free(op);
+				return -EIO;
+			}
+		}
 	} else {
 		/* strip 对齐写：从 raid_io iovs 拷贝新数据到 new_data_buf */
 		rc = (int)spdk_iovcpy(raid_io->iovs, raid_io->iovcnt,
@@ -989,12 +1167,14 @@ poweraid_raid_common_rmw_submit_merged(
 	op->chunk_bitmap = chunk_bitmap;
 	op->num_modified = num_modified;
 	op->strip_bytes = strip_size_bytes;
+	op->num_data = (uint8_t)data_chunks;
 	op->complete_cb = cb;
 	op->complete_cb_arg = cb_arg;
+	op->is_rcw = rmw_choose_rcw(raid, num_modified);
 
 	SPDK_DEBUGLOG(raid5f_rmw, "rmw_merged: op=%p stripe=%"PRIu64" p_idx=%u"
-		       " bitmap=0x%"PRIx64" num_modified=%u\n",
-		       op, stripe_index, p_idx, chunk_bitmap, num_modified);
+		      " bitmap=0x%"PRIx64" num_modified=%u rcw=%d\n",
+		      op, stripe_index, p_idx, chunk_bitmap, num_modified, op->is_rcw);
 
 	rc = rmw_op_alloc(op);
 	if (rc != 0) {
@@ -1002,13 +1182,15 @@ poweraid_raid_common_rmw_submit_merged(
 		return rc;
 	}
 
-	/* 从 new_chunk_bufs 拷贝新数据到 new_data_buf（按 bit 升序）*/
+	/* 从 new_chunk_bufs 拷贝新数据到 new_data_buf：
+	 * RCW 按 data_idx 全 stripe 索引；RMW 按 bit 升序紧凑索引。*/
 	bits = chunk_bitmap;
 	buf_idx = 0;
 	while (bits) {
 		uint32_t chunk = __builtin_ctzll(bits);
 		bits &= bits - 1;
-		memcpy((char *)op->new_data_buf + buf_idx * strip_size_bytes,
+		uint32_t dst_idx = op->is_rcw ? chunk : buf_idx;
+		memcpy((char *)op->new_data_buf + (size_t)dst_idx * strip_size_bytes,
 		       new_chunk_bufs[chunk], strip_size_bytes);
 		buf_idx++;
 	}

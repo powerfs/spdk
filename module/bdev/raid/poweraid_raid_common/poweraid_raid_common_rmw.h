@@ -9,11 +9,19 @@
  *   故模块收到的写 IO 只有两种：
  *     A) 完整 stripe（offset_blocks % stripe_blocks == 0 且 num_blocks == stripe_blocks）
  *        → 走全 stripe 写路径（poweraid_raid_common_sm_req WRITE_FULL，5 步 barrier）
- *     B) 部分 stripe（非 A）→ 走 RMW（本文件）
+ *     B) 部分 stripe（非 A）→ 走 RMW/RCW（本文件）
  *
- *   RMW 7 步（op + 回调状态机，与 REQ FSM 独立）：
- *     1. 读所有被改 data chunk 的旧数据 + 旧 parity（并行）
- *     2. 算新 parity（XOR syndrome）+ old/new data hash
+ *   部分 stripe 写的两种读策略（issue #16，按读块数自适应）：
+ *     - RMW（默认）：读 n_modified 旧 data + 全部旧 parity，delta XOR 更新 P/Q，
+ *       读块数 = n_modified + num_parity。
+ *     - RCW（reconstruct-write）：当 D < n_modified + num_parity 时启用，
+ *       读全部 D 个旧 data（不读 parity），整带 XOR/GF 重算 P/Q，读块数 = D。
+ *       PPL old/new hash 仍只覆盖被改 chunk（全 stripe 读天然包含其旧数据），
+ *       恢复协议零改动。命中：6f（D=3）n_modified=2 → 读 3 块而非 4 块。
+ *
+ *   RMW/RCW 7 步（op + 回调状态机，与 REQ FSM 独立）：
+ *     1. 读旧数据：RMW=被改 data+parity；RCW=全部 data
+ *     2. 算新 parity（RMW delta XOR；RCW 整带 XOR/GF）+ old/new data hash
  *     3. PPL append（FUA intent，含 chunk_bitmap / old_hash / new_hash）
  *     4. 写新 data + 新 parity（并行）
  *     5. flush 被写盘（并行）
