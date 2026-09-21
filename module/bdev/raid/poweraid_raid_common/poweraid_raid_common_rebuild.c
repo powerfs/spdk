@@ -15,6 +15,7 @@
 #include "poweraid_raid_common.h"
 #include "poweraid_raid_common_rebuild.h"
 #include "poweraid_raid_common_merge.h"
+#include "poweraid_raid_common_sb.h"
 
 SPDK_LOG_REGISTER_COMPONENT(poweraid_rebuild)
 
@@ -335,6 +336,10 @@ poweraid_raid_common_hook_rebuild_starting(struct raid_bdev *raid_bdev,
 
 	SPDK_NOTICELOG("replace: rebuild starting slot %u bdev %s raid %s\n",
 		       slot, target->name, raid->name);
+	/* 根因修复：把运行时新成员的 data_offset/data_size 统一到模块 PPL/MWL
+	 * 预留口径（superblock=false 时框架给的是 0），必须在重建引擎启动前完成，
+	 * 否则 helper 业务读(LBA0) 与 raw 重建写(reserve) 物理偏移不一致。*/
+	poweraid_raid_common_sb_unify_member_data_offset(raid_bdev, target);
 
 	/* 异步格式化新盘 sb + PPL 区（与数据区重建区域不重叠）*/
 	replace_format_start(raid, cbdev);

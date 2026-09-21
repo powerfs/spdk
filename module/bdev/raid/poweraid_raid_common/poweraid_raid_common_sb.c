@@ -861,6 +861,49 @@ poweraid_raid_common_sb_unify_data_offset(struct raid_bdev *rb)
 	}
 }
 
+/* C7-bis：运行时替换成员（热插 spare）的 data_offset/data_size 单轨。
+ *
+ * 背景：unify_data_offset() 只在新卷 start() 跑一次。成员盘故障被拔后，框架
+ * raid_bdev_free_base_bdev_resource() 会把槽位 data_offset 清零（data_size 保留）；
+ * ONLINE 状态 add_base_bdev 加入的 spare：
+ *   - superblock=false（poweraid 卷）：框架不预留，configure 后 data_offset=0、
+ *     data_size 沿用旧槽位值（缺少 reserve 尾部信息）；
+ *   - 结果 helper 业务 IO 物理偏移为 LBA0，而重建/恢复 raw 路径使用模块记录的
+ *     raid->data_offset_blocks（=reserve），重建数据写到 reserve 之后，业务读
+ *     却从 LBA0 读 → verify 全零。
+ * 修复：重建引擎启动前，把新成员口径统一为 [reserve, blockcnt)，与 start()
+ * 新卷公式一致；对已是正确口径（如 superblock=true 框架已设值）幂等。*/
+void
+poweraid_raid_common_sb_unify_member_data_offset(struct raid_bdev *rb,
+		struct raid_base_bdev_info *base_info)
+{
+	uint64_t reserve_blocks;
+
+	if (rb == NULL || base_info == NULL || base_info->desc == NULL) {
+		return;
+	}
+	reserve_blocks = (POWERAID_RAID_COMMON_PPL_REGION_OFFSET +
+			  POWERAID_RAID_COMMON_PPL_REGION_SIZE) /
+			 spdk_bdev_get_data_block_size(&rb->bdev);
+	if (base_info->blockcnt <= reserve_blocks) {
+		SPDK_ERRLOG("replacement bdev '%s' too small: blockcnt=%"PRIu64
+			    " <= reserve=%"PRIu64"\n",
+			    base_info->name, base_info->blockcnt, reserve_blocks);
+		return;
+	}
+	if (base_info->data_offset == reserve_blocks &&
+	    base_info->data_size == base_info->blockcnt - reserve_blocks) {
+		return;
+	}
+	SPDK_NOTICELOG("unify replacement member '%s': data_offset %"PRIu64
+		       "->%"PRIu64" data_size %"PRIu64"->%"PRIu64" (blockcnt=%"PRIu64")\n",
+		       base_info->name, base_info->data_offset, reserve_blocks,
+		       base_info->data_size,
+		       base_info->blockcnt - reserve_blocks, base_info->blockcnt);
+	base_info->data_offset = reserve_blocks;
+	base_info->data_size = base_info->blockcnt - reserve_blocks;
+}
+
 int
 poweraid_raid_common_sb_priv_adopt(struct poweraid_raid_common_raid *raid)
 {

@@ -264,6 +264,15 @@ int poweraid_raid_common_sb_priv_ensure_fresh(struct poweraid_raid_common_raid *
 void poweraid_raid_common_sb_unify_data_offset(struct raid_bdev *rb);
 
 /**
+ * C7-bis：运行时替换成员（热插 spare）的 data_offset/data_size 单轨。
+ * 必须在重建引擎启动前（hook_rebuild_starting）调用：superblock=false 的
+ * poweraid 卷框架不预留成员偏移，spare configure 后 data_offset=0，与模块
+ * raw 路径使用的 raid->data_offset_blocks 不一致会导致重建数据不可读。
+ */
+void poweraid_raid_common_sb_unify_member_data_offset(struct raid_bdev *rb,
+		struct raid_base_bdev_info *base_info);
+
+/**
  * 擦除单个在线 bdev 盘头的 RAID 超级块（盘退役 / 移除后重新利用）。
  *
  * 仅处理当前不属于任何阵列的盘：以 write 独占方式打开，在线成员已被
