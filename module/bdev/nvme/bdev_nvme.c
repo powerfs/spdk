@@ -4703,15 +4703,27 @@ nbdev_create(struct spdk_bdev *disk, const char *base_name,
 	}
 
 	if (spdk_mem_all_zero(nsdata->nguid, sizeof(nsdata->nguid))) {
-		uuid = spdk_nvme_ns_get_uuid(ns);
-		if (uuid) {
-			disk->uuid = *uuid;
-		} else if (g_opts.generate_uuids) {
+		if (g_opts.generate_uuids) {
+			/* poweraid fork: 显式开启 generate_uuids 时，优先由
+			 * controller 序列号 + nsid 经 sha1 确定性派生 bdev UUID，
+			 * 不采信设备上报的 NS UUID 描述符。
+			 * 背景：QEMU 4.2 的 NS UUID 每次控制器实例化都会随机变化，
+			 * 无法作为跨重启的稳定盘身份（RAID superblock 成员表按
+			 * bdev UUID 重装配，随机 UUID 会导致 examine 判定
+			 * "superblock does not contain this bdev's uuid"）。
+			 * 控制器序列号在夹具中固定（raid5f-diskN），派生结果跨
+			 * 重启稳定；真实硬件通常提供非零 NGUID，仍走上面的 NGUID
+			 * 优先路径；本选项默认关闭，关闭时保持上游优先级不变。*/
 			spdk_strcpy_pad(sn_tmp, cdata->sn, SPDK_NVME_CTRLR_SN_LEN, '\0');
 			rc = nvme_generate_uuid(sn_tmp, spdk_nvme_ns_get_id(ns), &disk->uuid);
 			if (rc < 0) {
 				SPDK_ERRLOG("UUID generation failed (%s)\n", spdk_strerror(-rc));
 				return rc;
+			}
+		} else {
+			uuid = spdk_nvme_ns_get_uuid(ns);
+			if (uuid) {
+				disk->uuid = *uuid;
 			}
 		}
 	} else {

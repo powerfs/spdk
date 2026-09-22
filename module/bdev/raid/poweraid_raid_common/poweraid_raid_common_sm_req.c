@@ -182,6 +182,7 @@ poweraid_raid_common_sm_req_calc(struct poweraid_raid_common_req *req,
 static void poweraid_raid_common_req_start_flushes(struct poweraid_raid_common_req *req);
 static void poweraid_raid_common_req_chunk_io_cb(struct spdk_bdev_io *bdev_io,
 					   bool success, void *cb_arg);
+static void poweraid_raid_common_req_gc_data_flush_done(int status, void *cb_arg);
 
 /* Step 1 完成：PPL append 回调 → 进入 Step 2（写 data+parity）*/
 static void
@@ -201,8 +202,10 @@ poweraid_raid_common_req_ppl_append_done(int status, uint64_t seq, void *cb_arg)
 
 	if (status != 0) {
 		/* PPL append 失败仅由真实 IO 错误或 ctx 销毁（-ECANCELED）引起；
-		 * -ENOSPC 由 backpressure 队列吸收，不会到达此处。降级写无 PPL 保护。*/
+		 * -ENOSPC 由 backpressure 队列吸收，不会到达此处。降级写无 PPL 保护。
+		 * gc_append 失败时 entry 已被 gc 释放，此处置 NULL 避免悬垂。*/
 		SPDK_ERRLOG("ppl append failed (%d), degrade write without PPL\n", status);
+		req->gc_entry = NULL;
 	}
 	req->ppl_seq = (status == 0) ? seq : 0;
 
@@ -297,6 +300,20 @@ poweraid_raid_common_req_chunk_io_cb(struct spdk_bdev_io *bdev_io, bool success,
 	}
 }
 
+/* gc data flush 完成 → Step 4 (WRITE_PARITY) */
+static void
+poweraid_raid_common_req_gc_data_flush_done(int status, void *cb_arg)
+{
+	struct poweraid_raid_common_req *req = cb_arg;
+
+	if (status != 0) {
+		SPDK_ERRLOG("gc data flush failed (%d)\n", status);
+		req->base_bdev_io_status = status;
+	}
+	poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
+				   POWERAID_REQ_EV_WRITE_PARITY);
+}
+
 /* Step 3：flush 所有 base bdev */
 static void
 poweraid_raid_common_req_start_flushes(struct poweraid_raid_common_req *req)
@@ -316,6 +333,26 @@ poweraid_raid_common_req_start_flushes(struct poweraid_raid_common_req *req)
 
 	/* 标记进入 WRITE1（flush）阶段 */
 	__atomic_fetch_or(&req->state, POWERAID_REQ_ST_WRITE1, __ATOMIC_ACQ_REL);
+
+	/* gc 路径：req->gc_entry 非空 → 走 group commit data flush（批合并 per-disk flush）*/
+	if (req->gc_entry != NULL) {
+		struct poweraid_raid_common_ppl_data_range
+			ranges[POWERAID_RAID_COMMON_PPL_GC_MAX_BDEVS];
+		uint64_t base_offset = req->stripe_index * raid->strip_size;
+
+		for (i = 0; i < raid->num_base_bdevs; i++) {
+			ranges[i].phys = i;
+			ranges[i].offset = base_offset;
+			ranges[i].length = raid->strip_size;
+		}
+		poweraid_raid_common_ppl_gc_data_flush_enqueue(
+			&req->ch->gc_ctx, req->gc_entry,
+			ranges, raid->num_base_bdevs,
+			poweraid_raid_common_req_gc_data_flush_done, req);
+		return;
+	}
+
+	/* 非 gc 路径：per-disk flush（原逻辑，无 PPL 或 gc 不可用时 fallback）*/
 	req->base_bdev_io_remaining = raid->num_base_bdevs;
 
 	for (i = 0; i < raid->num_base_bdevs; i++) {
@@ -328,7 +365,7 @@ poweraid_raid_common_req_start_flushes(struct poweraid_raid_common_req *req)
 			if (--req->base_bdev_io_remaining == 0) {
 				/* 全部 flush 完成 → Step 4 */
 				poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
-						   POWERAID_REQ_EV_WRITE_PARITY);
+							   POWERAID_REQ_EV_WRITE_PARITY);
 			}
 			continue;
 		}
@@ -343,7 +380,7 @@ poweraid_raid_common_req_start_flushes(struct poweraid_raid_common_req *req)
 			req->base_bdev_io_status = rc;
 			if (--req->base_bdev_io_remaining == 0) {
 				poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
-						   POWERAID_REQ_EV_WRITE_PARITY);
+							   POWERAID_REQ_EV_WRITE_PARITY);
 			}
 		}
 	}
@@ -358,6 +395,8 @@ poweraid_raid_common_req_ppl_commit_done(int status, void *cb_arg)
 	if (status != 0) {
 		SPDK_ERRLOG("ppl commit failed (%d)\n", status);
 	}
+	/* gc_commit 已释放 entry，此处置 NULL 避免 io_complete double-free */
+	req->gc_entry = NULL;
 	poweraid_raid_common_sm_process(POWERAID_FSM_LAYER_REQ, req,
 				   POWERAID_REQ_EV_IO_COMPLETE);
 }
@@ -396,7 +435,8 @@ poweraid_raid_common_sm_req_write_full(struct poweraid_raid_common_req *req,
 	}
 
 	if (ppl_ctx != NULL && ppl_ch != NULL) {
-		/* Step 1: PPL append（FUA 落盘 intent）*/
+		/* Step 1: PPL append（FUA 落盘 intent）
+		 * 阶段 C1：走 group commit 批合并路径（per-thread gc_ctx）*/
 		/* old_data_hash=0（全 stripe 写无旧数据），new_data_hash 用 data_buf 算 */
 		uint64_t new_hash = poweraid_raid_common_ppl_data_hash(
 			req->data_buf, (raid->num_base_bdevs - raid->num_parity) *
@@ -404,14 +444,18 @@ poweraid_raid_common_sm_req_write_full(struct poweraid_raid_common_req *req,
 
 		__atomic_fetch_or(&req->state, POWERAID_REQ_ST_WRITE,
 				  __ATOMIC_ACQ_REL);
-		poweraid_raid_common_ppl_append_record(ppl_ctx, ppl_ch,
-						  req->stripe_index,
-						  chunk_bitmap, 0 /* old_data_hash */,
-						  new_hash,
-						  poweraid_raid_common_req_ppl_append_done, req);
+		req->gc_entry = NULL;
+		/* raid_ch 懒设置（ioch_create 无 raid_ch，首次 IO 时填充）*/
+		req->ch->gc_ctx.raid_ch = req->eff_raid_ch;
+		poweraid_raid_common_ppl_gc_append(ppl_ctx, &req->ch->gc_ctx,
+						   ppl_ch, req->stripe_index,
+						   chunk_bitmap, 0 /* old_data_hash */,
+						   new_hash, &req->gc_entry,
+						   poweraid_raid_common_req_ppl_append_done, req);
 	} else {
 		/* 无 PPL：直接进入 Step 2（写 data+parity），降级但保证数据可用 */
 		SPDK_WARNLOG("write_full: no ppl_ctx, write without PPL protection\n");
+		req->gc_entry = NULL;
 		poweraid_raid_common_req_ppl_append_done(0, 0, req);
 	}
 }
@@ -448,7 +492,13 @@ poweraid_raid_common_sm_req_write_parity(struct poweraid_raid_common_req *req,
 		}
 	}
 
-	if (ppl_ctx != NULL && ppl_ch != NULL) {
+	if (ppl_ctx != NULL && ppl_ch != NULL && req->gc_entry != NULL) {
+		/* 阶段 C1：走 group commit 批合并路径 */
+		poweraid_raid_common_ppl_gc_commit(ppl_ctx, &req->ch->gc_ctx, ppl_ch,
+						   req->gc_entry,
+						   poweraid_raid_common_req_ppl_commit_done, req);
+	} else if (ppl_ctx != NULL && ppl_ch != NULL) {
+		/* fallback：非 gc 路径（gc_entry 为空但 ppl_seq 有效）*/
 		poweraid_raid_common_ppl_commit(ppl_ctx, ppl_ch, req->ppl_seq,
 					   poweraid_raid_common_req_ppl_commit_done, req);
 	} else {
@@ -468,6 +518,13 @@ poweraid_raid_common_sm_req_io_complete(struct poweraid_raid_common_req *req,
 
 	if (req == NULL) {
 		return;
+	}
+
+	/* 阶段 C1：orphaned gc_entry（write/flush 失败未到 commit）。
+	 * gc_commit 成功路径已由 ppl_gc_commit_loop 释放并在此前置 NULL。 */
+	if (req->gc_entry != NULL) {
+		free(req->gc_entry);
+		req->gc_entry = NULL;
 	}
 
 	__atomic_fetch_or(&req->state, POWERAID_REQ_ST_IO_COMPLETE,

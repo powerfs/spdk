@@ -16,6 +16,7 @@
 
 #include "poweraid_raid_common_merge.h"
 #include "poweraid_raid_common_sb.h"
+#include "poweraid_raid_common_ppl.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -318,6 +319,7 @@ struct poweraid_raid_common_req {
 	void    *parity_buf_alloc;       /* owned P parity 缓冲（区别于 xor 期借用 parity_buf）*/
 	void    *q_buf;                  /* Q parity 目标缓冲（RAID6 用，RAID5 为 NULL）*/
 	void    *q_buf_alloc;            /* owned Q parity 缓冲（RAID6 用）*/
+	struct poweraid_raid_common_ppl_gc_entry *gc_entry;  /* PPL group commit entry（阶段 C1，NULL=无 gc）*/
 	TAILQ_ENTRY(poweraid_raid_common_req) link;  /* free 池 / xor_retry_queue 链接 */
 };
 
@@ -360,6 +362,9 @@ struct poweraid_raid_common_io_channel {
 
 	/* 合并层上下文（阶段 3b）*/
 	struct merge_ctx merge_ctx;
+
+	/* per-thread PPL group commit 协调器（阶段 C1）*/
+	struct poweraid_raid_common_ppl_gc gc_ctx;
 };
 
 /* ===== 通用分派入口 ===== */

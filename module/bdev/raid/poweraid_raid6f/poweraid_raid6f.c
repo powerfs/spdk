@@ -111,6 +111,27 @@ poweraid_raid6f_ioch_create(void *io_device, void *ctx_buf)
 		goto err;
 	}
 
+	/* PPL group commit 初始化（阶段 C1）*/
+	{
+		struct poweraid_raid_common_ppl_ctx *ppl_ctx = NULL;
+		uint8_t bi;
+		for (bi = 0; bi < raid->num_base_bdevs; bi++) {
+			if (raid->base_bdevs[bi] != NULL &&
+			    raid->base_bdevs[bi]->ppl_ctx != NULL) {
+				ppl_ctx = raid->base_bdevs[bi]->ppl_ctx;
+				break;
+			}
+		}
+		if (ppl_ctx != NULL) {
+			if (poweraid_raid_common_ppl_gc_init(&ch->gc_ctx, ppl_ctx,
+							     raid->raid_bdev, NULL) != 0) {
+				SPDK_ERRLOG("poweraid_raid6f: gc_init failed, fallback to non-gc\n");
+			}
+		} else {
+			memset(&ch->gc_ctx, 0, sizeof(ch->gc_ctx));
+		}
+	}
+
 	SPDK_DEBUGLOG(poweraid_raid6f, "ioch_create: raid=%p ch=%p\n", raid, ch);
 	return 0;
 
@@ -135,6 +156,8 @@ poweraid_raid6f_ioch_destroy(void *io_device, void *ctx_buf)
 	struct poweraid_raid_common_req *req;
 
 	assert(TAILQ_EMPTY(&ch->xor_retry_queue));
+
+	poweraid_raid_common_ppl_gc_destroy(&ch->gc_ctx);
 
 	poweraid_raid_common_merge_destroy(&ch->merge_ctx);
 

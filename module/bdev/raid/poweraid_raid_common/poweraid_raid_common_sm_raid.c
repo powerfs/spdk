@@ -499,34 +499,41 @@ poweraid_raid_common_online_recovery_done(int status,
 	parity_fixup_next(op);
 }
 
-/* 实际置 ONLINE 并触发 recovery（新卷初始化完成 / 既有卷直接进入）。*/
+/* 实际置 ONLINE 并触发 recovery（新卷初始化完成 / 既有卷直接进入）。
+ * skip_recovery=true：新卷刚 ppl_init（PPL region 已清零 + super 已写），
+ * 无 uncommitted record，跳过 recovery 避免无谓扫描 8191 个 slot。
+ * 既有卷必须 recovery（可能有掉电遗留的 uncommitted record）。*/
 static void
-raid_enter_online(struct poweraid_raid_common_raid *raid)
+raid_enter_online(struct poweraid_raid_common_raid *raid, bool skip_recovery)
 {
 	uint8_t i;
 
 	poweraid_raid_state_clear(&raid->state, POWERAID_RAID_ST_OFFLINE);
 
-	/* 恢复（含 parity fixup）完成前数据面必须保持关闭：先置 RESTORING 再置 ONLINE，
-	 * submit 门控要求 ONLINE && !RESTORING，RESTORING 在 recovery 回调/fixup
-	 * 结束时才清除。*/
-	for (i = 0; i < raid->num_base_bdevs; i++) {
-		if (raid->base_bdevs[i] != NULL && raid->base_bdevs[i]->ppl_ctx != NULL) {
-			poweraid_raid_state_set(&raid->state, POWERAID_RAID_ST_RESTORING);
-			break;
+	if (!skip_recovery) {
+		/* 恢复（含 parity fixup）完成前数据面必须保持关闭：先置 RESTORING 再置 ONLINE，
+		 * submit 门控要求 ONLINE && !RESTORING，RESTORING 在 recovery 回调/fixup
+		 * 结束时才清除。*/
+		for (i = 0; i < raid->num_base_bdevs; i++) {
+			if (raid->base_bdevs[i] != NULL && raid->base_bdevs[i]->ppl_ctx != NULL) {
+				poweraid_raid_state_set(&raid->state, POWERAID_RAID_ST_RESTORING);
+				break;
+			}
 		}
 	}
 	poweraid_raid_state_set(&raid->state, POWERAID_RAID_ST_ONLINE);
 
-	/* 触发 PPL 恢复：扫描首个带 ppl_ctx 的盘 */
-	for (i = 0; i < raid->num_base_bdevs; i++) {
-		if (raid->base_bdevs[i] != NULL && raid->base_bdevs[i]->ppl_ctx != NULL) {
-			SPDK_NOTICELOG("online: kick recovery on bdev[%u] ppl_ctx=%p\n",
-				       i, raid->base_bdevs[i]->ppl_ctx);
-			poweraid_raid_common_recovery_run(raid->base_bdevs[i]->ppl_ctx, raid,
+	if (!skip_recovery) {
+		/* 触发 PPL 恢复：扫描首个带 ppl_ctx 的盘 */
+		for (i = 0; i < raid->num_base_bdevs; i++) {
+			if (raid->base_bdevs[i] != NULL && raid->base_bdevs[i]->ppl_ctx != NULL) {
+				SPDK_NOTICELOG("online: kick recovery on bdev[%u] ppl_ctx=%p\n",
+					       i, raid->base_bdevs[i]->ppl_ctx);
+				poweraid_raid_common_recovery_run(raid->base_bdevs[i]->ppl_ctx, raid,
 						     raid->ops.read_strip,
 						     poweraid_raid_common_online_recovery_done, raid);
-			break;
+				break;
+			}
 		}
 	}
 }
@@ -576,7 +583,7 @@ fresh_ppl_step(struct fresh_ppl_op *op)
 	}
 	SPDK_NOTICELOG("fresh_init: all %u PPL regions initialized\n",
 		       op->raid->num_base_bdevs);
-	raid_enter_online(op->raid);
+	raid_enter_online(op->raid, true);  /* 新卷：PPL 已清零+init，跳过 recovery */
 	free(op);
 }
 
@@ -609,7 +616,7 @@ fresh_persist_done(int status, void *cb_arg)
 	}
 	op = calloc(1, sizeof(*op));
 	if (op == NULL) {
-		raid_enter_online(raid);
+		raid_enter_online(raid, true);  /* 新卷：内存不足降级上线，跳过 recovery */
 		return;
 	}
 	op->raid = raid;
@@ -621,7 +628,7 @@ fresh_persist_done(int status, void *cb_arg)
 			      "fresh_init: no PPL region (level=%u raid=%s), skip\n",
 			      raid->level, raid->name);
 		free(op);
-		raid_enter_online(raid);
+		raid_enter_online(raid, true);  /* 新卷：无 PPL 区，跳过 recovery */
 		return;
 	}
 	fresh_ppl_step(op);
@@ -684,7 +691,7 @@ poweraid_raid_common_sm_raid_online(struct poweraid_raid_common_raid *raid,
 		return;
 	}
 
-	raid_enter_online(raid);
+	raid_enter_online(raid, false);  /* 既有卷：需要 recovery 处理掉电遗留 */
 }
 
 /* OFFLINE：清 RAID_ST_ONLINE，置 OFFLINE。卷停止接受 IO。

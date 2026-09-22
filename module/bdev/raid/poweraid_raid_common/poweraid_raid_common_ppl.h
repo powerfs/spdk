@@ -93,6 +93,7 @@ SPDK_STATIC_ASSERT(sizeof(struct poweraid_raid_common_ppl_super) ==
 
 /* ===== 上下文（opaque）===== */
 struct poweraid_raid_common_ppl_ctx;
+struct poweraid_raid_common_ppl_gc;
 
 /* in-flight record（已 append，待 commit），挂在 ctx->inflight 链表 */
 struct poweraid_raid_common_ppl_inflight {
@@ -114,6 +115,115 @@ typedef void (*poweraid_raid_common_ppl_commit_cb)(int status, void *cb_arg);
 typedef void (*poweraid_raid_common_ppl_replay_cb)(int status,
 		struct poweraid_raid_common_ppl_record *records, uint32_t num_records,
 		void *cb_arg);
+
+/* data flush 完成回调（group commit 阶段 C1）*/
+typedef void (*poweraid_raid_common_ppl_data_flush_cb)(int status, void *cb_arg);
+
+/* ===== Group Commit 协调器（阶段 C1）=====
+ *
+ * 三处屏障批合并，不改盘上格式：
+ *   1. append group：K 条 record 流水线写，1 次 range flush
+ *   2. data flush group：K 个 stripe 的 N 盘 flush 合并为每盘 1 次 range flush
+ *   3. commit group：K 个 commit 合并为 1 次 super 写+flush
+ *
+ * 并发模型：per-thread gc_ctx（挂 io_channel），无锁访问；
+ * 共享 ppl_ctx 的 slot/seq/super 用 slot_lock 保护。
+ * idle 快路径：仅 1 个 pending 且无 inflight → 立即 flush，d1 无回归。
+ */
+
+#define POWERAID_RAID_COMMON_PPL_GC_K           32    /* 批合并阈值，与 iodepth 匹配 */
+#define POWERAID_RAID_COMMON_PPL_GC_T_APPEND_US 100   /* append group 超时触发（µs）*/
+#define POWERAID_RAID_COMMON_PPL_GC_T_DATA_US   50    /* data flush group 超时（µs）*/
+#define POWERAID_RAID_COMMON_PPL_GC_T_COMMIT_US 50    /* commit group 超时（µs）*/
+#define POWERAID_RAID_COMMON_PPL_GC_POLLER_US   50    /* poller 周期（µs）*/
+#define POWERAID_RAID_COMMON_PPL_GC_MAX_BDEVS   16    /* data flush 按盘聚合最大盘数 */
+
+/* per-disk data flush range（IO 写过的盘区间）*/
+struct poweraid_raid_common_ppl_data_range {
+	uint8_t				phys;   /* 物理盘索引 */
+	uint64_t			offset; /* stripe 相对偏移（blocks）*/
+	uint64_t			length; /* 长度（blocks）*/
+};
+
+/* group commit entry：贯穿 append → data_flush → commit 三阶段 */
+struct poweraid_raid_common_ppl_gc_entry {
+	uint64_t			seq;
+	uint32_t			slot;
+	uint64_t			slot_byte_off;
+	uint64_t			stripe_id;
+	uint64_t			chunk_bitmap;
+	uint64_t			old_data_hash;
+	uint64_t			new_data_hash;
+	struct spdk_io_channel		*ch;  /* 调用方线程 channel（append write/flush 用）*/
+
+	/* append 阶段 */
+	struct poweraid_raid_common_ppl_gc	*gc;  /* 所属 group commit 协调器 */
+	poweraid_raid_common_ppl_append_cb	append_cb;
+	void				*append_cb_arg;
+	uint64_t			append_enqueue_ticks;
+	bool				append_write_failed;
+	bool				waiting_for_slot;  /* PPL 满，等待 slot 释放 */
+	void				*append_buf;  /* DMA scratch for record write */
+
+	/* data flush 阶段 */
+	struct poweraid_raid_common_ppl_data_range	ranges[POWERAID_RAID_COMMON_PPL_GC_MAX_BDEVS];
+	uint32_t			num_ranges;
+	poweraid_raid_common_ppl_data_flush_cb	data_flush_cb;
+	void				*data_flush_cb_arg;
+	uint64_t			data_flush_enqueue_ticks;
+
+	/* commit 阶段 */
+	poweraid_raid_common_ppl_commit_cb	commit_cb;
+	void				*commit_cb_arg;
+
+	TAILQ_ENTRY(poweraid_raid_common_ppl_gc_entry)	link;
+};
+
+/* per-thread group commit 协调器（嵌入 io_channel）*/
+struct poweraid_raid_common_ppl_gc {
+	struct poweraid_raid_common_ppl_ctx	*ppl_ctx;
+	struct spdk_poller			*poller;
+
+	/* opaque raid 引用：data flush 阶段发 per-disk range flush 用。
+	 * raid_bdev = struct raid_bdev*（base_bdev_info[] 来源）
+	 * raid_ch   = struct raid_bdev_io_channel*（base_channel[] 来源）
+	 * 用 void* 避免 ppl.h 依赖 bdev_raid.h，ppl.c 内部强转。*/
+	void					*raid_bdev;
+	void					*raid_ch;
+
+	/* append group */
+	TAILQ_HEAD(, poweraid_raid_common_ppl_gc_entry)	append_pending;
+	uint32_t				append_pending_count;
+	bool					append_inflight;
+	uint64_t				append_oldest_ticks;
+	/* 已入队但 record 写尚未提交的 entry 数（waiting_for_slot 场景）。
+	 * append flush 组必须等组内所有 record 写都完成后才能发出，
+	 * 否则在无 FUA/flush 能力的盘上 flush 会立即完成并提前释放 append_buf，
+	 * 与仍在途的 record 写形成 UAF（载荷被回收内存覆盖，record 落盘全零，
+	 * 且破坏 record 先于数据持久化的顺序保证）。*/
+	uint32_t				append_unsubmitted_count;
+	/* 已提交但尚未完成的 record 写数量 */
+	uint32_t				append_write_inflight;
+
+	/* data flush group */
+	TAILQ_HEAD(, poweraid_raid_common_ppl_gc_entry)	data_flush_pending;
+	uint32_t				data_flush_pending_count;
+	bool					data_flush_inflight;
+	uint64_t				data_flush_oldest_ticks;
+	struct {
+		uint64_t			min_off;
+		uint64_t			max_off;
+		bool				active;
+	} data_flush_ranges[POWERAID_RAID_COMMON_PPL_GC_MAX_BDEVS];
+	uint32_t				data_flush_remaining;
+	bool					data_flush_group_failed;
+
+	/* commit group */
+	TAILQ_HEAD(, poweraid_raid_common_ppl_gc_entry)	commit_pending;
+	uint32_t				commit_pending_count;
+	bool					commit_inflight;
+	uint64_t				commit_oldest_ticks;
+};
 
 /* ===== API ===== */
 
@@ -192,6 +302,70 @@ void poweraid_raid_common_ppl_hash_init(struct poweraid_raid_common_ppl_hash_ctx
 void poweraid_raid_common_ppl_hash_update(struct poweraid_raid_common_ppl_hash_ctx *c,
 				     const void *buf, size_t len);
 uint64_t poweraid_raid_common_ppl_hash_final(struct poweraid_raid_common_ppl_hash_ctx *c);
+
+/* ===== Group Commit API（阶段 C1）===== */
+
+/**
+ * 初始化 per-thread gc_ctx（ioch_create 调用）。
+ * 注册 poller，初始化 TAILQ。
+ * raid_bdev / raid_ch 为 opaque 指针（data flush per-disk flush 用）。
+ */
+int poweraid_raid_common_ppl_gc_init(struct poweraid_raid_common_ppl_gc *gc,
+				  struct poweraid_raid_common_ppl_ctx *ppl_ctx,
+				  void *raid_bdev, void *raid_ch);
+
+/**
+ * 销毁 gc_ctx（ioch_destroy 调用）。
+ * 注销 poller，fail 所有 pending entry。
+ */
+void poweraid_raid_common_ppl_gc_destroy(struct poweraid_raid_common_ppl_gc *gc);
+
+/**
+ * Group commit append：替代 ppl_append_record 的逐条 flush。
+ * - 分配 entry（*entry 返回给调用方，贯穿后续 data_flush/commit 阶段）
+ * - spinlock reserve slot/seq，issue write（不 flush），入队 append_pending
+ * - 触发条件满足时 range flush，完成后 inline 调 cb
+ * - idle 快路径：仅 1 pending 且无 inflight → 立即 flush（d1 无回归）
+ *
+ * 注意：cb 在 entry 完成 append flush 后被调用（可能 inline 也可能 poller 触发后）。
+ * 调用方在 cb 中开始 data writes，完成后调 ppl_gc_data_flush_enqueue。
+ */
+void poweraid_raid_common_ppl_gc_append(
+	struct poweraid_raid_common_ppl_ctx *ctx,
+	struct poweraid_raid_common_ppl_gc *gc,
+	struct spdk_io_channel *ch,
+	uint64_t stripe_id, uint64_t chunk_bitmap,
+	uint64_t old_data_hash, uint64_t new_data_hash,
+	struct poweraid_raid_common_ppl_gc_entry **entry,
+	poweraid_raid_common_ppl_append_cb cb, void *cb_arg);
+
+/**
+ * Group commit data flush enqueue：替代 rmw_start_flushes / req_start_flushes。
+ * - entry 为 ppl_gc_append 返回的同一 entry
+ * - ranges 描述本 IO 写过的盘区间（write_full=全部 N 盘，RMW=n_modified+num_parity 盘）
+ * - 入队 data_flush_pending，按盘聚合 min/max offset
+ * - 触发条件满足时每盘 1 次 range flush，全部完成后 inline 调 cb
+ */
+void poweraid_raid_common_ppl_gc_data_flush_enqueue(
+	struct poweraid_raid_common_ppl_gc *gc,
+	struct poweraid_raid_common_ppl_gc_entry *entry,
+	const struct poweraid_raid_common_ppl_data_range *ranges,
+	uint32_t num_ranges,
+	poweraid_raid_common_ppl_data_flush_cb cb, void *cb_arg);
+
+/**
+ * Group commit commit：替代 ppl_commit 的逐条 super 写+flush。
+ * - entry 为同一 entry（携带 append 分配的 seq）
+ * - 入队 commit_pending
+ * - 触发条件满足时 slot_lock 取锁、commit_seq=max、1 次 super 写+flush、释放锁
+ * - 完成后 inline 调 cb，entry 被 gc 释放
+ */
+void poweraid_raid_common_ppl_gc_commit(
+	struct poweraid_raid_common_ppl_ctx *ctx,
+	struct poweraid_raid_common_ppl_gc *gc,
+	struct spdk_io_channel *ch,
+	struct poweraid_raid_common_ppl_gc_entry *entry,
+	poweraid_raid_common_ppl_commit_cb cb, void *cb_arg);
 
 #ifdef __cplusplus
 }

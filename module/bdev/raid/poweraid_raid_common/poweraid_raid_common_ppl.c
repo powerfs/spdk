@@ -24,6 +24,7 @@
 #include "spdk/log.h"
 #include "spdk/util.h"
 
+#include "../bdev_raid.h"
 #include "poweraid_raid_common_ppl.h"
 
 SPDK_LOG_REGISTER_COMPONENT(raid5f_ppl);
@@ -52,6 +53,10 @@ struct poweraid_raid_common_ppl_ctx {
 	/* backpressure 等待队列：PPL 满时挂起 append 请求，commit 释放 slot 后唤醒。
 	 * 解决 issue #14：高并发写时 PPL 满（-ENOSPC）降级无 PPL 保护的问题。*/
 	TAILQ_HEAD(, poweraid_raid_common_ppl_waiter)	waiters;
+
+	/* slot_lock：保护 tail_slot/next_seq/super 修改、inflight/waiters 链表操作。
+	 * 修复多线程并发 append/commit 的 race（阶段 C1 顺带修复）。*/
+	pthread_spinlock_t		slot_lock;
 };
 
 /* backpressure 等待者：PPL 满时暂存 append 参数，commit 唤醒后重发 append */
@@ -109,7 +114,8 @@ struct ppl_commit_op {
 
 /* ===== init 异步操作 ===== */
 enum ppl_init_state {
-	PPL_INIT_WRITE = 0,
+	PPL_INIT_ZEROES = 0,  /* 清零整个 PPL region，防止旧 record 残留（阶段 C1 根因修复）*/
+	PPL_INIT_WRITE,
 	PPL_INIT_FLUSH,
 	PPL_INIT_DONE,
 };
@@ -278,6 +284,7 @@ poweraid_raid_common_ppl_alloc(void *bdev_desc, struct spdk_io_channel *ch,
 	ctx->tail_slot = 1;  /* slot 0 = super，record 从 slot 1 起 */
 	TAILQ_INIT(&ctx->inflight);
 	TAILQ_INIT(&ctx->waiters);
+	pthread_spin_init(&ctx->slot_lock, PTHREAD_PROCESS_PRIVATE);
 
 	/* 内存 super 初始（写盘由 ppl_init 触发；加载由 ppl_load_replay 触发）*/
 	memset(&ctx->super, 0, sizeof(ctx->super));
@@ -311,6 +318,7 @@ poweraid_raid_common_ppl_free(struct poweraid_raid_common_ppl_ctx *ctx)
 		w->cb(-ECANCELED, 0, w->cb_arg);
 		free(w);
 	}
+	pthread_spin_destroy(&ctx->slot_lock);
 	free(ctx);
 }
 
@@ -325,10 +333,31 @@ ppl_arm_wait(struct spdk_bdev_io_wait_entry *w, void *bdev_desc,
 	spdk_bdev_queue_io_wait(bdev_desc, ch, w);
 }
 
-/* ===== init：格式化 PPL 区（写 super + FUA）===== */
+/* ===== init：格式化 PPL 区（清零 region + 写 super + FUA）===== */
 
 static void ppl_init_io_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
 static void ppl_init_loop(struct ppl_init_op *op);
+
+/* 清零 record 区域完成回调。
+ * 根因修复（阶段 C1）：ppl_init 之前只写 super（slot 0），不清零 record 区域，
+ * 旧磁盘残留的 record 会被 recovery 误读为 uncommitted，执行 REWRITE_PARITY 破坏全新卷 parity。
+ * 清零整个 PPL region 后再写 super，确保旧数据被彻底清除。*/
+static void
+ppl_init_zeroes_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct ppl_init_op *op = cb_arg;
+
+	spdk_bdev_free_io(bdev_io);
+	if (!success) {
+		SPDK_ERRLOG("ppl_init: write_zeroes PPL region failed\n");
+		op->status = -EIO;
+		op->state = PPL_INIT_DONE;
+		ppl_init_loop(op);
+		return;
+	}
+	op->state++;
+	ppl_init_loop(op);
+}
 
 static void
 ppl_init_io_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
@@ -354,6 +383,24 @@ ppl_init_loop(struct ppl_init_op *op)
 
 	while (op->state < PPL_INIT_DONE) {
 		switch (op->state) {
+		case PPL_INIT_ZEROES:
+			/* 清零整个 PPL region（slot 0..max_slots-1），防止旧磁盘 record 残留。
+			 * 旧 record 的 magic+crc 仍然有效，recovery 会误读为 uncommitted record，
+			 * 对全新卷执行 REWRITE_PARITY 破坏 parity。必须先清零再写 super。*/
+			rc = spdk_bdev_write_zeroes_blocks(ctx->bdev_desc, ctx->ch,
+							   byte_to_block_offset(ctx, ctx->region_offset),
+							   ctx->max_slots, ppl_init_zeroes_cb, op);
+			if (rc == -ENOMEM) {
+				ppl_arm_wait(&op->wait_entry, ctx->bdev_desc, ctx->ch,
+					     (spdk_bdev_io_wait_cb)ppl_init_loop, op);
+				return;
+			} else if (rc != 0) {
+				op->status = rc;
+				op->state = PPL_INIT_DONE;
+				continue;
+			}
+			return;  /* 等 cb */
+
 		case PPL_INIT_WRITE:
 			memcpy(op->buf, &ctx->super, sizeof(ctx->super));
 			rc = spdk_bdev_write_blocks(ctx->bdev_desc, ctx->ch, op->buf,
@@ -421,7 +468,7 @@ poweraid_raid_common_ppl_init(struct poweraid_raid_common_ppl_ctx *ctx,
 	op->cb = cb;
 	op->cb_arg = cb_arg;
 	op->status = 0;
-	op->state = PPL_INIT_WRITE;
+	op->state = PPL_INIT_ZEROES;
 
 	op->buf = spdk_dma_malloc(ctx->block_size, 0x1000, NULL);
 	if (!op->buf) {
@@ -509,7 +556,9 @@ ppl_append_loop(struct ppl_append_op *op)
 		if (inf) {
 			inf->seq = op->seq;
 			inf->stripe_id = op->rec.stripe_id;
+			pthread_spin_lock(&ctx->slot_lock);
 			TAILQ_INSERT_TAIL(&ctx->inflight, inf, link);
+			pthread_spin_unlock(&ctx->slot_lock);
 		}
 		op->cb(0, op->seq, op->cb_arg);
 	} else {
@@ -536,6 +585,9 @@ poweraid_raid_common_ppl_append_record(struct poweraid_raid_common_ppl_ctx *ctx,
 		if (cb) { cb(-EINVAL, 0, cb_arg); }
 		return;
 	}
+
+	/* slot_lock 保护 tail_slot/next_seq/super/inflight/waiters（阶段 C1 修复并发 bug）*/
+	pthread_spin_lock(&ctx->slot_lock);
 	if (ctx->tail_slot >= ctx->max_slots) {
 		/* 环形回收：所有已 append 的 record 均已 commit（inflight 空）后，
 		 * slot 回卷到 1。seq 仍由 super.next_seq 单调分配，与 slot 解耦；
@@ -546,6 +598,7 @@ poweraid_raid_common_ppl_append_record(struct poweraid_raid_common_ppl_ctx *ctx,
 			 * 等 commit 释放 slot 后由 ppl_wake_waiters 唤醒重发。*/
 			w = calloc(1, sizeof(*w));
 			if (!w) {
+				pthread_spin_unlock(&ctx->slot_lock);
 				cb(-ENOMEM, 0, cb_arg);
 				return;
 			}
@@ -557,6 +610,7 @@ poweraid_raid_common_ppl_append_record(struct poweraid_raid_common_ppl_ctx *ctx,
 			w->cb = cb;
 			w->cb_arg = cb_arg;
 			TAILQ_INSERT_TAIL(&ctx->waiters, w, link);
+			pthread_spin_unlock(&ctx->slot_lock);
 			SPDK_NOTICELOG("ppl_append: log full, backpressure queueing "
 				       "(ctx=%p tail=%u max=%u waiters++\n",
 				       ctx, ctx->tail_slot, ctx->max_slots);
@@ -575,6 +629,7 @@ poweraid_raid_common_ppl_append_record(struct poweraid_raid_common_ppl_ctx *ctx,
 	ctx->super.next_seq = seq + 1;
 	ctx->super.tail_seq = seq + 1;
 	ctx->super.num_records++;
+	pthread_spin_unlock(&ctx->slot_lock);
 
 	op = calloc(1, sizeof(*op));
 	if (!op) {
@@ -629,20 +684,29 @@ ppl_wake_waiters(struct poweraid_raid_common_ppl_ctx *ctx)
 {
 	struct poweraid_raid_common_ppl_waiter *w;
 
-	while ((w = TAILQ_FIRST(&ctx->waiters)) != NULL) {
+	while (1) {
+		pthread_spin_lock(&ctx->slot_lock);
+		w = TAILQ_FIRST(&ctx->waiters);
+		if (w == NULL) {
+			pthread_spin_unlock(&ctx->slot_lock);
+			break;
+		}
 		if (ctx->tail_slot >= ctx->max_slots) {
 			if (TAILQ_EMPTY(&ctx->inflight)) {
 				SPDK_NOTICELOG("ppl_wake: ring recycle (next_seq=%"PRIu64")\n",
 					       ctx->super.next_seq);
 				ctx->tail_slot = 1;
 			} else {
+				pthread_spin_unlock(&ctx->slot_lock);
 				break;  /* 仍然满，等待下次 commit */
 			}
 		}
 		TAILQ_REMOVE(&ctx->waiters, w, link);
+		pthread_spin_unlock(&ctx->slot_lock);
+
 		SPDK_DEBUGLOG(raid5f_ppl, "ppl_wake: re-issue append stripe=%"PRIu64
 			      " bitmap=0x%"PRIx64"\n", w->stripe_id, w->chunk_bitmap);
-		/* 重发 append：同步预占 slot，若再次满则重新入队（尾部）*/
+		/* 重发 append：同步预占 slot（内部加 slot_lock），若再次满则重新入队 */
 		poweraid_raid_common_ppl_append_record(ctx, w->ch,
 						       w->stripe_id, w->chunk_bitmap,
 						       w->old_data_hash, w->new_data_hash,
@@ -715,6 +779,7 @@ ppl_commit_loop(struct ppl_commit_op *op)
 	if (op->status == 0) {
 		struct poweraid_raid_common_ppl_inflight *inf, *tmp;
 		uint32_t removed = 0;
+		pthread_spin_lock(&ctx->slot_lock);
 		TAILQ_FOREACH_SAFE(inf, &ctx->inflight, link, tmp) {
 			if (inf->seq <= op->commit_seq) {
 				TAILQ_REMOVE(&ctx->inflight, inf, link);
@@ -728,6 +793,7 @@ ppl_commit_loop(struct ppl_commit_op *op)
 				? (ctx->super.num_records - removed) : 0;
 			ctx->super.head_seq = op->commit_seq + 1;
 		}
+		pthread_spin_unlock(&ctx->slot_lock);
 		/* backpressure 唤醒：释放 slot 后通知等待者 */
 		ppl_wake_waiters(ctx);
 	}
@@ -754,8 +820,10 @@ poweraid_raid_common_ppl_commit(struct poweraid_raid_common_ppl_ctx *ctx,
 		return;
 	}
 
+	pthread_spin_lock(&ctx->slot_lock);
 	ctx->super.commit_seq = seq;
 	ppl_super_set_crc(&ctx->super);
+	pthread_spin_unlock(&ctx->slot_lock);
 
 	op = calloc(1, sizeof(*op));
 	if (!op) {
@@ -824,7 +892,8 @@ ppl_replay_scan_chunk(struct ppl_replay_op *op, uint32_t slots_in_buf)
 	for (i = 0; i < slots_in_buf; i++) {
 		const struct poweraid_raid_common_ppl_record *rec =
 			(const struct poweraid_raid_common_ppl_record *)p;
-		if (rec->magic == POWERAID_RAID_COMMON_PPL_REC_MAGIC && ppl_rec_check(rec)) {
+		if (rec->magic == POWERAID_RAID_COMMON_PPL_REC_MAGIC &&
+		    ppl_rec_check(rec)) {
 			if (rec->seq > op->ctx->super.commit_seq) {
 				if (ppl_replay_insert(op, rec) != 0) {
 					op->status = -ENOMEM;
@@ -1085,4 +1154,1044 @@ uint64_t
 poweraid_raid_common_ppl_hash_final(struct poweraid_raid_common_ppl_hash_ctx *c)
 {
 	return ((uint64_t)c->hi << 32) | (uint64_t)c->lo;
+}
+
+/* ===== Group Commit 实现（阶段 C1）=====
+ *
+ * 三处屏障批合并，per-thread gc_ctx 无锁 + 共享 ppl_ctx slot_lock。
+ * 详见 poweraid_raid_common_ppl.h 注释。
+ */
+
+/* 命名 TAILQ head 类型：TAILQ_LAST 需要具名 head type，匿名 TAILQ_HEAD 不行。
+ * gc_append_flush_op / gc_data_flush_op / gc_commit_op 中的 group 字段布局一致，
+ * 均为 TAILQ_HEAD(, poweraid_raid_common_ppl_gc_entry)，可安全强转。*/
+TAILQ_HEAD(gc_entry_list, poweraid_raid_common_ppl_gc_entry);
+
+/* 前向声明 */
+static int ppl_gc_poller(void *arg);
+static void ppl_gc_append_flush_retry(void *arg);
+static void ppl_gc_data_flush_check_trigger(struct poweraid_raid_common_ppl_gc *gc);
+static void ppl_gc_commit_check_trigger(struct poweraid_raid_common_ppl_gc *gc,
+					struct poweraid_raid_common_ppl_ctx *ctx);
+static void ppl_gc_append_check_trigger(struct poweraid_raid_common_ppl_gc *gc, bool force);
+static void ppl_gc_append_resume_waiting(struct poweraid_raid_common_ppl_gc *gc);
+
+/* ===== append group ===== */
+
+/* 单条 record write 完成 cb：仅标记失败，不推进状态（flush 完成才推进）*/
+
+static void
+ppl_gc_append_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct poweraid_raid_common_ppl_gc_entry *entry = cb_arg;
+	struct poweraid_raid_common_ppl_gc *gc = entry->gc;
+
+	spdk_bdev_free_io(bdev_io);
+	assert(gc->append_write_inflight > 0);
+	gc->append_write_inflight--;
+	if (!success) {
+		entry->append_write_failed = true;
+		SPDK_ERRLOG("gc_append: write failed slot=%u seq=%"PRIu64"\n",
+			    entry->slot, entry->seq);
+	}
+
+	/* record 写全部完成后，append flush 组才允许发出 */
+	ppl_gc_append_check_trigger(gc, false);
+}
+
+/* range flush op：跟踪当前 flush group */
+struct gc_append_flush_op {
+	struct poweraid_raid_common_ppl_gc		*gc;
+	struct spdk_io_channel				*ch;
+	TAILQ_HEAD(, poweraid_raid_common_ppl_gc_entry)	group;
+	uint32_t					count;
+	uint64_t					flush_off;
+	uint64_t					flush_len;
+	struct spdk_bdev_io_wait_entry			wait_entry;
+};
+
+static void
+ppl_gc_append_flush_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct gc_append_flush_op *op = cb_arg;
+	struct poweraid_raid_common_ppl_gc *gc = op->gc;
+	struct poweraid_raid_common_ppl_gc_entry *entry, *tmp;
+	struct poweraid_raid_common_ppl_inflight *inf;
+
+	/* 提交即失败的路径（ENOMEM 重试耗尽/EINVAL）会以 bdev_io==NULL 直接调本回调 */
+	if (bdev_io != NULL) {
+		spdk_bdev_free_io(bdev_io);
+	}
+
+	if (!success) {
+		SPDK_ERRLOG("gc_append: range flush failed (count=%u)\n", op->count);
+	}
+
+	TAILQ_FOREACH_SAFE(entry, &op->group, link, tmp) {
+		spdk_free(entry->append_buf);
+		entry->append_buf = NULL;
+
+		if (success && !entry->append_write_failed) {
+			/* 成功：插入 inflight（slot_lock 保护），回调，entry 保留供后续 data_flush/commit */
+			inf = calloc(1, sizeof(*inf));
+			if (inf) {
+				inf->seq = entry->seq;
+				inf->stripe_id = entry->stripe_id;
+				pthread_spin_lock(&gc->ppl_ctx->slot_lock);
+				TAILQ_INSERT_TAIL(&gc->ppl_ctx->inflight, inf, link);
+				pthread_spin_unlock(&gc->ppl_ctx->slot_lock);
+			}
+			entry->append_cb(0, entry->seq, entry->append_cb_arg);
+			/* entry 不释放：贯穿后续 data_flush / commit 阶段 */
+		} else {
+			/* 失败：回调后释放 entry（调用方收到 error 后设 gc_entry=NULL，不再使用）*/
+			entry->append_cb(-EIO, 0, entry->append_cb_arg);
+			free(entry);
+		}
+	}
+
+	gc->append_inflight = false;
+
+	/* 链式：flush 完成后若 pending 非空，立即触发下一 group */
+	if (!TAILQ_EMPTY(&gc->append_pending)) {
+		ppl_gc_append_check_trigger(gc, false);
+	}
+
+	free(op);
+}
+
+/* idle 快路径判断：仅 1 pending 且无 inflight 且无 commit 活动 */
+static bool
+ppl_gc_append_idle_fastpath(const struct poweraid_raid_common_ppl_gc *gc)
+{
+	return gc->append_pending_count == 1 &&
+	       !gc->append_inflight &&
+	       gc->commit_pending_count == 0 &&
+	       !gc->commit_inflight;
+}
+
+/* ENOMEM 重试：op 仍持有 group entries，重新发 range flush。
+ * 作为 spdk_bdev_io_wait_cb 被 spdk_bdev_queue_io_wait 回调。*/
+static void
+ppl_gc_append_flush_retry(void *arg)
+{
+	struct gc_append_flush_op *op = arg;
+	struct poweraid_raid_common_ppl_gc *gc = op->gc;
+	struct poweraid_raid_common_ppl_ctx *ctx = gc->ppl_ctx;
+	int rc;
+
+	rc = spdk_bdev_flush_blocks(ctx->bdev_desc, op->ch,
+				    byte_to_block_offset(ctx, op->flush_off),
+				    op->flush_len >> ctx->block_shift,
+				    ppl_gc_append_flush_cb, op);
+	if (rc == -ENOMEM) {
+		/* 仍资源不足：重新 arm wait */
+		op->wait_entry.bdev = spdk_bdev_desc_get_bdev(ctx->bdev_desc);
+		op->wait_entry.cb_fn = ppl_gc_append_flush_retry;
+		op->wait_entry.cb_arg = op;
+		spdk_bdev_queue_io_wait(ctx->bdev_desc, op->ch, &op->wait_entry);
+	} else if (rc != 0) {
+		SPDK_ERRLOG("gc_append: flush retry failed rc=%d\n", rc);
+		ppl_gc_append_flush_cb(NULL, false, op);
+	}
+}
+
+/* 检查 append 触发条件，满足则发 range flush */
+static void
+ppl_gc_append_check_trigger(struct poweraid_raid_common_ppl_gc *gc, bool force)
+{
+	struct poweraid_raid_common_ppl_ctx *ctx = gc->ppl_ctx;
+	struct gc_append_flush_op *op;
+	struct poweraid_raid_common_ppl_gc_entry *first, *last;
+	uint64_t flush_off;
+	uint64_t flush_len;
+	int rc;
+
+	if (gc->append_inflight || gc->append_pending_count == 0) {
+		return;
+	}
+
+	/* 必须等组内所有 record 写都已提交且完成后再 flush：
+	 * - 无 FUA/flush 能力的盘上 flush 会立即完成，ppl_gc_append_flush_cb
+	 *   随即释放 append_buf；若 record 写仍在途，其 DMA 载荷会被后续
+	 *   malloc/memset 回收覆盖（实测落盘为全零 record），形成 UAF；
+	 * - 同时必须保证 record 先于后续 data 写持久化的顺序。*/
+	if (gc->append_unsubmitted_count != 0 || gc->append_write_inflight != 0) {
+		return;
+	}
+
+	/* 触发条件：K 达到 / idle 快路径 / poller T_append 超时强制（force）。
+	 * force 仍受上面的未完成 record 写门控约束，不能提前 flush。*/
+	bool trigger = force ||
+		       (gc->append_pending_count >= POWERAID_RAID_COMMON_PPL_GC_K) ||
+		       ppl_gc_append_idle_fastpath(gc);
+	if (!trigger) {
+		return;
+	}
+
+	/* 收集当前 pending 全部 entry 到 flush op */
+	op = calloc(1, sizeof(*op));
+	if (!op) {
+		SPDK_ERRLOG("gc_append: flush op alloc failed, retry next poll\n");
+		return;
+	}
+	op->gc = gc;
+	op->ch = TAILQ_FIRST(&gc->append_pending)->ch;
+	TAILQ_INIT(&op->group);
+	TAILQ_SWAP(&gc->append_pending, &op->group, poweraid_raid_common_ppl_gc_entry, link);
+	/* TAILQ_SWAP 不清空源 head，手动清 */
+	TAILQ_INIT(&gc->append_pending);
+	op->count = gc->append_pending_count;
+	gc->append_pending_count = 0;
+	gc->append_inflight = true;
+
+
+	/* 计算 flush range [first_slot, last_slot]。
+	 * ring 回卷时（last slot 号 < first，entry 按入队顺序排列）两段不连续，
+	 * 直接相减会下溢成超长范围导致 spdk_bdev_flush_blocks 返回 -EINVAL。
+	 * NVMe FLUSH 本身不带范围（刷整个 namespace），回卷时刷整个 PPL region
+	 * 与刷两个分段语义等价，且不会触及 region 之外的数据。*/
+	first = TAILQ_FIRST(&op->group);
+	last = TAILQ_LAST(&op->group, gc_entry_list);
+	if (last->slot >= first->slot) {
+		op->flush_off = first->slot_byte_off;
+		op->flush_len = (last->slot_byte_off - first->slot_byte_off) + ctx->block_size;
+	} else {
+		op->flush_off = ctx->region_offset;
+		op->flush_len = ctx->region_size;
+	}
+
+	SPDK_DEBUGLOG(raid5f_ppl, "gc_append flush: count=%u range=[%lu, +%lu)\n",
+		      op->count, (unsigned long)op->flush_off, (unsigned long)op->flush_len);
+
+	rc = spdk_bdev_flush_blocks(ctx->bdev_desc, op->ch,
+				    byte_to_block_offset(ctx, op->flush_off),
+				    op->flush_len >> ctx->block_shift,
+				    ppl_gc_append_flush_cb, op);
+	if (rc == -ENOMEM) {
+		/* 资源不足：arm wait，retry 回调直接重发 flush（op 仍持有 entries）*/
+		op->wait_entry.bdev = spdk_bdev_desc_get_bdev(ctx->bdev_desc);
+		op->wait_entry.cb_fn = ppl_gc_append_flush_retry;
+		op->wait_entry.cb_arg = op;
+		spdk_bdev_queue_io_wait(ctx->bdev_desc, op->ch, &op->wait_entry);
+		return;
+	} else if (rc != 0) {
+		SPDK_ERRLOG("gc_append: flush failed rc=%d\n", rc);
+		/* 直接调 flush_cb 模拟 flush 失败，cb 会 fail 全组并清 inflight */
+		ppl_gc_append_flush_cb(NULL, false, op);
+		return;
+	}
+}
+
+/* 为 waiting_for_slot 的 entry 尝试预留 slot 并发 write */
+static void
+ppl_gc_append_resume_waiting(struct poweraid_raid_common_ppl_gc *gc)
+{
+	struct poweraid_raid_common_ppl_ctx *ctx = gc->ppl_ctx;
+	struct poweraid_raid_common_ppl_gc_entry *entry, *tmp;
+	struct poweraid_raid_common_ppl_record rec;
+	uint64_t seq;
+	uint32_t slot;
+	int rc;
+
+	TAILQ_FOREACH_SAFE(entry, &gc->append_pending, link, tmp) {
+		if (!entry->waiting_for_slot) {
+			continue;
+		}
+
+		pthread_spin_lock(&ctx->slot_lock);
+		if (ctx->tail_slot >= ctx->max_slots) {
+			if (!TAILQ_EMPTY(&ctx->inflight)) {
+				pthread_spin_unlock(&ctx->slot_lock);
+				continue;  /* 仍然满 */
+			}
+			ctx->tail_slot = 1;
+		}
+		seq = ctx->super.next_seq;
+		slot = ctx->tail_slot;
+		ctx->tail_slot++;
+		ctx->super.next_seq = seq + 1;
+		ctx->super.tail_seq = seq + 1;
+		ctx->super.num_records++;
+		pthread_spin_unlock(&ctx->slot_lock);
+
+		entry->seq = seq;
+		entry->slot = slot;
+		entry->slot_byte_off = slot_to_byte_offset(ctx, slot);
+		entry->waiting_for_slot = false;
+
+		/* 构造 record 并发 write */
+		memset(&rec, 0, sizeof(rec));
+		rec.magic = POWERAID_RAID_COMMON_PPL_REC_MAGIC;
+		rec.flags = POWERAID_RAID_COMMON_PPL_REC_F_VALID;
+		rec.seq = seq;
+		rec.stripe_id = entry->stripe_id;
+		rec.chunk_bitmap = entry->chunk_bitmap;
+		rec.old_data_hash = entry->old_data_hash;
+		rec.new_data_hash = entry->new_data_hash;
+		rec.ts = (uint64_t)time(NULL);
+		ppl_rec_set_crc(&rec);
+
+		entry->append_buf = spdk_dma_malloc(ctx->block_size, 0x1000, NULL);
+		if (!entry->append_buf) {
+			entry->append_write_failed = true;
+			gc->append_unsubmitted_count--;  /* 无在途写，直接允许组触发 */
+			continue;
+		}
+		memset(entry->append_buf, 0, ctx->block_size);
+		memcpy(entry->append_buf, &rec, sizeof(rec));
+
+		rc = spdk_bdev_write_blocks(ctx->bdev_desc, entry->ch,
+					    entry->append_buf,
+					    byte_to_block_offset(ctx, entry->slot_byte_off),
+					    1, ppl_gc_append_write_cb, entry);
+		if (rc != 0) {
+			SPDK_ERRLOG("gc_append: write failed rc=%d (waiting entry)\n", rc);
+			entry->append_write_failed = true;
+			/* 提交失败：无在途写，直接允许组触发 */
+			gc->append_unsubmitted_count--;
+		} else {
+			gc->append_unsubmitted_count--;
+			gc->append_write_inflight++;
+		}
+	}
+
+	/* 可能本批 waiting entry 是最后的未提交写，尝试触发 append flush */
+	ppl_gc_append_check_trigger(gc, false);
+}
+
+void
+poweraid_raid_common_ppl_gc_append(
+	struct poweraid_raid_common_ppl_ctx *ctx,
+	struct poweraid_raid_common_ppl_gc *gc,
+	struct spdk_io_channel *ch,
+	uint64_t stripe_id, uint64_t chunk_bitmap,
+	uint64_t old_data_hash, uint64_t new_data_hash,
+	struct poweraid_raid_common_ppl_gc_entry **entry_out,
+	poweraid_raid_common_ppl_append_cb cb, void *cb_arg)
+{
+	struct poweraid_raid_common_ppl_gc_entry *entry;
+	struct poweraid_raid_common_ppl_record rec;
+	uint64_t seq;
+	uint32_t slot;
+	bool slot_reserved = false;
+	int rc;
+
+	if (ctx == NULL || gc == NULL || ch == NULL || cb == NULL) {
+		if (cb) { cb(-EINVAL, 0, cb_arg); }
+		return;
+	}
+
+	/* gc 未初始化（poller 为 NULL）→ fallback 到逐条 append_record。
+	 * entry_out 设 NULL，调用方据此走非 gc 路径的 data flush / commit。*/
+	if (gc->poller == NULL) {
+		*entry_out = NULL;
+		poweraid_raid_common_ppl_append_record(ctx, ch, stripe_id, chunk_bitmap,
+						       old_data_hash, new_data_hash, cb, cb_arg);
+		return;
+	}
+
+	entry = calloc(1, sizeof(*entry));
+	if (!entry) {
+		cb(-ENOMEM, 0, cb_arg);
+		return;
+	}
+	entry->stripe_id = stripe_id;
+	entry->chunk_bitmap = chunk_bitmap;
+	entry->old_data_hash = old_data_hash;
+	entry->new_data_hash = new_data_hash;
+	entry->ch = ch;
+	entry->gc = gc;
+	entry->append_cb = cb;
+	entry->append_cb_arg = cb_arg;
+	entry->append_enqueue_ticks = spdk_get_ticks();
+	*entry_out = entry;
+
+	/* 尝试预留 slot/seq */
+	pthread_spin_lock(&ctx->slot_lock);
+	if (ctx->tail_slot >= ctx->max_slots) {
+		if (!TAILQ_EMPTY(&ctx->inflight)) {
+			/* PPL 满：entry 挂入 append_pending，标记 waiting_for_slot，
+			 * poller 在 commit 释放 slot 后重试 */
+			entry->waiting_for_slot = true;
+		} else {
+			ctx->tail_slot = 1;  /* ring recycle */
+		}
+	}
+	if (!entry->waiting_for_slot) {
+		seq = ctx->super.next_seq;
+		slot = ctx->tail_slot;
+		ctx->tail_slot++;
+		ctx->super.next_seq = seq + 1;
+		ctx->super.tail_seq = seq + 1;
+		ctx->super.num_records++;
+		entry->seq = seq;
+		entry->slot = slot;
+		entry->slot_byte_off = slot_to_byte_offset(ctx, slot);
+		slot_reserved = true;
+	}
+	pthread_spin_unlock(&ctx->slot_lock);
+
+	/* 入队 append_pending */
+	TAILQ_INSERT_TAIL(&gc->append_pending, entry, link);
+	gc->append_pending_count++;
+	/* 新 entry 的 record 写尚未提交（waiting_for_slot 时由 resume 路径提交）*/
+	gc->append_unsubmitted_count++;
+	if (gc->append_pending_count == 1) {
+		gc->append_oldest_ticks = entry->append_enqueue_ticks;
+	}
+
+	if (slot_reserved) {
+		/* 构造 record 并发 write（不 flush）*/
+		memset(&rec, 0, sizeof(rec));
+		rec.magic = POWERAID_RAID_COMMON_PPL_REC_MAGIC;
+		rec.flags = POWERAID_RAID_COMMON_PPL_REC_F_VALID;
+		rec.seq = seq;
+		rec.stripe_id = stripe_id;
+		rec.chunk_bitmap = chunk_bitmap;
+		rec.old_data_hash = old_data_hash;
+		rec.new_data_hash = new_data_hash;
+		rec.ts = (uint64_t)time(NULL);
+		ppl_rec_set_crc(&rec);
+
+		entry->append_buf = spdk_dma_malloc(ctx->block_size, 0x1000, NULL);
+		if (!entry->append_buf) {
+			entry->append_write_failed = true;
+			gc->append_unsubmitted_count--;  /* 无在途写，直接允许组触发 */
+		} else {
+			memset(entry->append_buf, 0, ctx->block_size);
+			memcpy(entry->append_buf, &rec, sizeof(rec));
+
+			rc = spdk_bdev_write_blocks(ctx->bdev_desc, ch,
+						    entry->append_buf,
+						    byte_to_block_offset(ctx, entry->slot_byte_off),
+						    1, ppl_gc_append_write_cb, entry);
+			if (rc != 0) {
+				SPDK_ERRLOG("gc_append: write_blocks rc=%d\n", rc);
+				entry->append_write_failed = true;
+				/* 提交失败：无在途写，直接允许组触发 */
+				gc->append_unsubmitted_count--;
+			} else {
+				gc->append_unsubmitted_count--;
+				gc->append_write_inflight++;
+			}
+		}
+	}
+
+	/* 检查触发条件 */
+	ppl_gc_append_check_trigger(gc, false);
+}
+
+/* ===== data flush group ===== */
+
+struct gc_data_flush_op {
+	struct poweraid_raid_common_ppl_gc		*gc;
+	TAILQ_HEAD(, poweraid_raid_common_ppl_gc_entry)	group;
+	uint32_t					count;
+	uint32_t					remaining;  /* 未完成 per-disk flush 数 */
+	bool						failed;
+	/* per-disk range 聚合（从 gc->data_flush_ranges 拷贝，避免 inflight 期间被新 enqueue 污染）*/
+	struct {
+		uint64_t				min_off;
+		uint64_t				max_off;
+		bool					active;
+	} ranges[POWERAID_RAID_COMMON_PPL_GC_MAX_BDEVS];
+};
+
+static void
+ppl_gc_data_flush_done(struct gc_data_flush_op *op)
+{
+	struct poweraid_raid_common_ppl_gc *gc = op->gc;
+	struct poweraid_raid_common_ppl_gc_entry *entry, *tmp;
+	int status = op->failed ? -EIO : 0;
+
+	SPDK_DEBUGLOG(raid5f_ppl, "gc_data_flush_done: count=%u failed=%d status=%d\n",
+		      op->count, op->failed, status);
+
+	TAILQ_FOREACH_SAFE(entry, &op->group, link, tmp) {
+		entry->data_flush_cb(status, entry->data_flush_cb_arg);
+		/* entry 不释放：贯穿 commit 阶段 */
+	}
+
+	gc->data_flush_inflight = false;
+	/* 注：gc->data_flush_ranges 已在 trigger 时拷贝到 op 并重置，此处不再清 */
+
+	/* 链式 */
+	if (!TAILQ_EMPTY(&gc->data_flush_pending)) {
+		ppl_gc_data_flush_check_trigger(gc);
+	}
+
+	free(op);
+}
+
+static void
+ppl_gc_data_flush_per_disk_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct gc_data_flush_op *op = cb_arg;
+
+	spdk_bdev_free_io(bdev_io);
+	SPDK_DEBUGLOG(raid5f_ppl, "gc_data_flush per_disk_cb: success=%d remaining=%u\n",
+		      success, op->remaining - 1);
+	if (!success) {
+		op->failed = true;
+		SPDK_ERRLOG("gc_data_flush: per-disk flush failed (remaining=%u)\n",
+			    op->remaining - 1);
+	}
+
+	if (--op->remaining == 0) {
+		ppl_gc_data_flush_done(op);
+	}
+}
+
+static void
+ppl_gc_data_flush_check_trigger(struct poweraid_raid_common_ppl_gc *gc)
+{
+	struct gc_data_flush_op *op;
+	struct raid_bdev *raid_bdev = gc->raid_bdev;
+	struct raid_bdev_io_channel *raid_ch = gc->raid_ch;
+	uint32_t i, num_disks;
+	int rc;
+
+	if (gc->data_flush_inflight || gc->data_flush_pending_count == 0) {
+		return;
+	}
+
+	/* raid_bdev / raid_ch 未设置（理论不应到达，首次 IO 即填充）→ fail 全组 */
+	if (raid_bdev == NULL || raid_ch == NULL) {
+		SPDK_ERRLOG("gc_data_flush: raid_bdev or raid_ch is NULL\n");
+		/* fail 所有 pending entry */
+		{
+			struct poweraid_raid_common_ppl_gc_entry *entry, *tmp;
+			TAILQ_FOREACH_SAFE(entry, &gc->data_flush_pending, link, tmp) {
+				TAILQ_REMOVE(&gc->data_flush_pending, entry, link);
+				entry->data_flush_cb(-ENODEV, entry->data_flush_cb_arg);
+			}
+			gc->data_flush_pending_count = 0;
+			memset(gc->data_flush_ranges, 0, sizeof(gc->data_flush_ranges));
+		}
+		return;
+	}
+
+	bool trigger = (gc->data_flush_pending_count >= POWERAID_RAID_COMMON_PPL_GC_K) ||
+		       (gc->data_flush_pending_count == 1 &&
+			!gc->data_flush_inflight &&
+			gc->append_pending_count == 0 &&
+			!gc->append_inflight &&
+			gc->commit_pending_count == 0 &&
+			!gc->commit_inflight);
+
+	SPDK_DEBUGLOG(raid5f_ppl, "gc_data_flush trigger: pending=%u inflight=%d append_pend=%u append_inf=%d commit_pend=%u commit_inf=%d trigger=%d\n",
+		      gc->data_flush_pending_count, gc->data_flush_inflight,
+		      gc->append_pending_count, gc->append_inflight,
+		      gc->commit_pending_count, gc->commit_inflight, trigger);
+	/* T_data 超时强制触发：避免低并发下 batch 不满而 stall */
+	if (!trigger && gc->data_flush_oldest_ticks != 0) {
+		uint64_t t_data = (POWERAID_RAID_COMMON_PPL_GC_T_DATA_US *
+				   spdk_get_ticks_hz()) / 1000000ULL;
+		if ((spdk_get_ticks() - gc->data_flush_oldest_ticks) >= t_data) {
+			trigger = true;
+		}
+	}
+	if (!trigger) {
+		return;
+	}
+
+	/* 收集 group */
+	op = calloc(1, sizeof(*op));
+	if (!op) {
+		SPDK_ERRLOG("gc_data_flush: op alloc failed\n");
+		return;
+	}
+	op->gc = gc;
+	TAILQ_INIT(&op->group);
+	TAILQ_SWAP(&gc->data_flush_pending, &op->group, poweraid_raid_common_ppl_gc_entry, link);
+	TAILQ_INIT(&gc->data_flush_pending);
+	op->count = gc->data_flush_pending_count;
+	gc->data_flush_pending_count = 0;
+	gc->data_flush_oldest_ticks = 0;
+	gc->data_flush_inflight = true;
+	op->failed = false;
+
+	/* 拷贝 per-disk range 聚合到 op，并立即重置 gc->data_flush_ranges。
+	 * 这样 inflight 期间新 enqueue 的 entry 的 range 不会被丢失（下一 group 独立聚合）。*/
+	memcpy(op->ranges, gc->data_flush_ranges, sizeof(op->ranges));
+	memset(gc->data_flush_ranges, 0, sizeof(gc->data_flush_ranges));
+
+	/* 统计有多少个活跃盘需要 flush */
+	num_disks = 0;
+	for (i = 0; i < POWERAID_RAID_COMMON_PPL_GC_MAX_BDEVS; i++) {
+		if (op->ranges[i].active) {
+			num_disks++;
+		}
+	}
+	op->remaining = num_disks;
+
+	SPDK_DEBUGLOG(raid5f_ppl, "gc_data_flush: group formed count=%u num_disks=%u\n",
+		      op->count, num_disks);
+
+	if (num_disks == 0) {
+		/* 无盘需 flush（理论不应发生），直接完成 */
+		ppl_gc_data_flush_done(op);
+		return;
+	}
+
+	/* 每盘发一次 range flush：通过 raid_bdev->base_bdev_info[phys] 获取 desc，
+	 * 通过 raid_bdev_channel_get_base_channel(raid_ch, phys) 获取 base channel。
+	 * offset/length 为 stripe 相对偏移（blocks），raid_bdev_flush_blocks 内部加 data_offset。*/
+	for (i = 0; i < POWERAID_RAID_COMMON_PPL_GC_MAX_BDEVS; i++) {
+		struct raid_base_bdev_info *base_info;
+		struct spdk_io_channel *base_ch;
+		uint64_t off, len;
+
+		if (!op->ranges[i].active) {
+			continue;
+		}
+		base_info = &raid_bdev->base_bdev_info[i];
+		base_ch = raid_bdev_channel_get_base_channel(raid_ch, i);
+		off = op->ranges[i].min_off;
+		len = op->ranges[i].max_off - off;
+
+		if (base_ch == NULL || base_info->desc == NULL) {
+			SPDK_ERRLOG("gc_data_flush: disk %u unavailable\n", i);
+			op->failed = true;
+			if (--op->remaining == 0) {
+				ppl_gc_data_flush_done(op);
+			}
+			continue;
+		}
+
+		rc = raid_bdev_flush_blocks(base_info, base_ch, off, len,
+					    ppl_gc_data_flush_per_disk_cb, op);
+		SPDK_DEBUGLOG(raid5f_ppl, "gc_data_flush: disk %u flush off=%lu len=%lu rc=%d remaining=%u\n",
+			      i, (unsigned long)off, (unsigned long)len, rc, op->remaining);
+		if (rc != 0) {
+			SPDK_ERRLOG("gc_data_flush: disk %u flush rc=%d\n", i, rc);
+			op->failed = true;
+			if (--op->remaining == 0) {
+				ppl_gc_data_flush_done(op);
+			}
+		}
+	}
+}
+
+void
+poweraid_raid_common_ppl_gc_data_flush_enqueue(
+	struct poweraid_raid_common_ppl_gc *gc,
+	struct poweraid_raid_common_ppl_gc_entry *entry,
+	const struct poweraid_raid_common_ppl_data_range *ranges,
+	uint32_t num_ranges,
+	poweraid_raid_common_ppl_data_flush_cb cb, void *cb_arg)
+{
+	uint32_t i;
+
+	SPDK_DEBUGLOG(raid5f_ppl, "gc_data_flush_enqueue: gc=%p entry=%p num_ranges=%u pending=%u inflight=%d\n",
+		      gc, entry, num_ranges, gc ? gc->data_flush_pending_count : 0,
+		      gc ? gc->data_flush_inflight : -1);
+
+	if (gc == NULL || entry == NULL || cb == NULL) {
+		if (cb) { cb(-EINVAL, cb_arg); }
+		return;
+	}
+
+	/* 复制 ranges 到 entry */
+	entry->num_ranges = num_ranges;
+	for (i = 0; i < num_ranges && i < POWERAID_RAID_COMMON_PPL_GC_MAX_BDEVS; i++) {
+		entry->ranges[i] = ranges[i];
+	}
+	entry->data_flush_cb = cb;
+	entry->data_flush_cb_arg = cb_arg;
+	entry->data_flush_enqueue_ticks = spdk_get_ticks();
+
+	/* 入队 */
+	TAILQ_INSERT_TAIL(&gc->data_flush_pending, entry, link);
+	gc->data_flush_pending_count++;
+	if (gc->data_flush_pending_count == 1) {
+		gc->data_flush_oldest_ticks = entry->data_flush_enqueue_ticks;
+	}
+
+	/* 按盘聚合 min/max offset */
+	for (i = 0; i < num_ranges && i < POWERAID_RAID_COMMON_PPL_GC_MAX_BDEVS; i++) {
+		uint8_t phys = ranges[i].phys;
+		uint64_t off = ranges[i].offset;
+		uint64_t end = off + ranges[i].length;
+		if (phys >= POWERAID_RAID_COMMON_PPL_GC_MAX_BDEVS) {
+			continue;
+		}
+		if (!gc->data_flush_ranges[phys].active) {
+			gc->data_flush_ranges[phys].active = true;
+			gc->data_flush_ranges[phys].min_off = off;
+			gc->data_flush_ranges[phys].max_off = end;
+		} else {
+			if (off < gc->data_flush_ranges[phys].min_off) {
+				gc->data_flush_ranges[phys].min_off = off;
+			}
+			if (end > gc->data_flush_ranges[phys].max_off) {
+				gc->data_flush_ranges[phys].max_off = end;
+			}
+		}
+	}
+
+	ppl_gc_data_flush_check_trigger(gc);
+}
+
+/* ===== commit group ===== */
+
+struct gc_commit_op {
+	struct poweraid_raid_common_ppl_gc		*gc;
+	struct poweraid_raid_common_ppl_ctx		*ctx;
+	struct spdk_io_channel				*ch;
+	TAILQ_HEAD(, poweraid_raid_common_ppl_gc_entry)	group;
+	uint32_t					count;
+	uint64_t					commit_seq;
+	uint8_t						state;  /* 0=write, 1=flush, 2=done */
+	int						status;
+	void						*buf;
+	struct spdk_bdev_io_wait_entry			wait_entry;
+};
+
+enum {
+	GC_COMMIT_WRITE = 0,
+	GC_COMMIT_FLUSH,
+	GC_COMMIT_DONE,
+};
+
+static void
+ppl_gc_commit_loop(struct gc_commit_op *op);
+
+static void
+ppl_gc_commit_io_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct gc_commit_op *op = cb_arg;
+
+	spdk_bdev_free_io(bdev_io);
+	if (!success) {
+		op->status = -EIO;
+		op->state = GC_COMMIT_DONE;
+	} else {
+		op->state++;
+	}
+	ppl_gc_commit_loop(op);
+}
+
+static void
+ppl_gc_commit_loop(struct gc_commit_op *op)
+{
+	struct poweraid_raid_common_ppl_ctx *ctx = op->ctx;
+	int rc;
+
+	while (op->state < GC_COMMIT_DONE) {
+		switch (op->state) {
+		case GC_COMMIT_WRITE:
+			memcpy(op->buf, &ctx->super, sizeof(ctx->super));
+			SPDK_DEBUGLOG(raid5f_ppl, "gc_commit WRITE: commit_seq=%"PRIu64" next_seq=%"PRIu64
+				      " tail_seq=%"PRIu64" num_records=%u count=%u\n",
+				      ctx->super.commit_seq, ctx->super.next_seq,
+				      ctx->super.tail_seq, ctx->super.num_records, op->count);
+			rc = spdk_bdev_write_blocks(ctx->bdev_desc, op->ch, op->buf,
+						    byte_to_block_offset(ctx, ctx->region_offset),
+						    1, ppl_gc_commit_io_cb, op);
+			if (rc == -ENOMEM) {
+				op->wait_entry.bdev = spdk_bdev_desc_get_bdev(ctx->bdev_desc);
+				op->wait_entry.cb_fn = (spdk_bdev_io_wait_cb)ppl_gc_commit_loop;
+				op->wait_entry.cb_arg = op;
+				spdk_bdev_queue_io_wait(ctx->bdev_desc, op->ch, &op->wait_entry);
+				return;
+			} else if (rc != 0) {
+				op->status = rc;
+				op->state = GC_COMMIT_DONE;
+				continue;
+			}
+			return;
+
+		case GC_COMMIT_FLUSH:
+			rc = spdk_bdev_flush_blocks(ctx->bdev_desc, op->ch,
+						    byte_to_block_offset(ctx, ctx->region_offset),
+						    1, ppl_gc_commit_io_cb, op);
+			if (rc == -ENOMEM) {
+				op->wait_entry.bdev = spdk_bdev_desc_get_bdev(ctx->bdev_desc);
+				op->wait_entry.cb_fn = (spdk_bdev_io_wait_cb)ppl_gc_commit_loop;
+				op->wait_entry.cb_arg = op;
+				spdk_bdev_queue_io_wait(ctx->bdev_desc, op->ch, &op->wait_entry);
+				return;
+			} else if (rc != 0) {
+				op->status = rc;
+				op->state = GC_COMMIT_DONE;
+				continue;
+			}
+			return;
+
+		default:
+			op->status = -EINVAL;
+			op->state = GC_COMMIT_DONE;
+			break;
+		}
+	}
+
+	/* DONE */
+	if (op->status == 0) {
+		struct poweraid_raid_common_ppl_inflight *inf, *tmp;
+		uint32_t removed = 0;
+		pthread_spin_lock(&ctx->slot_lock);
+		TAILQ_FOREACH_SAFE(inf, &ctx->inflight, link, tmp) {
+			if (inf->seq <= op->commit_seq) {
+				TAILQ_REMOVE(&ctx->inflight, inf, link);
+				free(inf);
+				removed++;
+			}
+		}
+		if (removed > 0) {
+			ctx->super.num_records = (ctx->super.num_records > removed)
+				? (ctx->super.num_records - removed) : 0;
+			ctx->super.head_seq = op->commit_seq + 1;
+		}
+		pthread_spin_unlock(&ctx->slot_lock);
+		ppl_wake_waiters(ctx);
+	}
+
+	/* 回调全组 */
+	{
+		struct poweraid_raid_common_ppl_gc_entry *entry, *tmp;
+		int status = op->status;
+		TAILQ_FOREACH_SAFE(entry, &op->group, link, tmp) {
+			entry->commit_cb(status, entry->commit_cb_arg);
+			free(entry);
+		}
+	}
+
+	op->gc->commit_inflight = false;
+
+	/* 链式 */
+	if (!TAILQ_EMPTY(&op->gc->commit_pending)) {
+		ppl_gc_commit_check_trigger(op->gc, op->ctx);
+	}
+
+	spdk_free(op->buf);
+	free(op);
+}
+
+static void
+ppl_gc_commit_check_trigger(struct poweraid_raid_common_ppl_gc *gc,
+			    struct poweraid_raid_common_ppl_ctx *ctx)
+{
+	struct gc_commit_op *op;
+	struct poweraid_raid_common_ppl_gc_entry *entry, *first;
+	uint64_t max_seq = 0;
+
+	if (gc->commit_inflight || gc->commit_pending_count == 0) {
+		return;
+	}
+
+	bool trigger = (gc->commit_pending_count >= POWERAID_RAID_COMMON_PPL_GC_K) ||
+	       (gc->commit_pending_count == 1 &&
+			!gc->commit_inflight &&
+			gc->append_pending_count == 0 &&
+			!gc->append_inflight &&
+			gc->data_flush_pending_count == 0 &&
+			!gc->data_flush_inflight);
+
+	/* T_commit 超时强制触发：避免低并发下 batch 不满而 stall */
+	if (!trigger && gc->commit_oldest_ticks != 0) {
+		uint64_t t_commit = (POWERAID_RAID_COMMON_PPL_GC_T_COMMIT_US *
+				     spdk_get_ticks_hz()) / 1000000ULL;
+		if ((spdk_get_ticks() - gc->commit_oldest_ticks) >= t_commit) {
+			trigger = true;
+		}
+	}
+	if (!trigger) {
+		return;
+	}
+
+	op = calloc(1, sizeof(*op));
+	if (!op) {
+		SPDK_ERRLOG("gc_commit: op alloc failed\n");
+		return;
+	}
+	op->gc = gc;
+	op->ctx = ctx;
+	op->ch = TAILQ_FIRST(&gc->commit_pending)->ch;
+	TAILQ_INIT(&op->group);
+	TAILQ_SWAP(&gc->commit_pending, &op->group, poweraid_raid_common_ppl_gc_entry, link);
+	TAILQ_INIT(&gc->commit_pending);
+	op->count = gc->commit_pending_count;
+	gc->commit_pending_count = 0;
+	gc->commit_oldest_ticks = 0;
+	gc->commit_inflight = true;
+	op->state = GC_COMMIT_WRITE;
+	op->status = 0;
+
+	/* commit_seq = max(seq in group) */
+	TAILQ_FOREACH(entry, &op->group, link) {
+		if (entry->seq > max_seq) {
+			max_seq = entry->seq;
+		}
+	}
+	op->commit_seq = max_seq;
+
+	/* 更新 super.commit_seq（slot_lock 保护）*/
+	pthread_spin_lock(&ctx->slot_lock);
+	ctx->super.commit_seq = max_seq;
+	ppl_super_set_crc(&ctx->super);
+	pthread_spin_unlock(&ctx->slot_lock);
+
+	op->buf = spdk_dma_malloc(ctx->block_size, 0x1000, NULL);
+	if (!op->buf) {
+		SPDK_ERRLOG("gc_commit: buf alloc failed\n");
+		/* fail 全组 */
+		TAILQ_FOREACH_SAFE(entry, &op->group, link, first) {
+			entry->commit_cb(-ENOMEM, entry->commit_cb_arg);
+			free(entry);
+		}
+		gc->commit_inflight = false;
+		free(op);
+		return;
+	}
+	memset(op->buf, 0, ctx->block_size);
+
+	ppl_gc_commit_loop(op);
+}
+
+void
+poweraid_raid_common_ppl_gc_commit(
+	struct poweraid_raid_common_ppl_ctx *ctx,
+	struct poweraid_raid_common_ppl_gc *gc,
+	struct spdk_io_channel *ch,
+	struct poweraid_raid_common_ppl_gc_entry *entry,
+	poweraid_raid_common_ppl_commit_cb cb, void *cb_arg)
+{
+	if (ctx == NULL || gc == NULL || entry == NULL || cb == NULL) {
+		if (cb) { cb(-EINVAL, cb_arg); }
+		return;
+	}
+
+	SPDK_DEBUGLOG(raid5f_ppl, "gc_commit: entry=%p seq=%"PRIu64" commit_pending=%u commit_inflight=%d\n",
+		      entry, entry->seq, gc->commit_pending_count, gc->commit_inflight);
+
+	entry->ch = ch;
+	entry->commit_cb = cb;
+	entry->commit_cb_arg = cb_arg;
+
+	TAILQ_INSERT_TAIL(&gc->commit_pending, entry, link);
+	gc->commit_pending_count++;
+	if (gc->commit_pending_count == 1) {
+		gc->commit_oldest_ticks = spdk_get_ticks();
+	}
+
+	ppl_gc_commit_check_trigger(gc, ctx);
+}
+
+/* ===== poller ===== */
+
+static int
+ppl_gc_poller(void *arg)
+{
+	struct poweraid_raid_common_ppl_gc *gc = arg;
+	uint64_t now = spdk_get_ticks();
+	uint64_t hz = spdk_get_ticks_hz();
+	uint64_t t_append = (POWERAID_RAID_COMMON_PPL_GC_T_APPEND_US * hz) / 1000000ULL;
+
+	/* append T_append 超时 */
+	if (!gc->append_inflight && gc->append_pending_count > 0) {
+		/* 先尝试恢复 waiting_for_slot 的 entry */
+		ppl_gc_append_resume_waiting(gc);
+		/* T_append 超时必须以 force 透传：否则组内停留 1..K-1 个 entry 且
+		 * 上层无新 IO 补满 K 时（如 fio qd 恰好停在 K-1），flush 永不
+		 * 发出，append 回调不返回，形成自死锁。*/
+		if ((now - gc->append_oldest_ticks) >= t_append) {
+			ppl_gc_append_check_trigger(gc, true);
+		} else {
+			ppl_gc_append_check_trigger(gc, false);
+		}
+	}
+
+	/* data flush / commit 超时由各自 trigger 内部检查 T_data / T_commit，
+	 * poller 只需在有 pending 且无 inflight 时调用 trigger。*/
+	if (!gc->data_flush_inflight && gc->data_flush_pending_count > 0) {
+		ppl_gc_data_flush_check_trigger(gc);
+	}
+
+	if (!gc->commit_inflight && gc->commit_pending_count > 0) {
+		ppl_gc_commit_check_trigger(gc, gc->ppl_ctx);
+	}
+
+	return 0;
+}
+
+/* ===== init / destroy ===== */
+
+int
+poweraid_raid_common_ppl_gc_init(struct poweraid_raid_common_ppl_gc *gc,
+			      struct poweraid_raid_common_ppl_ctx *ppl_ctx,
+			      void *raid_bdev, void *raid_ch)
+{
+	if (gc == NULL || ppl_ctx == NULL) {
+		return -EINVAL;
+	}
+
+	memset(gc, 0, sizeof(*gc));
+	gc->ppl_ctx = ppl_ctx;
+	gc->raid_bdev = raid_bdev;
+	gc->raid_ch = raid_ch;
+	TAILQ_INIT(&gc->append_pending);
+	TAILQ_INIT(&gc->data_flush_pending);
+	TAILQ_INIT(&gc->commit_pending);
+	gc->append_pending_count = 0;
+	gc->append_inflight = false;
+	gc->append_unsubmitted_count = 0;
+	gc->append_write_inflight = 0;
+	gc->data_flush_pending_count = 0;
+	gc->data_flush_inflight = false;
+	gc->commit_pending_count = 0;
+	gc->commit_inflight = false;
+
+	gc->poller = SPDK_POLLER_REGISTER(ppl_gc_poller, gc,
+					  POWERAID_RAID_COMMON_PPL_GC_POLLER_US);
+	if (gc->poller == NULL) {
+		SPDK_ERRLOG("gc_init: poller register failed\n");
+		return -ENOMEM;
+	}
+
+	SPDK_DEBUGLOG(raid5f_ppl, "gc_init: gc=%p ppl_ctx=%p raid_bdev=%p raid_ch=%p\n",
+		      gc, ppl_ctx, raid_bdev, raid_ch);
+	return 0;
+}
+
+void
+poweraid_raid_common_ppl_gc_destroy(struct poweraid_raid_common_ppl_gc *gc)
+{
+	struct poweraid_raid_common_ppl_gc_entry *entry, *tmp;
+
+	if (gc == NULL) {
+		return;
+	}
+
+	if (gc->poller) {
+		spdk_poller_unregister(&gc->poller);
+	}
+
+	/* fail 所有 pending entry */
+	TAILQ_FOREACH_SAFE(entry, &gc->append_pending, link, tmp) {
+		TAILQ_REMOVE(&gc->append_pending, entry, link);
+		if (entry->append_buf) {
+			spdk_free(entry->append_buf);
+		}
+		entry->append_cb(-ECANCELED, 0, entry->append_cb_arg);
+		free(entry);
+	}
+	gc->append_pending_count = 0;
+
+	TAILQ_FOREACH_SAFE(entry, &gc->data_flush_pending, link, tmp) {
+		TAILQ_REMOVE(&gc->data_flush_pending, entry, link);
+		entry->data_flush_cb(-ECANCELED, entry->data_flush_cb_arg);
+		free(entry);
+	}
+	gc->data_flush_pending_count = 0;
+
+	TAILQ_FOREACH_SAFE(entry, &gc->commit_pending, link, tmp) {
+		TAILQ_REMOVE(&gc->commit_pending, entry, link);
+		entry->commit_cb(-ECANCELED, entry->commit_cb_arg);
+		free(entry);
+	}
+	gc->commit_pending_count = 0;
+
+	SPDK_DEBUGLOG(raid5f_ppl, "gc_destroy: gc=%p\n", gc);
 }

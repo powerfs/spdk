@@ -170,6 +170,29 @@ poweraid_raid_common_ioch_create(void *io_device, void *ctx_buf)
 		goto err;
 	}
 
+	/* PPL group commit 初始化（阶段 C1）：per-thread gc_ctx + poller。
+	 * raid_ch 在首次 IO 时由 write_full / rmw_submit_ppl_append 懒设置（ioch_create 无 raid_ch）。*/
+	{
+		struct poweraid_raid_common_ppl_ctx *ppl_ctx = NULL;
+		uint8_t bi;
+		for (bi = 0; bi < raid->num_base_bdevs; bi++) {
+			if (raid->base_bdevs[bi] != NULL &&
+			    raid->base_bdevs[bi]->ppl_ctx != NULL) {
+				ppl_ctx = raid->base_bdevs[bi]->ppl_ctx;
+				break;
+			}
+		}
+		if (ppl_ctx != NULL) {
+			if (poweraid_raid_common_ppl_gc_init(&ch->gc_ctx, ppl_ctx,
+							     raid->raid_bdev, NULL) != 0) {
+				SPDK_ERRLOG("poweraid_raid5f: gc_init failed, fallback to non-gc\n");
+				/* gc_ctx 全零，gc_append 自动 fallback 到逐条 append */
+			}
+		} else {
+			memset(&ch->gc_ctx, 0, sizeof(ch->gc_ctx));
+		}
+	}
+
 	SPDK_DEBUGLOG(poweraid_raid5f, "ioch_create: raid=%p ch=%p\n", raid, ch);
 	return 0;
 
@@ -194,6 +217,9 @@ poweraid_raid_common_ioch_destroy(void *io_device, void *ctx_buf)
 	struct poweraid_raid_common_req *req;
 
 	assert(TAILQ_EMPTY(&ch->xor_retry_queue));
+
+	/* PPL group commit 销毁（先于合并层，确保 pending entry 完成）*/
+	poweraid_raid_common_ppl_gc_destroy(&ch->gc_ctx);
 
 	/* 合并层销毁（先于 stripe_request 池，确保 pending IO 完成）*/
 	poweraid_raid_common_merge_destroy(&ch->merge_ctx);

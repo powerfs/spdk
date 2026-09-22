@@ -74,6 +74,7 @@ struct rmw_op {
 	struct poweraid_raid_common_ppl_ctx		*ppl_ctx;
 	struct spdk_io_channel			*ppl_ch;
 	uint64_t				ppl_seq;	/* 0 表示无 PPL 保护 */
+	struct poweraid_raid_common_ppl_gc_entry	*gc_entry;	/* 阶段 C1 group commit entry */
 
 	/* 状态机 */
 	enum rmw_state				state;
@@ -112,12 +113,19 @@ static void rmw_ppl_append_done(int status, uint64_t seq, void *cb_arg);
 static void rmw_start_commit(struct rmw_op *op);
 static void rmw_ppl_commit_done(int status, void *cb_arg);
 static void rmw_calc_and_next(struct rmw_op *op);
+static void rmw_gc_data_flush_done(int status, void *cb_arg);
 
 /* ===== 释放与完成 ===== */
 
 static void
 rmw_op_free(struct rmw_op *op)
 {
+	if (op->gc_entry != NULL) {
+		/* 阶段 C1：orphaned gc_entry（write/flush 失败未到 commit）。
+		 * gc_commit 成功路径已由 ppl_gc_commit_loop 释放并在此前置 NULL。 */
+		free(op->gc_entry);
+		op->gc_entry = NULL;
+	}
 	if (op->old_data_buf != NULL) {
 		spdk_dma_free(op->old_data_buf);
 	}
@@ -415,15 +423,28 @@ rmw_read_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 static void
 rmw_submit_ppl_append(struct rmw_op *op, uint64_t old_hash, uint64_t new_hash)
 {
+	struct poweraid_raid_common_io_channel *mod_ch;
+	SPDK_DEBUGLOG(raid5f_rmw, "rmw_submit_ppl_append ENTER: op=%p ppl_ctx=%p ppl_ch=%p\n",
+		      op, op->ppl_ctx, op->ppl_ch);
+
 	/* Step 3: PPL append（FUA intent）*/
 	op->state = RMW_S_PPL_APPEND;
 	if (op->ppl_ctx != NULL && op->ppl_ch != NULL) {
-		poweraid_raid_common_ppl_append_record(op->ppl_ctx, op->ppl_ch,
-						 op->stripe_index, op->chunk_bitmap,
-						 old_hash, new_hash,
-						 rmw_ppl_append_done, op);
+		/* 阶段 C1：走 group commit 批合并路径 */
+		mod_ch = raid_bdev_channel_get_module_ctx(op->raid_ch);
+		op->gc_entry = NULL;
+		/* raid_ch 懒设置（ioch_create 无 raid_ch，首次 IO 时填充）*/
+		mod_ch->gc_ctx.raid_ch = op->raid_ch;
+		poweraid_raid_common_ppl_gc_append(op->ppl_ctx, &mod_ch->gc_ctx,
+						   op->ppl_ch, op->stripe_index,
+						   op->chunk_bitmap, old_hash, new_hash,
+						   &op->gc_entry,
+						   rmw_ppl_append_done, op);
+		SPDK_DEBUGLOG(raid5f_rmw, "rmw_submit_ppl_append: op=%p gc_entry=%p (after gc_append)\n",
+			      op, op->gc_entry);
 	} else {
 		SPDK_WARNLOG("rmw: no ppl_ctx, write without PPL protection op=%p\n", op);
+		op->gc_entry = NULL;
 		rmw_ppl_append_done(0, 0, op);
 	}
 }
@@ -598,8 +619,10 @@ rmw_ppl_append_done(int status, uint64_t seq, void *cb_arg)
 
 	if (status != 0) {
 		/* PPL append 失败仅由真实 IO 错误或 ctx 销毁（-ECANCELED）引起；
-		 * -ENOSPC 由 backpressure 队列吸收，不会到达此处。降级写无 PPL 保护。*/
+		 * -ENOSPC 由 backpressure 队列吸收，不会到达此处。降级写无 PPL保护。
+		 * gc_append 失败时 entry 已被 gc 释放，此处置 NULL 避免悬垂。*/
 		SPDK_ERRLOG("rmw: ppl append failed (%d), degrade write without PPL\n", status);
+		op->gc_entry = NULL;
 	}
 	op->ppl_seq = (status == 0) ? seq : 0;
 
@@ -752,6 +775,19 @@ rmw_write_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	}
 }
 
+/* gc data flush 完成 → rmw_start_commit */
+static void
+rmw_gc_data_flush_done(int status, void *cb_arg)
+{
+	struct rmw_op *op = cb_arg;
+
+	if (status != 0) {
+		SPDK_ERRLOG("rmw gc data flush failed (%d)\n", status);
+		op->io_status = status;
+	}
+	rmw_start_commit(op);
+}
+
 /* ===== Step 5：flush 被写盘（并行）===== */
 
 static void
@@ -779,6 +815,49 @@ rmw_start_flushes(struct rmw_op *op)
 	}
 
 	op->state = RMW_S_FLUSH;
+
+	SPDK_DEBUGLOG(raid5f_rmw, "rmw_start_flushes: op=%p gc_entry=%p ppl_seq=%"PRIu64
+		      " ppl_ctx=%p ppl_ch=%p\n", op, op->gc_entry, op->ppl_seq,
+		      op->ppl_ctx, op->ppl_ch);
+
+	/* gc 路径：op->gc_entry 非空 → 走 group commit data flush */
+	if (op->gc_entry != NULL) {
+		struct poweraid_raid_common_io_channel *mod_ch =
+			raid_bdev_channel_get_module_ctx(op->raid_ch);
+		struct poweraid_raid_common_ppl_data_range
+			ranges[POWERAID_RAID_COMMON_PPL_GC_MAX_BDEVS];
+		uint32_t n = 0;
+
+		while (bits) {
+			uint8_t data_idx = __builtin_ctzll(bits);
+			bits &= bits - 1;
+			ranges[n].phys = rmw_data_to_phys(data_idx, op->p_idx,
+							  op->q_idx, raid_bdev->num_base_bdevs);
+			ranges[n].offset = base_offset;
+			ranges[n].length = raid->strip_size;
+			n++;
+		}
+		/* P parity */
+		ranges[n].phys = op->p_idx;
+		ranges[n].offset = base_offset;
+		ranges[n].length = raid->strip_size;
+		n++;
+		/* Q parity (RAID6) */
+		if (raid->num_parity > 1) {
+			ranges[n].phys = op->q_idx;
+			ranges[n].offset = base_offset;
+			ranges[n].length = raid->strip_size;
+			n++;
+		}
+		SPDK_DEBUGLOG(raid5f_rmw, "rmw_start_flushes: calling gc_data_flush_enqueue gc_entry=%p n=%u\n",
+			      op->gc_entry, n);
+		poweraid_raid_common_ppl_gc_data_flush_enqueue(
+			&mod_ch->gc_ctx, op->gc_entry, ranges, n,
+			rmw_gc_data_flush_done, op);
+		return;
+	}
+
+	/* 非 gc 路径：per-disk flush（原逻辑）*/
 	op->io_remaining = op->num_modified + raid->num_parity; /* data + P(+Q) */
 	op->io_status = 0;
 
@@ -900,7 +979,18 @@ rmw_start_commit(struct rmw_op *op)
 	}
 
 	op->state = RMW_S_PPL_COMMIT;
-	if (op->ppl_seq != 0 && op->ppl_ctx != NULL && op->ppl_ch != NULL) {
+	SPDK_DEBUGLOG(raid5f_rmw, "rmw_start_commit: op=%p ppl_seq=%"PRIu64" gc_entry=%p ppl_ctx=%p ppl_ch=%p\n",
+		      op, op->ppl_seq, op->gc_entry, op->ppl_ctx, op->ppl_ch);
+	if (op->ppl_seq != 0 && op->ppl_ctx != NULL && op->ppl_ch != NULL &&
+	    op->gc_entry != NULL) {
+		/* 阶段 C1：走 group commit 批合并路径 */
+		struct poweraid_raid_common_io_channel *mod_ch =
+			raid_bdev_channel_get_module_ctx(op->raid_ch);
+		poweraid_raid_common_ppl_gc_commit(op->ppl_ctx, &mod_ch->gc_ctx,
+						   op->ppl_ch, op->gc_entry,
+						   rmw_ppl_commit_done, op);
+	} else if (op->ppl_seq != 0 && op->ppl_ctx != NULL && op->ppl_ch != NULL) {
+		/* fallback：非 gc 路径 */
 		poweraid_raid_common_ppl_commit(op->ppl_ctx, op->ppl_ch, op->ppl_seq,
 					   rmw_ppl_commit_done, op);
 	} else {
@@ -921,6 +1011,9 @@ rmw_ppl_commit_done(int status, void *cb_arg)
 	if (status != 0) {
 		SPDK_ERRLOG("rmw: ppl commit failed (%d)\n", status);
 	}
+
+	/* gc_commit 已释放 entry，此处置 NULL 避免 rmw_op_free double-free */
+	op->gc_entry = NULL;
 
 	/* 最终状态：base IO 失败则 FAILED，否则 SUCCESS（PPL 失败不影响数据，仅降级保护）*/
 	io_status = (op->io_status == 0) ? SPDK_BDEV_IO_STATUS_SUCCESS :
